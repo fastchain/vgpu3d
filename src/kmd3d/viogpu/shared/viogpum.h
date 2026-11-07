@@ -160,6 +160,12 @@ typedef struct _VIOGPU_ADAPTERINFO
 // GPU primaries does not reach the host display (egl-headless on NVIDIA);
 // the first such escape turns blob scanout off for the adapter.
 #define VIOGPU_FB_PRESENT            0x500
+// vgpu: stage an asynchronous blt-present copy for the calling thread.  The
+// UMD queued a GPU copy of the frame into a persistently mapped readback
+// buffer and armed the present fence; the next blt Present on this thread
+// becomes PRESENT_WAIT{token} + CPU_BLT, so the KMD copies the pixels into
+// DWM's surface after the GPU finished, and the app never waits for it.
+#define VIOGPU_BLT_ASYNC             0x501
 
 #pragma pack(1)
 typedef struct _VIOGPU_DISP_MODE
@@ -333,6 +339,17 @@ typedef struct _VIOGPU_FB_PRESENT_REQ
 } VIOGPU_FB_PRESENT_REQ;
 #pragma pack()
 
+#pragma pack(1)
+typedef struct _VIOGPU_BLT_ASYNC_REQ
+{
+    VIOGPU_UM_PTR Pixels; // frame origin in the readback buffer (caller's address space)
+    ULONG Pitch;
+    ULONG Width;
+    ULONG Height;
+    ULONG Swizzle;        // 1: pixels are RGBA8, convert to BGRA8
+} VIOGPU_BLT_ASYNC_REQ;
+#pragma pack()
+
 typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
@@ -358,6 +375,8 @@ typedef struct _VIOGPU_ESCAPE
         VIOGPU_GATE_ARM_REQ GateArm;
 
         VIOGPU_FB_PRESENT_REQ FbPresent;
+
+        VIOGPU_BLT_ASYNC_REQ BltAsync;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
 #pragma pack()
@@ -552,6 +571,7 @@ struct _VIOGPU_BLIT_PRESENT
 #define VIOGPU_CMD_GATE               0x9 // Hold DMA completion until the VIOGPU_ARM_GATE
                                           // token (ULONGLONG body) fires -- KMD-internal,
                                           // never reaches virtio
+#define VIOGPU_CMD_CPU_BLT           0xB // KMD-authored: run a staged VIOGPU_BLT_ASYNC copy (body: ULONGLONG job id)
 #define VIOGPU_CMD_PRESENT_WAIT       0xA // Hold DMA completion until the present-fence
                                           // token (ULONGLONG body) retires -- built BY the
                                           // KMD for packet-gated flip presents

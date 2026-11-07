@@ -575,6 +575,73 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
                                                pPresent->SubRectCnt));
             }
         }
+        // vgpu: asynchronous blt (VIOGPU_BLT_ASYNC staged by this thread): the
+        // packet waits for the frame's present token, then CPU_BLT copies the
+        // readback into the destination -- DWM sees the frame only after that,
+        // and the app's Present never waited for the GPU.
+        VioGpuAdapter::BLT_JOB *bltJob = m_pAdapter->BltJobTakeStaged(PsGetCurrentThreadId());
+        if (bltJob != NULL)
+        {
+            ULONGLONG bltToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId());
+            VioGpuAllocation *dstAlloc = dst ? dst->GetAllocation() : NULL;
+            const UINT need = 2 * (sizeof(VIOGPU_COMMAND_HDR) + sizeof(ULONGLONG));
+            if (pPresent->pDmaBuffer && dstAlloc && dstAlloc->IsCoherent() && !dstAlloc->IsBlob() &&
+                !dstAlloc->IsPrimary() && pPresent->DmaSize >= need && pPresent->SubRectCnt > 0 &&
+                pPresent->pDmaBufferPrivateData && pPresent->DmaBufferPrivateDataSize >= sizeof(VIOGPU_DMA_PRIVATE))
+            {
+                bltJob->Dx = pPresent->SrcRect.left - pPresent->DstRect.left;
+                bltJob->Dy = pPresent->SrcRect.top - pPresent->DstRect.top;
+                if (pPresent->SubRectCnt <= ARRAYSIZE(bltJob->Rects))
+                {
+                    bltJob->RectCount = pPresent->SubRectCnt;
+                    RtlCopyMemory(bltJob->Rects, pPresent->pDstSubRects, sizeof(RECT) * pPresent->SubRectCnt);
+                }
+                else
+                {
+                    RECT cover = pPresent->pDstSubRects[0];
+                    for (UINT i = 1; i < pPresent->SubRectCnt; i++)
+                    {
+                        cover.left = min(cover.left, pPresent->pDstSubRects[i].left);
+                        cover.top = min(cover.top, pPresent->pDstSubRects[i].top);
+                        cover.right = max(cover.right, pPresent->pDstSubRects[i].right);
+                        cover.bottom = max(cover.bottom, pPresent->pDstSubRects[i].bottom);
+                    }
+                    bltJob->RectCount = 1;
+                    bltJob->Rects[0] = cover;
+                }
+                dstAlloc->AddRef();
+                bltJob->Dst = dstAlloc;
+                const ULONGLONG jobId = m_pAdapter->BltJobPark(bltJob);
+
+                char *bodyStart = (char *)pPresent->pDmaBuffer;
+                UCHAR *p = (UCHAR *)bodyStart;
+                if (bltToken != 0)
+                {
+                    VIOGPU_COMMAND_HDR *hdr = (VIOGPU_COMMAND_HDR *)p;
+                    hdr->type = VIOGPU_CMD_PRESENT_WAIT;
+                    hdr->size = sizeof(ULONGLONG);
+                    hdr->flags = 0;
+                    hdr->ring_idx = 0;
+                    RtlCopyMemory(p + sizeof(*hdr), &bltToken, sizeof(ULONGLONG));
+                    p += sizeof(*hdr) + sizeof(ULONGLONG);
+                }
+                VIOGPU_COMMAND_HDR *hdr = (VIOGPU_COMMAND_HDR *)p;
+                hdr->type = VIOGPU_CMD_CPU_BLT;
+                hdr->size = sizeof(ULONGLONG);
+                hdr->flags = 0;
+                hdr->ring_idx = 0;
+                RtlCopyMemory(p + sizeof(*hdr), &jobId, sizeof(ULONGLONG));
+                p += sizeof(*hdr) + sizeof(ULONGLONG);
+                pPresent->pDmaBuffer = p;
+
+                cmd->SetKmdAuthored();
+                cmd->MirrorBody(pPresent->pDmaBufferPrivateData, pPresent->DmaBufferPrivateDataSize, bodyStart,
+                                (char *)pPresent->pDmaBuffer - bodyStart);
+                return STATUS_SUCCESS;
+            }
+            VioGpuAdapter::BltJobFree(bltJob); // not usable here: fall back to the synchronous path
+        }
+
         if (pPresent->pDmaBuffer && dst && src)
         {
             char *bodyStart = (char *)pPresent->pDmaBuffer;

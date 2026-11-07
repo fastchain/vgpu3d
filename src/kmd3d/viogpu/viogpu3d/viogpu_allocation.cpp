@@ -826,6 +826,78 @@ BOOLEAN VioGpuAllocation::CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UIN
     return TRUE;
 }
 
+BOOLEAN VioGpuAllocation::CpuBltFromProcess(PEPROCESS process, const BYTE *src, ULONG srcPitch, ULONG srcW,
+                                            ULONG srcH, BOOLEAN swizzle, const RECT *rects, UINT count, INT dx, INT dy)
+{
+    PAGED_CODE();
+
+    if (m_IsBlob || process == NULL || src == NULL || rects == NULL || !IsLinear32BppVirtioFormat(m_3dOptions.format))
+    {
+        return FALSE;
+    }
+    if (PsGetProcessExitStatus(process) != STATUS_PENDING)
+    {
+        return FALSE; // the presenting process is gone and so are its mappings
+    }
+    const LONG dw = (LONG)m_3dOptions.width, dh = (LONG)m_3dOptions.height;
+    const SIZE_T dstride = (SIZE_T)dw * 4;
+    if (dw <= 0 || dh <= 0 || (ULONGLONG)dstride * dh > m_Size)
+    {
+        return FALSE;
+    }
+
+    auto guard = LockGuard();
+    UCHAR *d = (UCHAR *)CpuMapLocked();
+    if (d == NULL)
+    {
+        return FALSE;
+    }
+
+    BOOLEAN ok = TRUE;
+    VIOGPU_KAPC_STATE apc;
+    KeStackAttachProcess(process, &apc);
+    __try
+    {
+        ProbeForRead((PVOID)src, (SIZE_T)srcPitch * (srcH - 1) + (SIZE_T)srcW * 4, 1);
+        for (UINT i = 0; i < count; i++)
+        {
+            LONG x0 = max(rects[i].left, max(0L, (LONG)-dx));
+            LONG y0 = max(rects[i].top, max(0L, (LONG)-dy));
+            LONG x1 = min(rects[i].right, min(dw, (LONG)srcW - (LONG)dx));
+            LONG y1 = min(rects[i].bottom, min(dh, (LONG)srcH - (LONG)dy));
+            x0 = max(x0, 0L);
+            y0 = max(y0, 0L);
+            if (x1 <= x0 || y1 <= y0)
+            {
+                continue;
+            }
+            for (LONG y = y0; y < y1; y++)
+            {
+                const ULONG *s32 = (const ULONG *)(src + (SIZE_T)(y + dy) * srcPitch + (SIZE_T)(x0 + dx) * 4);
+                ULONG *d32 = (ULONG *)(d + (SIZE_T)y * dstride + (SIZE_T)x0 * 4);
+                if (!swizzle)
+                {
+                    RtlCopyMemory(d32, s32, (SIZE_T)(x1 - x0) * 4);
+                }
+                else
+                {
+                    for (LONG x = 0; x < x1 - x0; x++)
+                    {
+                        const ULONG p = s32[x]; // RGBA in memory -> BGRA
+                        d32[x] = (p & 0xff00ff00u) | ((p & 0xffu) << 16) | ((p >> 16) & 0xffu);
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ok = FALSE;
+    }
+    KeUnstackDetachProcess(&apc);
+    return ok;
+}
+
 VOID VioGpuAllocation::CreateBlob(UINT ctx_id)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d IsBlob=%d\n", __FUNCTION__, m_Id, m_IsBlob));

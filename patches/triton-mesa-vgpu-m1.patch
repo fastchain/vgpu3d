@@ -1,5 +1,5 @@
 diff --git a/src/virtio/neptune/triton/triton.h b/src/virtio/neptune/triton/triton.h
-index 94a72f4..ef0c388 100644
+index 94a72f4..8c72e80 100644
 --- a/src/virtio/neptune/triton/triton.h
 +++ b/src/virtio/neptune/triton/triton.h
 @@ -247,7 +247,13 @@ typedef struct TRITON_DEVICE {
@@ -16,7 +16,7 @@ index 94a72f4..ef0c388 100644
  
  /* Defines a CalcPrivate*Size DDI whose private object has a fixed size. */
  #define TR_CALC_PRIVATE_SIZE(name, type, ...)                          \
-@@ -338,6 +344,16 @@ typedef struct TRITON_RESOURCE {
+@@ -338,6 +344,23 @@ typedef struct TRITON_RESOURCE {
  
      /* Head of the intrusive list of live views wrapping this resource. */
      TRITON_VIEWLINK       *pViewList;
@@ -29,12 +29,19 @@ index 94a72f4..ef0c388 100644
 +    D3DKMT_HANDLE          hVgpuCoherent;
 +    UINT                   vgpuCoherentW, vgpuCoherentH;
 +    ID3D11Texture2D       *pVgpuStaging;
++    /* asynchronous blt presents: ring of persistently mapped readback textures
++     * (VIOGPU_BLT_ASYNC); 4 > TRITON_PRESENT_MAX_AHEAD frames in flight */
++    ID3D11Texture2D       *pVgpuRing[4];
++    const void            *vgpuRingPtr[4];
++    UINT                   vgpuRingPitch[4];
++    UINT                   vgpuRingIdx;
++    BOOL                   vgpuRingFailed;
 +#endif
  } TRITON_RESOURCE, *PTRITON_RESOURCE;
  
  /* Views keep the host desc they were created with, so recreating them after
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
-index bc4e182..f190b3e 100644
+index bc4e182..b27d091 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
 +++ b/src/virtio/neptune/triton/tritonDxgi.c
 @@ -22,6 +22,12 @@
@@ -43,14 +50,14 @@ index bc4e182..f190b3e 100644
  
 +#ifdef VGPU_DXVK_INPROC
 +void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT nrects); /* vgpu_triton_backend.c */
-+D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src);
++D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync);
 +void vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1);
 +#endif
 +
  /* Lazily create the GPU-done fence (rationale: the present-fence block in
   * triton.h).  Caller holds presentLock.  Returns TRUE if fencing is
   * available; FALSE => unfenced (bare-Flush) present. */
-@@ -621,7 +627,52 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -621,7 +627,56 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -64,9 +71,17 @@ index bc4e182..f190b3e 100644
 +    * staging Map already waits for the GPU (the copy is queued behind the
 +    * frame), so arming + waiting on the present fence here only adds the
 +    * fence-event latency (~25-35 ms per frame measured with Fusion). */
-+   if (!src->IsPresentable && pArgs->Flags.Blt)
-+      tritonPresentFlushAndGate(pD, FALSE /* arm */, FALSE /* wait */);
-+   else
++   BOOL vgpuBltDone = FALSE;
++   if (!src->IsPresentable && pArgs->Flags.Blt) {
++      /* queue the readback first so the present token armed below covers it;
++       * asynchronous: the KMD copies after the token retires (no wait here) */
++      BOOL vgpuAsync = FALSE;
++      tritonPresentLock(pD);
++      vgpuSrc = vgpuBltSource(pD, src, &vgpuAsync);
++      tritonPresentUnlock(pD);
++      vgpuBltDone = TRUE;
++      tritonPresentFlushAndGate(pD, vgpuAsync /* arm */, FALSE /* wait */);
++   } else
 +#endif
     tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
 +#ifdef VGPU_DXVK_INPROC
@@ -93,17 +108,13 @@ index bc4e182..f190b3e 100644
 +      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
 +       * a virgl copy, which cannot read Venus memory -- give it a coherent
 +       * source filled on the CPU instead */
-+      if (pArgs->Flags.Blt) {
-+         tritonPresentLock(pD);
-+         vgpuSrc = vgpuBltSource(pD, src);
-+         tritonPresentUnlock(pD);
-+      }
++      (void)vgpuBltDone; /* blt source handled before the gate */
 +   }
 +#endif
  
     /* DXGIDDICB_PRESENT (MSDN):
      *   hSrcAllocation  the rendered back buffer to present (a flip-primary
-@@ -631,7 +682,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -631,7 +686,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
      *   pDXGIContext    runtime cookie threaded through unchanged. */
     DXGIDDICB_PRESENT cb;
     memset(&cb, 0, sizeof(cb));
@@ -115,7 +126,7 @@ index bc4e182..f190b3e 100644
     cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
     cb.pDXGIContext   = pArgs->pDXGIContext;
     cb.hContext       = pD->hKMContext;
-@@ -1335,11 +1389,59 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
+@@ -1335,11 +1393,63 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -129,9 +140,17 @@ index bc4e182..f190b3e 100644
 +    * staging Map already waits for the GPU (the copy is queued behind the
 +    * frame), so arming + waiting on the present fence here only adds the
 +    * fence-event latency (~25-35 ms per frame measured with Fusion). */
-+   if (!src->IsPresentable && pArgs->Flags.Blt)
-+      tritonPresentFlushAndGate(pD, FALSE /* arm */, FALSE /* wait */);
-+   else
++   BOOL vgpuBltDone = FALSE;
++   if (!src->IsPresentable && pArgs->Flags.Blt) {
++      /* queue the readback first so the present token armed below covers it;
++       * asynchronous: the KMD copies after the token retires (no wait here) */
++      BOOL vgpuAsync = FALSE;
++      tritonPresentLock(pD);
++      vgpuSrc = vgpuBltSource(pD, src, &vgpuAsync);
++      tritonPresentUnlock(pD);
++      vgpuBltDone = TRUE;
++      tritonPresentFlushAndGate(pD, vgpuAsync /* arm */, FALSE /* wait */);
++   } else
 +#endif
     tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
 +#ifdef VGPU_DXVK_INPROC
@@ -158,11 +177,7 @@ index bc4e182..f190b3e 100644
 +      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
 +       * a virgl copy, which cannot read Venus memory -- give it a coherent
 +       * source filled on the CPU instead */
-+      if (pArgs->Flags.Blt) {
-+         tritonPresentLock(pD);
-+         vgpuSrc = vgpuBltSource(pD, src);
-+         tritonPresentUnlock(pD);
-+      }
++      (void)vgpuBltDone; /* blt source handled before the gate */
 +   }
 +#endif
  
@@ -190,7 +205,7 @@ index 4a359d5..8962be5 100644
        HRESULT hr = tritonKmEscape(km, &esc);
        if (SUCCEEDED(hr))
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
-index e47217f..0504efa 100644
+index e47217f..507737a 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
 +++ b/src/virtio/neptune/triton/tritonResource.c
 @@ -15,6 +15,10 @@
@@ -204,7 +219,7 @@ index e47217f..0504efa 100644
  /* tritonQuery.c; the DDI table in tritonDDI.c carries the same prototype. */
  void APIENTRY tritonCheckFormatSupport(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT *);
  
-@@ -206,6 +210,11 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -206,6 +210,15 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      r->pResource        = NULL;
      r->pPresentCompanion = NULL;
      r->pViewList        = NULL;
@@ -212,11 +227,15 @@ index e47217f..0504efa 100644
 +    r->hVgpuCoherent    = 0;
 +    r->vgpuCoherentW    = r->vgpuCoherentH = 0;
 +    r->pVgpuStaging     = NULL;
++    memset(r->pVgpuRing, 0, sizeof(r->pVgpuRing));
++    memset((void *)r->vgpuRingPtr, 0, sizeof(r->vgpuRingPtr));
++    r->vgpuRingIdx      = 0;
++    r->vgpuRingFailed   = FALSE;
 +#endif
      /* A resource is a display primary only when the runtime supplies
       * pPrimaryDesc (d3d10umddi.h: "If pPrimaryDesc absent, blt/copy style
       * is implied when used with Present").  BIND_PRESENT alone marks any
-@@ -242,10 +251,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -242,10 +255,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      const BOOL exportableShape = pArgs->MipLevels <= 1 &&
                                   pArgs->ArraySize <= 1 &&
                                   pArgs->SampleDesc.Count <= 1;
@@ -239,7 +258,7 @@ index e47217f..0504efa 100644
  
  
      /* Top-level dimensions come from the mip-0 entry of pMipInfoList. */
-@@ -520,6 +541,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+@@ -520,6 +545,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
          ID3D11Resource_Release(r->pResource);
          r->pResource = NULL;
      }
@@ -250,7 +269,7 @@ index e47217f..0504efa 100644
          ID3D11Resource_Release(r->pPresentCompanion);
          r->pPresentCompanion = NULL;
 diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
-index e2da5c4..9e84407 100644
+index e2da5c4..90c3aa4 100644
 --- a/src/virtio/virtio-gpu/wddm_hw.h
 +++ b/src/virtio/virtio-gpu/wddm_hw.h
 @@ -45,12 +45,12 @@ typedef ULONGLONG VIOGPU_UM_PTR;    // user-mode VA, zero-extended
@@ -277,7 +296,7 @@ index e2da5c4..9e84407 100644
  {
      return (HANDLE)(ULONG_PTR)v;
  }
-@@ -154,6 +154,13 @@ typedef struct _VIOGPU_ADAPTERINFO
+@@ -154,6 +154,19 @@ typedef struct _VIOGPU_ADAPTERINFO
  // wait for that frame.  No payload.
  #define VIOGPU_PRESENT_GATE_HINT     0x402
  
@@ -287,11 +306,17 @@ index e2da5c4..9e84407 100644
 +// GPU primaries does not reach the host display (egl-headless on NVIDIA);
 +// the first such escape turns blob scanout off for the adapter.
 +#define VIOGPU_FB_PRESENT            0x500
++// vgpu: stage an asynchronous blt-present copy for the calling thread.  The
++// UMD queued a GPU copy of the frame into a persistently mapped readback
++// buffer and armed the present fence; the next blt Present on this thread
++// becomes PRESENT_WAIT{token} + CPU_BLT, so the KMD copies the pixels into
++// DWM's surface after the GPU finished, and the app never waits for it.
++#define VIOGPU_BLT_ASYNC             0x501
 +
  #pragma pack(1)
  typedef struct _VIOGPU_DISP_MODE
  {
-@@ -311,6 +318,21 @@ typedef struct _VIOGPU_GATE_ARM_REQ
+@@ -311,6 +324,32 @@ typedef struct _VIOGPU_GATE_ARM_REQ
  #pragma pack()
  
  #pragma pack(1)
@@ -310,19 +335,32 @@ index e2da5c4..9e84407 100644
 +} VIOGPU_FB_PRESENT_REQ;
 +#pragma pack()
 +
++#pragma pack(1)
++typedef struct _VIOGPU_BLT_ASYNC_REQ
++{
++    VIOGPU_UM_PTR Pixels; // frame origin in the readback buffer (caller's address space)
++    ULONG Pitch;
++    ULONG Width;
++    ULONG Height;
++    ULONG Swizzle;        // 1: pixels are RGBA8, convert to BGRA8
++} VIOGPU_BLT_ASYNC_REQ;
++#pragma pack()
++
  typedef struct _VIOGPU_ESCAPE
  {
      USHORT Type;
-@@ -334,6 +356,8 @@ typedef struct _VIOGPU_ESCAPE
+@@ -334,6 +373,10 @@ typedef struct _VIOGPU_ESCAPE
          VIOGPU_PRESENT_FENCE_REQ PresentFence;
  
          VIOGPU_GATE_ARM_REQ GateArm;
 +
 +        VIOGPU_FB_PRESENT_REQ FbPresent;
++
++        VIOGPU_BLT_ASYNC_REQ BltAsync;
      } DUMMYUNIONNAME;
  } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
  #pragma pack()
-@@ -443,6 +467,14 @@ typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
+@@ -443,6 +486,14 @@ typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
  } VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS;
  #pragma pack()
  
@@ -337,7 +375,7 @@ index e2da5c4..9e84407 100644
  #define VIOGPU_RESOURCE_TYPE_3D     0
  #define VIOGPU_RESOURCE_TYPE_BLOB   1
  #define VIOGPU_RESOURCE_TYPE_IMPORT 2
-@@ -482,7 +514,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX
+@@ -482,7 +533,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX
  // blob_id) is unique among live shared textures -- the pending blob is
  // staged per transport context under a per-context-monotonic blob_id.
  // Bit 62 namespaces these away from KMD-minted EX cookies (bit 63).
@@ -346,6 +384,14 @@ index e2da5c4..9e84407 100644
  {
      return (1ULL << 62) | ((ULONGLONG)create_ctx_id << 44) | (blob_id & ((1ULL << 44) - 1));
  }
+@@ -520,6 +571,7 @@ struct _VIOGPU_BLIT_PRESENT
+ #define VIOGPU_CMD_GATE               0x9 // Hold DMA completion until the VIOGPU_ARM_GATE
+                                           // token (ULONGLONG body) fires -- KMD-internal,
+                                           // never reaches virtio
++#define VIOGPU_CMD_CPU_BLT           0xB // KMD-authored: run a staged VIOGPU_BLT_ASYNC copy (body: ULONGLONG job id)
+ #define VIOGPU_CMD_PRESENT_WAIT       0xA // Hold DMA completion until the present-fence
+                                           // token (ULONGLONG body) retires -- built BY the
+                                           // KMD for packet-gated flip presents
 diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
 index d34f523..d4b802e 100644
 --- a/src/virtio/vulkan/vn_common.c

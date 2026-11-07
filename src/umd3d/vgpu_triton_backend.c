@@ -655,6 +655,14 @@ vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r)
       ID3D11Texture2D_Release(r->pVgpuStaging);
       r->pVgpuStaging = NULL;
    }
+   for (UINT i = 0; i < 4; i++) {
+      if (r->pVgpuRing[i])
+         ID3D11Texture2D_Release(r->pVgpuRing[i]);
+      r->pVgpuRing[i] = NULL;
+      r->vgpuRingPtr[i] = NULL;
+   }
+   r->vgpuRingIdx = 0;
+   r->vgpuRingFailed = FALSE;
    if (r->hVgpuCoherent && pD && pD->KTCallbacks.pfnDeallocateCb) {
       D3DDDICB_DEALLOCATE da;
       memset(&da, 0, sizeof(da));
@@ -752,9 +760,70 @@ vgpu_blt_stats(UINT w, UINT h, const LARGE_INTEGER bt[5])
    }
 }
 
-D3DKMT_HANDLE
-vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
+/* Asynchronous blt present: queue the GPU copy of the frame into the next ring
+ * texture and stage a VIOGPU_BLT_ASYNC job for this thread; the KMD copies it
+ * into DWM's surface once the present token (armed by the caller after this)
+ * retires.  The ring textures are persistently mapped: their CPU pointers are
+ * taken once, with a blocking Map at creation.  FALSE: use the synchronous path. */
+static bool
+vgpu_blt_async(PTRITON_DEVICE pD, PTRITON_RESOURCE src, ID3D11Resource *copy_src, const D3D11_TEXTURE2D_DESC *d,
+               bool swizzle)
 {
+   /* opt-in while it is being validated: HKLM\SOFTWARE\vgpu BltAsync (REG_DWORD) = 1 */
+   static int enabled = -1;
+   if (enabled < 0) {
+      DWORD v = 0, n = sizeof(v);
+      enabled = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "BltAsync", RRF_RT_REG_DWORD, NULL, &v, &n) ==
+                   ERROR_SUCCESS && v == 1;
+      TR_LOG("vgpu: blt presents %s", enabled ? "asynchronous" : "synchronous");
+   }
+   if (!enabled || src->vgpuRingFailed)
+      return false;
+   if (!src->pVgpuRing[0]) {
+      D3D11_TEXTURE2D_DESC sd = *d;
+      sd.MipLevels = 1;
+      sd.ArraySize = 1;
+      sd.Usage = D3D11_USAGE_STAGING;
+      sd.BindFlags = 0;
+      sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      sd.MiscFlags = 0;
+      for (UINT i = 0; i < 4; i++) {
+         D3D11_MAPPED_SUBRESOURCE m;
+         if (FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuRing[i])) ||
+             FAILED(ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)src->pVgpuRing[i], 0, D3D11_MAP_READ, 0, &m))) {
+            TR_LOG("vgpu: blt async: ring %u setup failed; synchronous blt presents", i);
+            src->vgpuRingFailed = TRUE;
+            return false;
+         }
+         src->vgpuRingPtr[i] = m.pData;
+         src->vgpuRingPitch[i] = m.RowPitch;
+         ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)src->pVgpuRing[i], 0);
+      }
+   }
+   const UINT k = src->vgpuRingIdx++ % 4;
+   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)src->pVgpuRing[k], 0, 0, 0, 0, copy_src, 0, NULL);
+
+   VIOGPU_ESCAPE esc;
+   memset(&esc, 0, sizeof(esc));
+   esc.Type = VIOGPU_BLT_ASYNC;
+   esc.DataLength = sizeof(esc.BltAsync);
+   esc.BltAsync.Pixels = VioGpuUmPtr(src->vgpuRingPtr[k]);
+   esc.BltAsync.Pitch = src->vgpuRingPitch[k];
+   esc.BltAsync.Width = d->Width;
+   esc.BltAsync.Height = d->Height;
+   esc.BltAsync.Swizzle = swizzle ? 1 : 0;
+   if (FAILED(tritonKmEscape(&pD->Km, &esc))) {
+      TR_LOG("vgpu: blt async: escape failed; synchronous blt presents");
+      src->vgpuRingFailed = TRUE;
+      return false;
+   }
+   return true;
+}
+
+D3DKMT_HANDLE
+vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
+{
+   *pAsync = FALSE;
    /* the companion holds the resolved / single-subresource copy of the frame */
    ID3D11Resource *copy_src = src->pPresentCompanion ? src->pPresentCompanion : src->pResource;
    if (!copy_src || !pD->pDev1 || !pD->pCtx1 || !pD->KTCallbacks.pfnAllocateCb ||
@@ -858,6 +927,13 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
       src->hVgpuCoherent = ai.hAllocation;
       src->vgpuCoherentW = d.Width;
       src->vgpuCoherentH = d.Height;
+   }
+
+   /* the coherent allocation stays the present's source allocation; with the
+    * asynchronous path the KMD writes DWM's surface itself */
+   if (vgpu_blt_async(pD, src, copy_src, &d, swizzle)) {
+      *pAsync = TRUE;
+      return src->hVgpuCoherent;
    }
 
    LARGE_INTEGER bt[5];

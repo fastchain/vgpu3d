@@ -380,3 +380,15 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   (host nvtop: ~200% CPU, 6-8% GPU).
 - Lesson: after a toolchain reinstall, partial rebuilds mixed old and new objects -> 64-bit dxvk_dxgi.dll
   failed DLL init (1114). Clean-rebuild build dirs after any toolchain change.
+
+### Speed-up step 1b + driver restart fix (2026-11-07)
+- Framebuffer present uses DWM's dirty rects (bounding box) and one virtqueue kick for upload+flush.
+  Heaven at a 5120x2160 desktop: DX11 35.6 -> 60.3 fps, OpenGL 55.5 -> 72.7 fps.
+- GPU scanout (SET_SCANOUT_BLOB) under egl-headless froze the VM on the NVIDIA host: QEMU imports the
+  dma-buf with DRM_FORMAT_MOD_INVALID. Kept behind HKLM\SOFTWARE\vgpu\Scanout=blob, off.
+- Driver restarts broke the host renderer until QEMU restarted (virtio_gpu_virgl_reset() aborts while a
+  deferred blob destroy is pending). Fixed: unmap orphaned blobs before unref, drain the control queue
+  before the virtio reset. DXVK Singleton no longer returns null after a failed instance creation.
+- Step 2 (asynchronous blt present, PRESENT_WAIT + KMD CPU_BLT) is implemented but OPT-IN
+  (HKLM\SOFTWARE\vgpu\BltAsync=1): first test stalled the KMD commander (display output lost,
+  vkcompute hung), most likely a present token that never retires for windowed presents. To debug.
