@@ -1,6 +1,6 @@
+<!-- Example domain for docs/SETUP.md: change name, disk/ISO paths and (optionally) pin a MAC. -->
 <domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
   <name>WIN11_3D</name>
-  <uuid>460001c5-696b-44e3-b987-c2e436c5b157</uuid>
   <title>Windows 11 (virtio-gpu 3D test)</title>
   <metadata>
     <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
@@ -81,7 +81,7 @@
          (no virtio storage driver in the image); switch to virtio after installing virtio-win. -->
     <disk type="file" device="disk">
       <driver name="qemu" type="qcow2" cache="none" discard="unmap"/>
-      <source file="/mnt/st/VM/pool-1/WinDev2301Eval.qcow2"/>
+      <source file="/var/lib/libvirt/images/win11.qcow2"/>
       <target dev="sda" bus="sata"/>
       <boot order="1"/>
     </disk>
@@ -90,7 +90,7 @@
          Run setup.exe from inside Windows; the system disk stays first in the boot order. -->
     <disk type="file" device="cdrom">
       <driver name="qemu" type="raw"/>
-      <source file="/mnt/st/VM/pool-1/Win11_26H2_EnterpriseEval_x64_en-US.iso"/>
+      <source file="/var/lib/libvirt/images/Win11_x64.iso"/>
       <target dev="sdb" bus="sata"/>
       <readonly/>
     </disk>
@@ -106,7 +106,7 @@
     </tpm>
 
     <interface type="network">
-      <mac address="52:54:00:bc:04:53"/>
+      <!-- pin a MAC so redefining the domain keeps the guest IP: <mac address="52:54:00:XX:XX:XX"/> -->
       <source network="default"/>
       <model type="e1000e"/>
     </interface>

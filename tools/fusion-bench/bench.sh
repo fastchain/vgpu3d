@@ -1,6 +1,7 @@
 #!/bin/bash
 # Fusion viewport benchmark over the in-VM Fusion MCP server (127.0.0.1:27182, tunnelled over the VM ssh).
-# usage: bench.sh load     - new document with the 2.5M-triangle scene (fusion_big.py; models in C:\Users\User\Downloads\models)
+# Needs VGPU_SSH = ssh arguments that reach the guest, e.g. VGPU_SSH='-i ~/.ssh/<key> -p <port> <user>@<host>'.
+# usage: bench.sh load     - new document with the 2.5M-triangle scene (fusion_big.py; models in %USERPROFILE%\Downloads\models)
 #        bench.sh check    - triangle count of the active document
 #        bench.sh orbit    - 72-step scripted orbit, prints ORBIT avg/median/p90/fps
 set -eu
@@ -8,7 +9,7 @@ D=$(cd "$(dirname "$0")" && pwd)
 T=${CLAUDE_JOB_DIR:-/tmp}/fusion-bench; mkdir -p "$T"
 H=(-H 'Host: 127.0.0.1:27182' -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
 pgrep -f "27182:127.0.0.1:27182" >/dev/null ||
-  ssh -f -N -o ExitOnForwardFailure=yes -i ~/.ssh/win11_vm -p 4568 -L 27182:127.0.0.1:27182 User@10.0.0.1
+  ssh -f -N -o ExitOnForwardFailure=yes ${VGPU_SSH:?set VGPU_SSH to the guest ssh arguments} -L 27182:127.0.0.1:27182
 curl -s -D "$T/h.txt" -o /dev/null "${H[@]}" --max-time 20 http://127.0.0.1:27182/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"claude","version":"1"}}}'
 SID=$(grep -i '^mcp-session-id' "$T/h.txt" | awk '{print $2}' | tr -d '\r')

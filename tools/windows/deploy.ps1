@@ -1,5 +1,5 @@
 Remove-Item -Recurse -Force C:\vgpu\vgpu-guest -ErrorAction SilentlyContinue
-Expand-Archive C:\Users\User\vgpu-guest.zip C:\vgpu -Force
+Expand-Archive $env:USERPROFILE\vgpu-guest.zip C:\vgpu -Force
 Remove-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\VGpu -Name InitStatus -ErrorAction SilentlyContinue
 if (-not (Get-Process Dbgview64 -ErrorAction SilentlyContinue)) { Start-ScheduledTask vgpu-dbgview; Start-Sleep 4 }
 $n0 = (Get-Content C:\vgpu\dbg.log -ErrorAction SilentlyContinue).Count

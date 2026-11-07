@@ -1,5 +1,5 @@
 & C:\vgpu\m2test\modes2.exe 3840 2160
-$lnk = Get-ChildItem C:\Users\User\Desktop, C:\Users\Public\Desktop -Filter "*Fusion*.lnk" -EA 0 | Select -First 1
+$lnk = Get-ChildItem $env:USERPROFILE\Desktop, C:\Users\Public\Desktop -Filter "*Fusion*.lnk" -EA 0 | Select -First 1
 Start-Process $lnk.FullName -WindowStyle Maximized
 Start-Sleep 110
 Add-Type @"

@@ -3,7 +3,7 @@ param([int]$WaitSec = 100)
 Get-Process Fusion360, FusionLauncher -EA 0 | Stop-Process -Force
 Start-Sleep 3
 Set-Content C:\vgpu\job.ps1 @"
-`$lnk = Get-ChildItem C:\Users\User\Desktop, C:\Users\Public\Desktop -Filter "*Fusion*.lnk" -EA 0 | Select -First 1
+`$lnk = Get-ChildItem $env:USERPROFILE\Desktop, C:\Users\Public\Desktop -Filter "*Fusion*.lnk" -EA 0 | Select -First 1
 Start-Process `$lnk.FullName
 Start-Sleep $WaitSec
 & C:\vgpu\shot.ps1
