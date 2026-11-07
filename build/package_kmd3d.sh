@@ -9,7 +9,9 @@ R=/workspace/driver; P=$R/out/package-kmd3d/vgpu3d; TV=$R/upstream/triton/v0.5/d
 mkdir -p $R/out; touch $R/out/.package-start
 $R/build/build_kmd3d.sh ${1:-debug} $R/src/kmd3d | tail -2
 $R/build/build_umd.sh
-for f in $R/out/kmd3d/viogpu3d.sys $R/out/umd3d/vgpu_d3d11.dll; do
+$R/build/build_umd.sh 32
+[ -f $R/out/triton-venus32/vulkan_virtio32.dll ] || $R/build/build_triton_venus.sh 32
+for f in $R/out/kmd3d/viogpu3d.sys $R/out/umd3d/vgpu_d3d11.dll $R/out/umd3d/vgpu_d3d11_32.dll; do
   [ $f -nt $R/out/.package-start ] || { echo "ERROR: $f was not rebuilt" >&2; exit 1; }
 done
 rm -rf $R/out/package-kmd3d; mkdir -p $P/tools
@@ -18,7 +20,12 @@ cp $R/out/triton-venus/vulkan_virtio.dll $P/   # our MinGW build of the Triton V
 cp $TV/vgpusrv.exe $TV/viogpuap.exe $P/
 # D3D10/11 UMD: Triton DDI layer + DXVK (build_umd.sh)
 cp $R/out/umd3d/vgpu_d3d11.dll $R/out/umd3d/dxvk_d3d11.dll $R/out/umd3d/dxvk_dxgi.dll $P/
+# WOW64 (32-bit) UMD, DXVK pair and Venus ICD (build_umd.sh 32, build_triton_venus.sh 32)
+cp $R/out/umd3d/vgpu_d3d11_32.dll $R/out/umd3d/dxvk32_d3d11.dll $R/out/umd3d/dxvk32_dxgi.dll $P/
+cp $R/out/triton-venus32/vulkan_virtio32.dll $R/src/kmd3d-inf/virtio_icd32.json $P/
 cp $R/out/gl-win/libgallium_wgl.dll $P/
+[ -f $R/out/gl-win32/libgallium_wgl32.dll ] || $R/build/build_gl.sh 32
+cp $R/out/gl-win32/libgallium_wgl32.dll $P/
 # manifest-relative path: the loader cannot resolve Triton's bare "vulkan_virtio.dll" from the DriverStore (LoadLibrary error 87)
 cp $R/src/kmd3d-inf/virtio_icd.json $P/
 cp $R/src/kmd3d-inf/vgpu3d.inf $P/

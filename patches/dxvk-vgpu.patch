@@ -1,24 +1,24 @@
 diff --git a/meson.build b/meson.build
-index 4964301b..9fcd6fce 100644
+index 4964301b..99c86a0c 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -125,7 +125,8 @@ if platform == 'windows'
+@@ -125,7 +125,9 @@ if platform == 'windows'
      )
    endif
  
 -  dxvk_name_prefix = ''
-+  # vgpu: loaded inside our WDDM UMD alongside Windows' own d3d11.dll/dxgi.dll
-+  dxvk_name_prefix = 'dxvk_'
++  # vgpu: loaded inside our WDDM UMD alongside Windows' own d3d11.dll/dxgi.dll;
++  # the WOW64 (32-bit) build sits in the same DriverStore folder, so it gets its own prefix
++  dxvk_name_prefix = cpu_family == 'x86' ? 'dxvk32_' : 'dxvk_'
    compiler_args += ['-DDXVK_WSI_WIN32']
  else
    dxvk_abi_version = '0'
 diff --git a/src/d3d11/d3d11.def b/src/d3d11/d3d11.def
-index d406ba0b..2db017ad 100644
+index d406ba0b..23249cc9 100644
 --- a/src/d3d11/d3d11.def
 +++ b/src/d3d11/d3d11.def
-@@ -1,4 +1,4 @@
+@@ -1,4 +1,3 @@
 -LIBRARY D3D11.DLL
-+LIBRARY DXVK_D3D11.DLL
  EXPORTS  
      D3D11CoreCreateDevice @18
      D3D11CreateDevice @22
@@ -106,12 +106,11 @@ index af2b7b27..065b3ff4 100644
    d3d11_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d11.sym') ]
    d3d11_link_depends += files('d3d11.sym')
 diff --git a/src/dxgi/dxgi.def b/src/dxgi/dxgi.def
-index c5509571..3b09c4e5 100644
+index c5509571..63bb4ed9 100644
 --- a/src/dxgi/dxgi.def
 +++ b/src/dxgi/dxgi.def
-@@ -1,4 +1,4 @@
+@@ -1,4 +1,3 @@
 -LIBRARY DXGI.DLL
-+LIBRARY DXVK_DXGI.DLL
  EXPORTS  
      CreateDXGIFactory @9
      CreateDXGIFactory1 @10

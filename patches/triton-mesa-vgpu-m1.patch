@@ -813,7 +813,7 @@ index dbee43f..5d1acab 100644
     uint32_t max_timeline_count;
  
 diff --git a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
-index 0acb349..dd4ce91 100644
+index 0acb349..36152d1 100644
 --- a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 +++ b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 @@ -2,6 +2,7 @@
@@ -1426,7 +1426,7 @@ index 0acb349..dd4ce91 100644
  
     VkResult result = virtgpu_open(gpu, info);
     if (result == VK_SUCCESS)
-@@ -2274,3 +2574,41 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
+@@ -2274,3 +2574,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
  
     return VK_SUCCESS;
  }
@@ -1465,8 +1465,17 @@ index 0acb349..dd4ce91 100644
 +#ifdef __MINGW32__
 +/* assert.h declares _assert/_wassert dllimport, so callers go through the
 + * import slot; provide it for the renamed functions. */
++#ifdef _WIN64
 +void (__cdecl *__imp_vgpu_mesa_assert)(const char *, const char *, unsigned) = _assert;
 +void (__cdecl *__imp_vgpu_mesa_wassert)(const wchar_t *, const wchar_t *, unsigned) = _wassert;
++#else
++/* i386 decorates C symbols with a leading underscore: the slot is the raw
++ * symbol __imp__<name>, set with an asm label. */
++void (__cdecl *vgpu_imp_assert)(const char *, const char *, unsigned)
++   __asm__("__imp__vgpu_mesa_assert") = _assert;
++void (__cdecl *vgpu_imp_wassert)(const wchar_t *, const wchar_t *, unsigned)
++   __asm__("__imp__vgpu_mesa_wassert") = _wassert;
++#endif
 +#endif
 diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
 index 71ff678..898595e 100644

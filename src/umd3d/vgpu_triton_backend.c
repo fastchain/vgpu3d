@@ -58,6 +58,13 @@ typedef HRESULT(WINAPI *PFN_D3D11_CREATE_DEVICE_DXVK)(
    IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *,
    UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
 
+/* The WOW64 (32-bit) UMD uses its own DXVK pair in the same DriverStore folder. */
+#ifdef _WIN64
+#define VGPU_DXVK_D3D11 L"dxvk_d3d11.dll"
+#else
+#define VGPU_DXVK_D3D11 L"dxvk32_d3d11.dll"
+#endif
+
 static PFN_D3D11_CREATE_DEVICE_DXVK
 vgpu_dxvk_create_device(void)
 {
@@ -77,12 +84,12 @@ vgpu_dxvk_create_device(void)
          n--;
       path[n] = 0;
       if (n + 32 < MAX_PATH) {
-         wcscat(path, L"dxvk_d3d11.dll");
+         wcscat(path, VGPU_DXVK_D3D11);
          HMODULE dxvk = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
          if (dxvk)
             pfn = (PFN_D3D11_CREATE_DEVICE_DXVK)(void *)GetProcAddress(dxvk, "D3D11CreateDevice");
          else
-            TR_LOG("vgpu: loading dxvk_d3d11.dll failed (%lu)", GetLastError());
+            TR_LOG("vgpu: loading %ls failed (%lu)", VGPU_DXVK_D3D11, GetLastError());
       }
       InitOnceComplete(&once, 0, NULL);
    }

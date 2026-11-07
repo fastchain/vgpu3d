@@ -1,3 +1,43 @@
+diff --git a/src/util/00-mesa-defaults.conf b/src/util/00-mesa-defaults.conf
+index ef70666..6e0711f 100644
+--- a/src/util/00-mesa-defaults.conf
++++ b/src/util/00-mesa-defaults.conf
+@@ -32,6 +32,8 @@
+ 
+         <application name="Unigine Heaven (Windows)" executable="heaven.exe">
+             <option name="allow_glsl_extension_directive_midshader" value="true" />
++            <!-- vgpu: dual-source blending renders the lit scene black on zink/Venus (open issue) -->
++            <option name="disable_blend_func_extended" value="true" />
+             <!-- remove dual_color_blend_by_location if 4.1 ever comes out -->
+             <option name="dual_color_blend_by_location" value="true" />
+         </application>
+@@ -50,6 +52,8 @@
+ 
+         <application name="Unigine Valley (Windows)" executable="valley.exe">
+             <option name="allow_glsl_extension_directive_midshader" value="true" />
++            <!-- vgpu: dual-source blending renders the lit scene black on zink/Venus (open issue) -->
++            <option name="disable_blend_func_extended" value="true" />
+             <!-- remove dual_color_blend_by_location if 1.1 ever comes out -->
+             <option name="dual_color_blend_by_location" value="true" />
+         </application>
+diff --git a/src/util/xmlconfig.c b/src/util/xmlconfig.c
+index 17d4148..2dde219 100644
+--- a/src/util/xmlconfig.c
++++ b/src/util/xmlconfig.c
+@@ -884,7 +884,13 @@ parseAppAttr(struct OptConfData *data, const char **attr)
+          application_versions = attr[i+1];
+       else XML_WARNING("unknown application attribute: %s.", attr[i]);
+    }
++#ifdef _WIN32
++   /* Windows file names are case-insensitive: the process "Heaven.exe" must
++    * match executable="heaven.exe". */
++   if (exec && strcasecmp(exec, data->execName)) {
++#else
+    if (exec && strcmp(exec, data->execName)) {
++#endif
+       data->ignoringApp = data->inApp;
+    } else if (exec_regexp) {
+       regex_t re;
 diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
 index ff48d24..b0263f3 100644
 --- a/src/virtio/vulkan/meson.build

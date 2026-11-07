@@ -359,3 +359,24 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   4K remaining cost: GPU readback incl. frame render ~11 ms, CPU swizzle copy ~4-5 ms.
 - Tools: src/umd/modes (list / switch modes), tools/windows/fusion-4k-job.ps1; VGPU_STATS_EVERY=<n> env var
   sets the UMD stats interval (default 600).
+
+### 32-bit (WOW64) app support (2026-11-07)
+- New 32-bit user-mode stack in the same package/DriverStore folder, same 64-bit KMD:
+  vgpu_d3d11_32.dll (build_umd.sh 32) + dxvk32_d3d11/dxvk32_dxgi (build_dxvk.sh 32),
+  vulkan_virtio32.dll + virtio_icd32.json (build_triton_venus.sh 32), libgallium_wgl32.dll (build_gl.sh 32).
+  INF: UserModeDriverNameWow, VulkanDriverNameWow, OpenGLDriverNameWow/VersionWow/FlagsWow.
+- tests/abi32/check.sh: DWARF layout of every wddm_hw.h struct identical for i686 and x86_64 (138 members).
+- Tests: d3d11test32, vkcompute32, blttest32, sharetest 32->32, 32->64 and 64->32 all pass; gltest/gltest32
+  with the system opengl32 (ICD, no app-local DLLs) report zink on the 4090.
+- Mesa fixes: driconf executable match case-insensitive on Windows (Heaven.exe never matched heaven.exe, so
+  its "#extension mid-shader" workaround was off and every material shader failed -> white window);
+  Heaven/Valley on Windows also get disable_blend_func_extended.
+  OPEN ISSUE: dual-source blending (ARB_blend_func_extended) renders lit geometry black on zink/Venus.
+- Unigine benchmarks, 32-bit binaries, 1920x1080 windowed, QUALITY_HIGH, Phoronix automation define
+  (tools/windows/unigine-run.ps1, mid-run screenshot checked for each):
+    Heaven 4.0  DirectX 11: 48.4 FPS   OpenGL: 95.7 FPS
+    Valley 1.0  DirectX 11: 52.0 FPS   OpenGL: 76.8 FPS
+  The guest+host CPU path (DXVK/Zink translation, Venus encode/decode, blt copies) is the limit, not the GPU
+  (host nvtop: ~200% CPU, 6-8% GPU).
+- Lesson: after a toolchain reinstall, partial rebuilds mixed old and new objects -> 64-bit dxvk_dxgi.dll
+  failed DLL init (1114). Clean-rebuild build dirs after any toolchain change.

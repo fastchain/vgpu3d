@@ -1,5 +1,5 @@
 ;
-; vgpu3d.inf - WDDM render driver for virtio-gpu (M1: Vulkan + OpenGL system-wide, no Direct3D UMD yet).
+; vgpu3d.inf - WDDM render driver for virtio-gpu: Vulkan, Direct3D 10/11 and OpenGL, 64-bit and WOW64.
 ; Kernel driver: our build of viogpu3d (osy/kvm-guest-drivers-windows "neptune", BSD-3).
 ; Based on viogpu3d.inf (Red Hat / osy); Neptune D3D UMD replaced by Triton DDI + DXVK, Zink OpenGL ICD added.
 ;
@@ -27,6 +27,12 @@ libgallium_wgl.dll = 1,,
 vgpu_d3d11.dll = 1,,
 dxvk_d3d11.dll = 1,,
 dxvk_dxgi.dll = 1,,
+vgpu_d3d11_32.dll = 1,,
+dxvk32_d3d11.dll = 1,,
+dxvk32_dxgi.dll = 1,,
+vulkan_virtio32.dll = 1,,
+virtio_icd32.json = 1,,
+libgallium_wgl32.dll = 1,,
 vgpusrv.exe = 1,,
 viogpuap.exe = 1,,
 
@@ -46,6 +52,12 @@ libgallium_wgl.dll,,,0
 vgpu_d3d11.dll,,,0
 dxvk_d3d11.dll,,,0
 dxvk_dxgi.dll,,,0
+vgpu_d3d11_32.dll,,,0
+dxvk32_d3d11.dll,,,0
+dxvk32_dxgi.dll,,,0
+vulkan_virtio32.dll,,,0
+virtio_icd32.json,,,0
+libgallium_wgl32.dll,,,0
 vgpusrv.exe,,,0
 viogpuap.exe,,,0
 
@@ -94,13 +106,19 @@ HKR,, UsePhysicalMemory, %REG_DWORD%, 0
 ; WDDM render adapters must name a D3D UMD or dxgkrnl refuses to start them (LIVEDUMP 0x193/0x804,
 ; STATUS_OBJECT_NAME_NOT_FOUND); DWM needs a working D3D11 one on the display adapter.
 ; vgpu_d3d11.dll = Triton's D3D10/11 DDI layer on DXVK (dxvk_d3d11/dxvk_dxgi) on Venus.  D3D9 slot "<>".
-; No 32-bit UMD yet ("<>").
+; 32-bit (WOW64) processes: vgpu_d3d11_32.dll on dxvk32_d3d11/dxvk32_dxgi and vulkan_virtio32.dll,
+; same DriverStore folder, same 64-bit kernel driver (the UMD<->KMD ABI is pointer-size neutral,
+; checked by tests/abi32/check.sh).
 HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "<>",%13%\vgpu_d3d11.dll,%13%\vgpu_d3d11.dll,%13%\vgpu_d3d11.dll
-HKR,, UserModeDriverNameWow, %REG_MULTI_SZ%, "<>","<>","<>","<>"
+HKR,, UserModeDriverNameWow, %REG_MULTI_SZ%, "<>",%13%\vgpu_d3d11_32.dll,%13%\vgpu_d3d11_32.dll,%13%\vgpu_d3d11_32.dll
 HKR,, VulkanDriverName,  %REG_SZ%,       %13%\virtio_icd.json
+HKR,, VulkanDriverNameWow, %REG_SZ%,     %13%\virtio_icd32.json
 HKR,, OpenGLDriverName,  %REG_MULTI_SZ%, %13%\libgallium_wgl.dll
 HKR,, OpenGLVersion,     %REG_DWORD%, 1
 HKR,, OpenGLFlags,       %REG_DWORD%, 1
+HKR,, OpenGLDriverNameWow, %REG_MULTI_SZ%, %13%\libgallium_wgl32.dll
+HKR,, OpenGLVersionWow,  %REG_DWORD%, 1
+HKR,, OpenGLFlagsWow,    %REG_DWORD%, 1
 HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
 HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
 

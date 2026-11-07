@@ -5,6 +5,7 @@
  * waits for the GPU (EVENT query), opens it again in-process, then starts "sharetest child
  * <handle>" which opens the handle with OpenSharedResource, copies it to a staging texture and
  * checks the pixel.  Headless; run in the interactive session (the Vulkan ICD needs a display).
+ * SHARETEST_CHILD=<path> runs that executable as the child instead (e.g. the other bitness).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -163,6 +164,9 @@ main(int argc, char **argv)
 
     char cmd[MAX_PATH + 64], self[MAX_PATH];
     GetModuleFileNameA(NULL, self, MAX_PATH);
+    /* SHARETEST_CHILD=<exe>: open the texture from another build (32-bit <-> 64-bit check) */
+    if (GetEnvironmentVariableA("SHARETEST_CHILD", self, MAX_PATH) == 0)
+        GetModuleFileNameA(NULL, self, MAX_PATH);
     snprintf(cmd, sizeof(cmd), "\"%s\" child 0x%llx", self, (unsigned long long)(uintptr_t)h);
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi;
