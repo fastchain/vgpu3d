@@ -346,3 +346,16 @@ Fusion benchmark (same scene/orbit): 13.4-17 fps -> 48-64 fps (avg 15.6-20.8 ms)
 OpenGL/Zink (16.8 ms). blttest present interval 40 ms -> 14 ms. Regression: sharetest, d3d11test,
 vkcompute, vkcube pass; host log clean (only DXVK descriptor-pool growth warnings).
 Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled over the VM ssh).
+
+### 4K support (2026-11-07)
+- Framebuffer segment minimum 16 MiB -> 64 MiB (VIOGPU_FRAMEBUFFER_SIZE, system memory; BAR 0 is 16 MiB).
+- VioGpuVidPN::ModeFits hides modes whose 32 bpp framebuffer does not fit or that exceed
+  VIOGPU_MAX_MODE_W x H (5120x2880, also the scanout helper surface size); host-resize/custom modes that
+  do not fit are ignored instead of blacking the desktop. Offered now: up to 3840x2160, 4096x2160, 5120x2160.
+- Blt presents into DWM's redirection surface are copied on the CPU in the KMD (VioGpuAllocation::CpuBltTo,
+  kernel mapping of the GpuMmu-reported pages) instead of TRANSFER_TO_HOST + host copy + TRANSFER_FROM_HOST.
+  Falls back to the virgl path for blobs, primaries or non-resident pages.
+- Fusion benchmark maximized at 3840x2160 (viewport 3840x1822): 17 -> 31 fps. Maximized at 2560x1080: 66-69 fps.
+  4K remaining cost: GPU readback incl. frame render ~11 ms, CPU swizzle copy ~4-5 ms.
+- Tools: src/umd/modes (list / switch modes), tools/windows/fusion-4k-job.ps1; VGPU_STATS_EVERY=<n> env var
+  sets the UMD stats interval (default 600).

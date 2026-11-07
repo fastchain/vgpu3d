@@ -437,6 +437,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
         m_deferReleaseItem = NULL;
     }
 
+    DropCpuMappingLocked();
     if (m_GpummuPages != NULL)
     {
         // No DetachBacking here: the DestroyResource below unrefs the host
@@ -659,12 +660,17 @@ void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATE
             {
                 changedAttached = TRUE;
             }
+            if (m_GpummuPages[page] != addr)
+            {
+                DropCpuMappingLocked();
+            }
             m_GpummuPages[page] = addr;
         }
         else
         {
             if (m_GpummuPages[page] != GPUMMU_PAGE_UNFILLED)
             {
+                DropCpuMappingLocked();
                 m_GpummuPages[page] = GPUMMU_PAGE_UNFILLED;
                 m_GpummuFilled--;
                 if (m_BackingAttached)
@@ -705,6 +711,112 @@ void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATE
         m_BackingAttached = TRUE;
         DbgPrint(TRACE_LEVEL_VERBOSE, ("%s attach res_id=%d pages=%zu\n", __FUNCTION__, m_Id, total));
     }
+}
+
+void VioGpuAllocation::DropCpuMappingLocked()
+{
+    if (m_CpuVa != NULL)
+    {
+        MmUnmapLockedPages(m_CpuVa, m_CpuMdl);
+        m_CpuVa = NULL;
+    }
+    if (m_CpuMdl != NULL)
+    {
+        IoFreeMdl(m_CpuMdl);
+        m_CpuMdl = NULL;
+    }
+}
+
+PVOID VioGpuAllocation::CpuMapLocked()
+{
+    if (m_CpuVa != NULL)
+    {
+        return m_CpuVa;
+    }
+    const size_t total = (size_t)((m_Size + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    if (m_IsBlob || m_GpummuPages == NULL || total == 0 || m_GpummuFilled != total ||
+        total > (MAXULONG >> PAGE_SHIFT))
+    {
+        return NULL;
+    }
+    // An MDL describing the resident pages VidMm reported through
+    // UPDATE_PAGE_TABLE; VidMm keeps them locked while the allocation is
+    // resident, and any change drops this mapping first.
+    PMDL mdl = IoAllocateMdl(NULL, (ULONG)(total << PAGE_SHIFT), FALSE, FALSE, NULL);
+    if (mdl == NULL)
+    {
+        return NULL;
+    }
+    PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
+    for (size_t i = 0; i < total; i++)
+    {
+        pfns[i] = (PFN_NUMBER)(m_GpummuPages[i] >> PAGE_SHIFT);
+    }
+    mdl->MdlFlags |= MDL_PAGES_LOCKED;
+    PVOID va = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmCached, NULL, FALSE,
+                                            NormalPagePriority | MdlMappingNoExecute);
+    if (va == NULL)
+    {
+        IoFreeMdl(mdl);
+        DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d cannot map %zu pages\n", __FUNCTION__, m_Id, total));
+        return NULL;
+    }
+    m_CpuMdl = mdl;
+    m_CpuVa = va;
+    return va;
+}
+
+BOOLEAN VioGpuAllocation::CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UINT count, INT dx, INT dy)
+{
+    PAGED_CODE();
+
+    if (dst == NULL || dst == this || m_IsBlob || dst->m_IsBlob || rects == NULL ||
+        !IsLinear32BppVirtioFormat(m_3dOptions.format) || !IsLinear32BppVirtioFormat(dst->m_3dOptions.format))
+    {
+        return FALSE;
+    }
+    const LONG sw = (LONG)m_3dOptions.width, sh = (LONG)m_3dOptions.height;
+    const LONG dw = (LONG)dst->m_3dOptions.width, dh = (LONG)dst->m_3dOptions.height;
+    const SIZE_T sstride = (SIZE_T)sw * 4, dstride = (SIZE_T)dw * 4;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || (ULONGLONG)sstride * sh > m_Size ||
+        (ULONGLONG)dstride * dh > dst->m_Size)
+    {
+        return FALSE;
+    }
+
+    // Lock both in address order so two opposite blts cannot deadlock.
+    VioGpuAllocation *first = (this < dst) ? this : dst;
+    VioGpuAllocation *second = (this < dst) ? dst : this;
+    auto guard1 = first->LockGuard();
+    auto guard2 = second->LockGuard();
+
+    UCHAR *s = (UCHAR *)CpuMapLocked();
+    UCHAR *d = (UCHAR *)dst->CpuMapLocked();
+    if (s == NULL || d == NULL)
+    {
+        return FALSE;
+    }
+    for (UINT i = 0; i < count; i++)
+    {
+        // Clip to the destination, then to where the source exists.
+        LONG x0 = max(rects[i].left, max(0L, (LONG)-dx));
+        LONG y0 = max(rects[i].top, max(0L, (LONG)-dy));
+        LONG x1 = min(rects[i].right, min(dw, sw - (LONG)dx));
+        LONG y1 = min(rects[i].bottom, min(dh, sh - (LONG)dy));
+        x0 = max(x0, 0L);
+        y0 = max(y0, 0L);
+        if (x1 <= x0 || y1 <= y0)
+        {
+            continue;
+        }
+        const SIZE_T row = (SIZE_T)(x1 - x0) * 4;
+        for (LONG y = y0; y < y1; y++)
+        {
+            RtlCopyMemory(d + (SIZE_T)y * dstride + (SIZE_T)x0 * 4,
+                          s + (SIZE_T)(y + dy) * sstride + (SIZE_T)(x0 + dx) * 4, row);
+        }
+    }
+    return TRUE;
 }
 
 VOID VioGpuAllocation::CreateBlob(UINT ctx_id)

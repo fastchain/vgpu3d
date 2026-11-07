@@ -129,6 +129,17 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
     INT dx = pPresent->SrcRect.left - pPresent->DstRect.left;
     INT dy = pPresent->SrcRect.top - pPresent->DstRect.top;
 
+    // vgpu: both sides guest-memory surfaces and the destination is not
+    // scanned out from its host texture (DWM's redirection surface, which DWM
+    // reads from guest memory): copy on the CPU instead of TRANSFER_TO_HOST,
+    // a host copy and TRANSFER_FROM_HOST -- at 4K that round trip moved ~56 MB
+    // per frame.  The packet stays empty and completes like a flip.
+    if (src->IsCoherent() && dst->IsCoherent() && !src->IsBlob() && !dst->IsBlob() && !dst->IsPrimary() &&
+        src->CpuBltTo(dst, pPresent->pDstSubRects, pPresent->SubRectCnt, dx, dy))
+    {
+        return STATUS_SUCCESS;
+    }
+
     // If source requires coherency (staging or shadow surface) then emit transfer
     if (src->IsCoherent())
     {

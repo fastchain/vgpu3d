@@ -79,6 +79,12 @@ extern "C"
 
 #define NOM_WIDTH_SIZE                     1024
 #define NOM_HEIGHT_SIZE                    768
+// vgpu: largest display mode offered (also the size of the host-only scanout
+// helper surface, which must contain every scanout rect) and the framebuffer
+// segment that backs the 2D scanout; 5120x2880x4 = 56.25 MiB fits 64 MiB.
+#define VIOGPU_MAX_MODE_W                  5120
+#define VIOGPU_MAX_MODE_H                  2880
+#define VIOGPU_FRAMEBUFFER_SIZE            0x4000000
 
 #define VIOGPUTAG                          'OIVg'
 

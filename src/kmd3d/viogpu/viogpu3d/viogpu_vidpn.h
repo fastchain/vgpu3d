@@ -62,6 +62,7 @@ class VioGpuVidPN
     NTSTATUS GetModeList(DXGK_DISPLAY_INFORMATION *pDispInfo);
 
     void CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURRENT_MODE *pCurrentMode);
+    BOOLEAN ModeFits(ULONG xres, ULONG yres);
     void DestroyFrameBufferObj(BOOLEAN bReset);
 
     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);

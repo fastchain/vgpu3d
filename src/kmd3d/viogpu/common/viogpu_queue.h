@@ -332,8 +332,8 @@ class CtrlQueue : public VioGpuQueue
     // a dma-buf scanout to SPICE/VNC) only on a classic SET_SCANOUT, never on
     // SET_SCANOUT_BLOB; a disable (res 0) drops it.  SetScanoutBlob re-creates it
     // with a classic scanout of this small 2D helper resource when it is missing.
-#define VIOGPU_SURFACE_HELPER_W 3840
-#define VIOGPU_SURFACE_HELPER_H 2160
+#define VIOGPU_SURFACE_HELPER_W VIOGPU_MAX_MODE_W
+#define VIOGPU_SURFACE_HELPER_H VIOGPU_MAX_MODE_H
     bool HasScanoutSurfaceHelper() const
     {
         return m_SurfaceHelperRes != 0;

@@ -173,6 +173,14 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // the only place the pages behind a TYPE_3D allocation are ever named.
     void HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE *upt);
 
+    // vgpu: copy rects between two resident guest-backed TYPE_3D allocations
+    // on the CPU (dst rect r reads src at r + (dx,dy)).  Used for blt presents
+    // into DWM's redirection surface, which DWM reads from guest memory: no
+    // TRANSFER_TO_HOST / host copy / TRANSFER_FROM_HOST round trip.  FALSE
+    // (nothing copied) when either side is a blob, not 32 bpp linear or not
+    // fully resident; the caller then takes the virgl path.
+    BOOLEAN CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UINT count, INT dx, INT dy);
+
     void FlushToScreen(UINT scan_id);
 
     static NTSTATUS GetStandardAllocationDriverData(DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *pStandardAllocation);
@@ -316,6 +324,13 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     static constexpr ULONGLONG GPUMMU_PAGE_UNFILLED = ~0ull;
     ULONGLONG *m_GpummuPages = NULL;
     size_t m_GpummuFilled = 0;
+
+    // Kernel mapping of m_GpummuPages for CpuBltTo, built on first use and
+    // dropped whenever residency changes a page (allocation lock held).
+    PMDL m_CpuMdl = NULL;
+    PVOID m_CpuVa = NULL;
+    PVOID CpuMapLocked();
+    void DropCpuMappingLocked();
 
     size_t m_DxPhysicalAddress;
 

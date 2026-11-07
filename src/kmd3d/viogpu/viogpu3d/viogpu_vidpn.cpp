@@ -2141,12 +2141,31 @@ void VioGpuVidPN::ParseEdidTiming(void)
     m_EdidRefresh = rate;
 }
 
+// vgpu: a mode is only usable when its 32 bpp framebuffer fits the frame
+// segment (CreateFrameBufferObj fails otherwise and the desktop goes black)
+// and it lies inside the scanout helper surface.  Before HWInit sizes the
+// segment only the dimension limit applies.
+BOOLEAN VioGpuVidPN::ModeFits(ULONG xres, ULONG yres)
+{
+    if (xres > VIOGPU_MAX_MODE_W || yres > VIOGPU_MAX_MODE_H)
+    {
+        return FALSE;
+    }
+    const SIZE_T segment = m_pAdapter->frameSegment.GetSize();
+    return segment == 0 || (SIZE_T)xres * yres * 4 <= segment;
+}
+
 BOOLEAN VioGpuVidPN::UpdateModes(USHORT xres, USHORT yres, int &cnt)
 {
     int idx = 0;
 
     if ((xres < MIN_WIDTH_SIZE) || (yres < MIN_HEIGHT_SIZE))
     {
+        return FALSE;
+    }
+    if (!ModeFits(xres, yres))
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s: hiding %dx%d (framebuffer/scanout limit)\n", __FUNCTION__, xres, yres));
         return FALSE;
     }
 
@@ -2489,6 +2508,14 @@ void VioGpuVidPN::SetCustomDisplay(_In_ USHORT xres, _In_ USHORT yres)
     }
     tmpModeInfo.XResolution = m_pAdapter->IsFlexResolution() ? xres : max(MIN_WIDTH_SIZE, xres);
     tmpModeInfo.YResolution = m_pAdapter->IsFlexResolution() ? yres : max(MIN_HEIGHT_SIZE, yres);
+    if (!ModeFits(tmpModeInfo.XResolution, tmpModeInfo.YResolution))
+    {
+        // Keep the previous custom mode: programming this one would fail in
+        // CreateFrameBufferObj and black the desktop.
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("%s: %dx%d exceeds the framebuffer/scanout limit; ignored\n", __FUNCTION__, xres, yres));
+        return;
+    }
 
     m_CustomModeIndex = (USHORT)(m_ModeCount - 1);
 

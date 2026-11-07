@@ -3386,12 +3386,11 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList)
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("%s framebuffer %p +0x%x\n", __FUNCTION__, fb_pa.QuadPart, fb_size));
 
-    // FIXME
-#if NTDDI_VERSION > NTDDI_WINBLUE
-    UINT req_size = 0x1000000;
-#else
-    UINT req_size = 0x800000;
-#endif
+    // vgpu: 64 MiB so every mode up to VIOGPU_MAX_MODE_W x VIOGPU_MAX_MODE_H at
+    // 32 bpp fits (3840x2160 needs ~32 MiB; the old 16 MiB stopped at ~2560x1600).
+    // BAR 0 (the VGA vgamem, 16 MiB by default) is smaller, so this comes from
+    // system memory.  VioGpuVidPN::ModeFits hides modes that do not fit.
+    UINT req_size = VIOGPU_FRAMEBUFFER_SIZE;
 
     if (!IsUsePhysicalMemory() || fb_pa.QuadPart == 0 || fb_size < req_size)
     {

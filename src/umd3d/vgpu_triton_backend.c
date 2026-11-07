@@ -601,6 +601,18 @@ vgpu_is_bgra8(DXGI_FORMAT f)
           f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8X8_TYPELESS;
 }
 
+/* VGPU_STATS_EVERY=<n> overrides the 600-frame interval of both statistics. */
+static UINT
+vgpu_stats_every(void)
+{
+   static UINT every;
+   if (!every) {
+      const char *e = getenv("VGPU_STATS_EVERY");
+      every = (e && atoi(e) > 1) ? (UINT)atoi(e) : 600;
+   }
+   return every;
+}
+
 /* Per-process present statistics, logged every 600 windowed presents: count by
  * DXGI present flags, average FlushAndGate (GPU wait) time and the gap between
  * presents. */
@@ -625,7 +637,7 @@ vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE
       flip++;
    else
       other++;
-   if (++n == 600) {
+   if (++n == vgpu_stats_every()) {
       TR_LOG("vgpu: present stats n=%u blt=%u flip=%u other=%u avg us: gate=%u gap=%u", n, blt, flip, other,
              (UINT)(gate / n), (UINT)(gap / (n - 1)));
       gate = gap = 0;
@@ -650,7 +662,7 @@ vgpu_blt_stats(UINT w, UINT h, const LARGE_INTEGER bt[5])
    if (last.QuadPart)
       acc[4] += (double)(bt[0].QuadPart - last.QuadPart) * ms;
    last = bt[4];
-   if (++n == 600) {
+   if (++n == vgpu_stats_every()) {
       /* integer microseconds: TR_LOG has no floating-point formatting */
       TR_LOG("vgpu: blt stats %ux%u avg us: wait=%u lock=%u copy=%u unlock=%u gap=%u",
              w, h, (UINT)(acc[0] * 1000 / n), (UINT)(acc[1] * 1000 / n), (UINT)(acc[2] * 1000 / n),
