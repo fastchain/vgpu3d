@@ -873,6 +873,7 @@ void VioGpuVidPN::CreateFrameBufferObj(PVIDEO_MODE_INFORMATION pModeInfo, CURREN
     resid = 1;
 
     m_pFrameBuf = obj;
+    m_FbNeedsFull = TRUE; // vgpu: the new framebuffer is empty until a full frame arrives
     pCurrentMode->FrameBuffer.Ptr = obj->GetVirtualAddress();
     pCurrentMode->Flags.FrameBufferIsActive = TRUE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -1911,7 +1912,7 @@ VOID VioGpuVidPN::BlackOutScreen(CURRENT_MODE *pCurrentMod)
 // vgpu: copy a finished frame from the calling process into the 2D framebuffer
 // resource and scan that out (see VIOGPU_FB_PRESENT).  PASSIVE_LEVEL, caller's
 // process context (DxgkDdiEscape).
-NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_In_ const VIOGPU_FB_PRESENT_REQ *pReq)
+NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
 {
     PAGED_CODE();
 
@@ -1922,21 +1923,32 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_In_ const VIOGPU_FB_PRESENT_REQ *pRe
         return STATUS_DEVICE_NOT_READY;
     }
 
-    const UINT width = min(pReq->Width, pMode->DispInfo.Width);
-    const UINT height = min(pReq->Height, pMode->DispInfo.Height);
+    // The request names a box (DstX, DstY, Width x Height) of the frame; only that box is
+    // copied, uploaded and flushed.  A freshly created framebuffer holds nothing yet, so until a
+    // request covers the whole mode NeedFull asks the UMD for a full frame.
+    const UINT fbWidth = pMode->DispInfo.Width;
+    const UINT fbHeight = pMode->DispInfo.Height;
     const UINT dstPitch = pMode->DispInfo.Pitch;
-    if (width == 0 || height == 0 || pReq->Pitch < width * 4 || dstPitch < width * 4)
+    if (pReq->DstX >= fbWidth || pReq->DstY >= fbHeight)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    const UINT x = pReq->DstX, y = pReq->DstY;
+    const UINT width = min(pReq->Width, fbWidth - x);
+    const UINT height = min(pReq->Height, fbHeight - y);
+    if (width == 0 || height == 0 || pReq->Pitch < width * 4 || dstPitch < fbWidth * 4)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
     const BYTE *pSrc = VIOGPU_UM_PTR_AS(const BYTE *, pReq->Pixels);
+    BYTE *pBox = pDst + (SIZE_T)y * dstPitch + (SIZE_T)x * 4;
     __try
     {
         ProbeForRead((PVOID)pSrc, (SIZE_T)pReq->Pitch * (height - 1) + (SIZE_T)width * 4, 1);
-        for (UINT y = 0; y < height; y++)
+        for (UINT row = 0; row < height; row++)
         {
-            RtlCopyMemory(pDst + (SIZE_T)y * dstPitch, pSrc + (SIZE_T)y * pReq->Pitch, (SIZE_T)width * 4);
+            RtlCopyMemory(pBox + (SIZE_T)row * dstPitch, pSrc + (SIZE_T)row * pReq->Pitch, (SIZE_T)width * 4);
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1944,18 +1956,23 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_In_ const VIOGPU_FB_PRESENT_REQ *pRe
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (x == 0 && y == 0 && width == fbWidth && height == fbHeight)
+    {
+        m_FbNeedsFull = FALSE;
+    }
+    pReq->NeedFull = m_FbNeedsFull;
+
     m_pAdapter->m_FbPresentActive = TRUE;
 
     const UINT resid = m_pFrameBuf->GetId();
-    const UINT fbWidth = pMode->DispInfo.Width;
-    const UINT fbHeight = pMode->DispInfo.Height;
-    m_pAdapter->ctrlQueue.TransferToHost2D(resid, 0UL, fbWidth, fbHeight, 0, 0);
+    // TRANSFER_TO_HOST_2D: offset is the byte offset of the box's first pixel in the backing.
+    m_pAdapter->ctrlQueue.TransferToHost2D(resid, (ULONG)((SIZE_T)y * dstPitch + (SIZE_T)x * 4), width, height, x, y);
     if (m_pAdapter->ctrlQueue.GetClassicScanoutRes(0) != resid)
     {
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--> %s scanning out framebuffer res_id=%u %ux%u\n", __FUNCTION__, resid, fbWidth, fbHeight));
         m_pAdapter->ctrlQueue.SetScanout(0, resid, fbWidth, fbHeight, 0, 0);
     }
-    m_pAdapter->ctrlQueue.ResFlush(resid, fbWidth, fbHeight, 0, 0);
+    m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y);
     return STATUS_SUCCESS;
 }
 

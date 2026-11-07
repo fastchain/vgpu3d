@@ -499,12 +499,60 @@ static struct {
    ID3D11Texture2D *staging;
    UINT width, height;
    DXGI_FORMAT format;
+   bool need_full; /* staging recreated or the KMD asked for a full frame */
 } vgpu_fb;
 
-void
-vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
+/* HKLM\SOFTWARE\vgpu  Scanout (REG_SZ): "blob" leaves scanout primaries to the KMD's blob
+ * scanout (SET_SCANOUT_BLOB of the shared dma-buf, no CPU copy); anything else or missing uses
+ * the 2D framebuffer copy below, which works on every host.  Read once per process. */
+static bool
+vgpu_blob_scanout(void)
 {
-   if (!src->pResource || !pD->pDev1 || !pD->pCtx1)
+   static int mode = -1;
+   if (mode < 0) {
+      char v[16] = "";
+      DWORD n = sizeof(v);
+      mode = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "Scanout", RRF_RT_REG_SZ, NULL, v, &n) ==
+                   ERROR_SUCCESS &&
+                !_stricmp(v, "blob");
+      TR_LOG("vgpu: scanout mode %s", mode ? "blob (GPU)" : "framebuffer copy");
+   }
+   return mode;
+}
+
+static UINT vgpu_stats_every(void);
+
+/* Every vgpu_stats_every() presents: average share of the frame that was updated and the time
+ * spent waiting for the readback (Map) and in the KMD escape. */
+static void
+vgpu_fb_stats(UINT64 area, UINT64 full, const LARGE_INTEGER t[3])
+{
+   static LARGE_INTEGER freq;
+   static double map_us, esc_us;
+   static UINT64 sum_area, sum_full;
+   static UINT n;
+   if (!freq.QuadPart)
+      QueryPerformanceFrequency(&freq);
+   const double us = 1e6 / (double)freq.QuadPart;
+   map_us += (double)(t[1].QuadPart - t[0].QuadPart) * us;
+   esc_us += (double)(t[2].QuadPart - t[1].QuadPart) * us;
+   sum_area += area;
+   sum_full += full;
+   if (++n == vgpu_stats_every()) {
+      TR_LOG("vgpu: fb stats n=%u updated=%u%% avg us: copy+map=%u escape=%u", n,
+             (UINT)(sum_area * 100 / (sum_full ? sum_full : 1)), (UINT)(map_us / n), (UINT)(esc_us / n));
+      map_us = esc_us = 0;
+      sum_area = sum_full = 0;
+      n = 0;
+   }
+}
+
+/* Copies the changed part of the frame (the bounding box of the DXGI dirty rects, or the whole
+ * frame) into the KMD framebuffer: only that box is read back, copied and uploaded to the host. */
+void
+vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT nrects)
+{
+   if (!src->pResource || !pD->pDev1 || !pD->pCtx1 || vgpu_blob_scanout())
       return;
 
    ID3D11Texture2D *tex = (ID3D11Texture2D *)src->pResource;
@@ -536,10 +584,28 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
       vgpu_fb.width = d.Width;
       vgpu_fb.height = d.Height;
       vgpu_fb.format = d.Format;
+      vgpu_fb.need_full = true;
    }
 
-   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)vgpu_fb.staging, 0, 0,
-                                              0, 0, src->pResource, 0, NULL);
+   /* bounding box of the dirty rects, clipped to the frame; whole frame when unknown */
+   LONG x0 = 0, y0 = 0, x1 = (LONG)d.Width, y1 = (LONG)d.Height;
+   if (rects && nrects && !vgpu_fb.need_full) {
+      x0 = (LONG)d.Width, y0 = (LONG)d.Height, x1 = 0, y1 = 0;
+      for (UINT i = 0; i < nrects; i++) {
+         x0 = min(x0, max(rects[i].left, 0L));
+         y0 = min(y0, max(rects[i].top, 0L));
+         x1 = max(x1, min(rects[i].right, (LONG)d.Width));
+         y1 = max(y1, min(rects[i].bottom, (LONG)d.Height));
+      }
+      if (x1 <= x0 || y1 <= y0)
+         return; /* nothing visible changed */
+   }
+
+   LARGE_INTEGER t[3];
+   QueryPerformanceCounter(&t[0]);
+   D3D11_BOX box = { (UINT)x0, (UINT)y0, 0, (UINT)x1, (UINT)y1, 1 };
+   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)vgpu_fb.staging, 0,
+                                              (UINT)x0, (UINT)y0, 0, src->pResource, 0, &box);
    D3D11_MAPPED_SUBRESOURCE m;
    HRESULT hr = ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)vgpu_fb.staging, 0,
                                          D3D11_MAP_READ, 0, &m);
@@ -548,17 +614,24 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
       return;
    }
 
+   QueryPerformanceCounter(&t[1]);
+
    VIOGPU_ESCAPE esc;
    memset(&esc, 0, sizeof(esc));
    esc.Type = VIOGPU_FB_PRESENT;
    esc.DataLength = sizeof(esc.FbPresent);
-   esc.FbPresent.Pixels = VioGpuUmPtr(m.pData);
-   esc.FbPresent.Width = d.Width;
-   esc.FbPresent.Height = d.Height;
+   esc.FbPresent.Pixels = VioGpuUmPtr((const uint8_t *)m.pData + (SIZE_T)y0 * m.RowPitch + (SIZE_T)x0 * 4);
+   esc.FbPresent.Width = (ULONG)(x1 - x0);
+   esc.FbPresent.Height = (ULONG)(y1 - y0);
    esc.FbPresent.Pitch = m.RowPitch;
    esc.FbPresent.Format = d.Format;
+   esc.FbPresent.DstX = (ULONG)x0;
+   esc.FbPresent.DstY = (ULONG)y0;
    hr = tritonKmEscape(&pD->Km, &esc);
    ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)vgpu_fb.staging, 0);
+   QueryPerformanceCounter(&t[2]);
+   vgpu_fb.need_full = FAILED(hr) || esc.FbPresent.NeedFull;
+   vgpu_fb_stats((UINT64)(x1 - x0) * (UINT64)(y1 - y0), (UINT64)d.Width * d.Height, t);
 
    static LONG failures;
    if (FAILED(hr) && InterlockedIncrement(&failures) <= 3)

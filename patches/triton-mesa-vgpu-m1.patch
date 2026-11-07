@@ -34,7 +34,7 @@ index 94a72f4..ef0c388 100644
  
  /* Views keep the host desc they were created with, so recreating them after
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
-index bc4e182..e7fa083 100644
+index bc4e182..f190b3e 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
 +++ b/src/virtio/neptune/triton/tritonDxgi.c
 @@ -22,6 +22,12 @@
@@ -42,7 +42,7 @@ index bc4e182..e7fa083 100644
  #include "tritonBlitShaders.h"
  
 +#ifdef VGPU_DXVK_INPROC
-+void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src); /* vgpu_triton_backend.c */
++void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT nrects); /* vgpu_triton_backend.c */
 +D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src);
 +void vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1);
 +#endif
@@ -87,7 +87,7 @@ index bc4e182..e7fa083 100644
 +    * display on every host. */
 +   if (src->IsPresentable) {
 +      tritonPresentLock(pD);
-+      vgpuFbPresent(pD, src);
++      vgpuFbPresent(pD, src, NULL, 0); /* DXGI Present carries no dirty rects */
 +      tritonPresentUnlock(pD);
 +   } else {
 +      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
@@ -152,7 +152,7 @@ index bc4e182..e7fa083 100644
 +    * display on every host. */
 +   if (src->IsPresentable) {
 +      tritonPresentLock(pD);
-+      vgpuFbPresent(pD, src);
++      vgpuFbPresent(pD, src, pArgs->pDirtyRects, pArgs->DirtyRects);
 +      tritonPresentUnlock(pD);
 +   } else {
 +      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
@@ -250,7 +250,7 @@ index e47217f..0504efa 100644
          ID3D11Resource_Release(r->pPresentCompanion);
          r->pPresentCompanion = NULL;
 diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
-index e2da5c4..7c52c08 100644
+index e2da5c4..9e84407 100644
 --- a/src/virtio/virtio-gpu/wddm_hw.h
 +++ b/src/virtio/virtio-gpu/wddm_hw.h
 @@ -45,12 +45,12 @@ typedef ULONGLONG VIOGPU_UM_PTR;    // user-mode VA, zero-extended
@@ -291,25 +291,29 @@ index e2da5c4..7c52c08 100644
  #pragma pack(1)
  typedef struct _VIOGPU_DISP_MODE
  {
-@@ -311,6 +318,17 @@ typedef struct _VIOGPU_GATE_ARM_REQ
+@@ -311,6 +318,21 @@ typedef struct _VIOGPU_GATE_ARM_REQ
  #pragma pack()
  
  #pragma pack(1)
 +#pragma pack(1)
 +typedef struct _VIOGPU_FB_PRESENT_REQ
 +{
-+    VIOGPU_UM_PTR Pixels; // first row, Pitch bytes apart
-+    ULONG Width;
++    VIOGPU_UM_PTR Pixels; // first row of the updated box, Pitch bytes apart
++    ULONG Width;          // updated box size (the whole frame when DstX = DstY = 0 and it is the mode size)
 +    ULONG Height;
 +    ULONG Pitch;
 +    ULONG Format;         // DXGI_FORMAT
++    ULONG DstX;           // top-left of the updated box in the framebuffer
++    ULONG DstY;
++    ULONG NeedFull;       // out: the KMD framebuffer was (re)created; send the whole frame next time
++    ULONG Reserved;
 +} VIOGPU_FB_PRESENT_REQ;
 +#pragma pack()
 +
  typedef struct _VIOGPU_ESCAPE
  {
      USHORT Type;
-@@ -334,6 +352,8 @@ typedef struct _VIOGPU_ESCAPE
+@@ -334,6 +356,8 @@ typedef struct _VIOGPU_ESCAPE
          VIOGPU_PRESENT_FENCE_REQ PresentFence;
  
          VIOGPU_GATE_ARM_REQ GateArm;
@@ -318,7 +322,7 @@ index e2da5c4..7c52c08 100644
      } DUMMYUNIONNAME;
  } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
  #pragma pack()
-@@ -443,6 +463,14 @@ typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
+@@ -443,6 +467,14 @@ typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
  } VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS;
  #pragma pack()
  
@@ -333,7 +337,7 @@ index e2da5c4..7c52c08 100644
  #define VIOGPU_RESOURCE_TYPE_3D     0
  #define VIOGPU_RESOURCE_TYPE_BLOB   1
  #define VIOGPU_RESOURCE_TYPE_IMPORT 2
-@@ -482,7 +510,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX
+@@ -482,7 +514,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX
  // blob_id) is unique among live shared textures -- the pending blob is
  // staged per transport context under a per-context-monotonic blob_id.
  // Bit 62 namespaces these away from KMD-minted EX cookies (bit 63).

@@ -321,11 +321,15 @@ typedef struct _VIOGPU_GATE_ARM_REQ
 #pragma pack(1)
 typedef struct _VIOGPU_FB_PRESENT_REQ
 {
-    VIOGPU_UM_PTR Pixels; // first row, Pitch bytes apart
-    ULONG Width;
+    VIOGPU_UM_PTR Pixels; // first row of the updated box, Pitch bytes apart
+    ULONG Width;          // updated box size (the whole frame when DstX = DstY = 0 and it is the mode size)
     ULONG Height;
     ULONG Pitch;
     ULONG Format;         // DXGI_FORMAT
+    ULONG DstX;           // top-left of the updated box in the framebuffer
+    ULONG DstY;
+    ULONG NeedFull;       // out: the KMD framebuffer was (re)created; send the whole frame next time
+    ULONG Reserved;
 } VIOGPU_FB_PRESENT_REQ;
 #pragma pack()
 

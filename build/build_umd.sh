@@ -25,7 +25,7 @@ $CC $CFLAGS -c -o $O/vgpu_triton_backend.o $R/src/umd3d/vgpu_triton_backend.c
 objs+=($O/vgpu_triton_backend.o)
 printf 'LIBRARY %s.dll\nEXPORTS\n    %s\n' $DLL "$EXP" > $O/vgpu_d3d11.def
 # d3d10umddi.h defines file-scope const UINTs in every TU (upstream MSVC: /FORCE:MULTIPLE); identical values
-$CC -shared -o $O/$DLL.dll "${objs[@]}" $O/vgpu_d3d11.def -Wl,--allow-multiple-definition -static -ldxguid -luuid -lgdi32 -luser32 -lole32
+$CC -shared -o $O/$DLL.dll "${objs[@]}" $O/vgpu_d3d11.def -Wl,--allow-multiple-definition -static -ldxguid -luuid -lgdi32 -luser32 -lole32 -ladvapi32
 $T-strip -o $P/$DLL.dll $O/$DLL.dll
 cp $R/out/$DX/${DX}_d3d11.dll $R/out/$DX/${DX}_dxgi.dll $P/
 ls -la $P

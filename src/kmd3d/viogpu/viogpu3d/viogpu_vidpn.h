@@ -57,7 +57,7 @@ class VioGpuVidPN
         return m_ModeCount;
     }
     VOID BlackOutScreen(CURRENT_MODE *pCurrentMod);
-    NTSTATUS PresentToFrameBuffer(_In_ const VIOGPU_FB_PRESENT_REQ *pReq); // vgpu
+    NTSTATUS PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq); // vgpu
 
     NTSTATUS GetModeList(DXGK_DISPLAY_INFORMATION *pDispInfo);
 
@@ -224,6 +224,7 @@ class VioGpuVidPN
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_SystemDisplaySourceId;
 
     VioGpuObj *m_pFrameBuf;
+    BOOLEAN m_FbNeedsFull = TRUE; // vgpu: framebuffer (re)created, no full frame received yet
 
     PHYSICAL_ADDRESS m_sourceAddress = {0};
     VioGpuAllocation *m_sourceRes = NULL;
