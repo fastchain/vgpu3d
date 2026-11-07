@@ -389,6 +389,10 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
 - Driver restarts broke the host renderer until QEMU restarted (virtio_gpu_virgl_reset() aborts while a
   deferred blob destroy is pending). Fixed: unmap orphaned blobs before unref, drain the control queue
   before the virtio reset. DXVK Singleton no longer returns null after a failed instance creation.
-- Step 2 (asynchronous blt present, PRESENT_WAIT + KMD CPU_BLT) is implemented but OPT-IN
-  (HKLM\SOFTWARE\vgpu\BltAsync=1): first test stalled the KMD commander (display output lost,
-  vkcompute hung), most likely a present token that never retires for windowed presents. To debug.
+- Step 2 (asynchronous blt present, PRESENT_WAIT + KMD CPU_BLT) works but stays OPT-IN
+  (HKLM\SOFTWARE\vgpu\BltAsync=1). The first version waited on the thread's present token, which is
+  always 0 in our stack (DXVK's ID3D11Fence never reaches the KMD); now VIOGPU_BLT_ASYNC hands out a
+  token and a thread-pool wait on the readback fence sends VIOGPU_BLT_READY. Correct output, no stalls,
+  but Heaven DX11 only 60.3 -> 62.0 fps: the KMD commander runs packets one at a time and a parked
+  PRESENT_WAIT holds its slot, so the next frame's submissions wait behind it. Real gain needs the
+  commander to execute later packets while an earlier present is parked (complete in order only).

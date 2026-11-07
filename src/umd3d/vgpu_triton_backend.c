@@ -656,6 +656,14 @@ vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r)
       r->pVgpuStaging = NULL;
    }
    for (UINT i = 0; i < 4; i++) {
+      if (r->vgpuRingWait[i])
+         UnregisterWaitEx(r->vgpuRingWait[i], INVALID_HANDLE_VALUE); /* waits for a running callback */
+      r->vgpuRingWait[i] = NULL;
+      free(r->vgpuRingCtx[i]);
+      r->vgpuRingCtx[i] = NULL;
+      if (r->vgpuRingEvent[i])
+         CloseHandle(r->vgpuRingEvent[i]);
+      r->vgpuRingEvent[i] = NULL;
       if (r->pVgpuRing[i])
          ID3D11Texture2D_Release(r->pVgpuRing[i]);
       r->pVgpuRing[i] = NULL;
@@ -760,6 +768,26 @@ vgpu_blt_stats(UINT w, UINT h, const LARGE_INTEGER bt[5])
    }
 }
 
+BOOL vgpuPresentEnsureFence(PTRITON_DEVICE pD); /* tritonDxgi.c */
+
+struct vgpu_blt_ready {
+   TRITON_KM *km;
+   ULONGLONG token;
+};
+
+static VOID CALLBACK
+vgpu_blt_ready_cb(PVOID ctx, BOOLEAN timed_out)
+{
+   (void)timed_out;
+   struct vgpu_blt_ready *r = ctx;
+   VIOGPU_ESCAPE esc;
+   memset(&esc, 0, sizeof(esc));
+   esc.Type = VIOGPU_BLT_READY;
+   esc.DataLength = sizeof(esc.BltAsync);
+   esc.BltAsync.Token = r->token;
+   tritonKmEscape(r->km, &esc);
+}
+
 /* Asynchronous blt present: queue the GPU copy of the frame into the next ring
  * texture and stage a VIOGPU_BLT_ASYNC job for this thread; the KMD copies it
  * into DWM's surface once the present token (armed by the caller after this)
@@ -812,10 +840,43 @@ vgpu_blt_async(PTRITON_DEVICE pD, PTRITON_RESOURCE src, ID3D11Resource *copy_src
    esc.BltAsync.Width = d->Width;
    esc.BltAsync.Height = d->Height;
    esc.BltAsync.Swizzle = swizzle ? 1 : 0;
-   if (FAILED(tritonKmEscape(&pD->Km, &esc))) {
+   if (FAILED(tritonKmEscape(&pD->Km, &esc)) || esc.BltAsync.Token == 0) {
       TR_LOG("vgpu: blt async: escape failed; synchronous blt presents");
       src->vgpuRingFailed = TRUE;
       return false;
+   }
+
+   /* Retire the token when the readback is done: signal the present fence after
+    * the copy and let a thread-pool wait on its completion event send
+    * VIOGPU_BLT_READY.  The slot's previous wait finished long ago (at most
+    * TRITON_PRESENT_MAX_AHEAD frames are in flight). */
+   if (src->vgpuRingWait[k]) {
+      UnregisterWaitEx(src->vgpuRingWait[k], INVALID_HANDLE_VALUE);
+      src->vgpuRingWait[k] = NULL;
+   }
+   if (!src->vgpuRingEvent[k])
+      src->vgpuRingEvent[k] = CreateEventW(NULL, FALSE, FALSE, NULL);
+   if (!src->vgpuRingCtx[k])
+      src->vgpuRingCtx[k] = calloc(1, sizeof(struct vgpu_blt_ready));
+   struct vgpu_blt_ready *rc = src->vgpuRingCtx[k];
+   bool armed = false;
+   if (src->vgpuRingEvent[k] && rc && vgpuPresentEnsureFence(pD)) {
+      rc->km = &pD->Km;
+      rc->token = esc.BltAsync.Token;
+      const UINT64 v = ++pD->presentFenceValue;
+      ID3D11DeviceContext4_Signal(pD->pCtx4, pD->pPresentFence, v);
+      ID3D11DeviceContext1_Flush(pD->pCtx1);
+      ResetEvent(src->vgpuRingEvent[k]);
+      armed = SUCCEEDED(ID3D11Fence_SetEventOnCompletion(pD->pPresentFence, v, src->vgpuRingEvent[k])) &&
+              RegisterWaitForSingleObject(&src->vgpuRingWait[k], src->vgpuRingEvent[k], vgpu_blt_ready_cb, rc,
+                                          INFINITE, WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD);
+   }
+   if (!armed) {
+      /* cannot learn when the readback finishes: retire now (the KMD would
+       * otherwise hold the present until its deadline) and stop using the path */
+      vgpu_blt_ready_cb(&(struct vgpu_blt_ready){ &pD->Km, esc.BltAsync.Token }, FALSE);
+      TR_LOG("vgpu: blt async: cannot arm the readback fence; synchronous blt presents");
+      src->vgpuRingFailed = TRUE;
    }
    return true;
 }

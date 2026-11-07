@@ -628,6 +628,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         LIST_ENTRY Entry;
         ULONGLONG Id;          // 0 while staged (keyed by Tid)
         HANDLE Tid;
+        ULONGLONG Token;       // retired by VIOGPU_BLT_READY when the readback is done
         PEPROCESS Process;     // referenced; the pixels live in its address space
         const BYTE *Pixels;    // user VA of the frame origin
         ULONG Pitch, Width, Height, Swizzle;

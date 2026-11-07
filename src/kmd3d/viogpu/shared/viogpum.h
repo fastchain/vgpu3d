@@ -166,6 +166,9 @@ typedef struct _VIOGPU_ADAPTERINFO
 // becomes PRESENT_WAIT{token} + CPU_BLT, so the KMD copies the pixels into
 // DWM's surface after the GPU finished, and the app never waits for it.
 #define VIOGPU_BLT_ASYNC             0x501
+// vgpu: the GPU finished the readback of the VIOGPU_BLT_ASYNC job that
+// returned this token (the UMD saw its fence complete); retire it.
+#define VIOGPU_BLT_READY             0x502
 
 #pragma pack(1)
 typedef struct _VIOGPU_DISP_MODE
@@ -347,6 +350,7 @@ typedef struct _VIOGPU_BLT_ASYNC_REQ
     ULONG Width;
     ULONG Height;
     ULONG Swizzle;        // 1: pixels are RGBA8, convert to BGRA8
+    ULONGLONG Token;      // out: completion token, retired by VIOGPU_BLT_READY
 } VIOGPU_BLT_ASYNC_REQ;
 #pragma pack()
 

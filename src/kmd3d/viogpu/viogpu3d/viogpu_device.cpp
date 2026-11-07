@@ -582,7 +582,9 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         VioGpuAdapter::BLT_JOB *bltJob = m_pAdapter->BltJobTakeStaged(PsGetCurrentThreadId());
         if (bltJob != NULL)
         {
-            ULONGLONG bltToken = m_pAdapter->TakeThreadToken(PsGetCurrentThreadId());
+            // The job's own token, retired by VIOGPU_BLT_READY once the UMD saw
+            // the readback complete (DXVK's fences never reach the KMD).
+            ULONGLONG bltToken = bltJob->Token;
             VioGpuAllocation *dstAlloc = dst ? dst->GetAllocation() : NULL;
             const UINT need = 2 * (sizeof(VIOGPU_COMMAND_HDR) + sizeof(ULONGLONG));
             if (pPresent->pDmaBuffer && dstAlloc && dstAlloc->IsCoherent() && !dstAlloc->IsBlob() &&
@@ -612,6 +614,13 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
                 dstAlloc->AddRef();
                 bltJob->Dst = dstAlloc;
                 const ULONGLONG jobId = m_pAdapter->BltJobPark(bltJob);
+                {
+                    static LONG s_logged;
+                    if (InterlockedIncrement(&s_logged) <= 20)
+                        DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: blt async present job=%llu token=%llu retired=%d rects=%u\n",
+                                                       jobId, bltToken, bltToken ? (int)m_pAdapter->PresentTokenRetired(bltToken) : -1,
+                                                       bltJob->RectCount));
+                }
 
                 char *bodyStart = (char *)pPresent->pDmaBuffer;
                 UCHAR *p = (UCHAR *)bodyStart;

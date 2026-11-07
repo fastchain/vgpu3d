@@ -1526,7 +1526,21 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 job->Width = req->Width;
                 job->Height = req->Height;
                 job->Swizzle = req->Swizzle;
+                job->Token = PresentTokenSubmit();
+                pVioGpuEscape->BltAsync.Token = job->Token;
                 BltJobStage(job);
+                status = STATUS_SUCCESS;
+                break;
+            }
+        case VIOGPU_BLT_READY:
+            {
+                size = sizeof(VIOGPU_BLT_ASYNC_REQ);
+                if (pVioGpuEscape->DataLength < size || pVioGpuEscape->BltAsync.Token == 0)
+                {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                PresentTokenRetire(pVioGpuEscape->BltAsync.Token);
+                PresentWaitSweep();
                 status = STATUS_SUCCESS;
                 break;
             }

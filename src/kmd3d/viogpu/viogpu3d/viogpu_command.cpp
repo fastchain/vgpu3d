@@ -432,12 +432,24 @@ void VioGpuCommand::Run()
                     VioGpuAdapter::BLT_JOB *job = m_pAdapter->BltJobTake(jobId);
                     if (job != NULL)
                     {
+                        LARGE_INTEGER bf, b0 = KeQueryPerformanceCounter(&bf);
                         if (!job->Dst->CpuBltFromProcess(job->Process, job->Pixels, job->Pitch, job->Width, job->Height,
                                                          job->Swizzle != 0, job->Rects, job->RectCount, job->Dx, job->Dy))
                         {
                             DbgPrint(TRACE_LEVEL_WARNING, ("%s fence_id=%d CPU_BLT copy failed\n", __FUNCTION__, m_FenceId));
                         }
+                        {
+                            static LONG s_logged;
+                            LARGE_INTEGER b1 = KeQueryPerformanceCounter(NULL);
+                            if (InterlockedIncrement(&s_logged) <= 20)
+                                DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: CPU_BLT job=%llu %ux%u took %lld us\n", jobId, job->Width,
+                                                               job->Height, (b1.QuadPart - b0.QuadPart) * 1000000 / bf.QuadPart));
+                        }
                         VioGpuAdapter::BltJobFree(job);
+                    }
+                    else
+                    {
+                        DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: CPU_BLT job=%llu not found\n", jobId));
                     }
                     break;
                 }
