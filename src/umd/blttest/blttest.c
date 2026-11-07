@@ -1,7 +1,8 @@
 /*
  * blttest - windowed blt-model D3D11 swapchain (DXGI_SWAP_EFFECT_DISCARD) that clears to a
  * solid colour every frame; tests the classic redirected (blt) present path through DWM.
- * Usage: blttest [seconds [sync_interval]]   (default 30 s, interval 1)
+ * Usage: blttest [seconds [sync_interval [fullscreen]]]   (default 30 s, interval 1, windowed)
+ * fullscreen=1 switches the swapchain to exclusive fullscreen at the desktop mode.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -31,6 +32,8 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     int seconds = cmd && *cmd ? atoi(cmd) : 30;
     const char *sp = cmd ? strchr(cmd, ' ') : NULL;
     UINT interval = sp ? (UINT)atoi(sp + 1) : 1;
+    const char *sp2 = sp ? strchr(sp + 1, ' ') : NULL;
+    int fullscreen = sp2 ? atoi(sp2 + 1) : 0;
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
@@ -60,6 +63,13 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         MessageBoxA(NULL, "D3D11CreateDeviceAndSwapChain failed", "blttest", 0);
         return 1;
     }
+    if (fullscreen) {
+        hr = IDXGISwapChain_SetFullscreenState(sc, TRUE, NULL);
+        char m[96];
+        snprintf(m, sizeof(m), "blttest: SetFullscreenState hr=0x%08lx\n", hr);
+        OutputDebugStringA(m);
+        IDXGISwapChain_ResizeBuffers(sc, 0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+    }
     ID3D11Texture2D *bb;
     IDXGISwapChain_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void **)&bb);
     ID3D11RenderTargetView *rtv;
@@ -81,8 +91,11 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         IDXGISwapChain_Present(sc, interval, 0);
         frame++;
     }
-    char note[64];
-    snprintf(note, sizeof(note), "blttest frames=%u fps=%.1f interval=%u\n", frame, frame / (double)seconds, interval);
+    if (fullscreen)
+        IDXGISwapChain_SetFullscreenState(sc, FALSE, NULL);
+    char note[80];
+    snprintf(note, sizeof(note), "blttest frames=%u fps=%.1f interval=%u fullscreen=%d\n", frame,
+             frame / (double)seconds, interval, fullscreen);
     OutputDebugStringA(note);
     return 0;
 }

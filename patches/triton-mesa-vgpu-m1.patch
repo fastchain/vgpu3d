@@ -1,5 +1,5 @@
 diff --git a/src/virtio/neptune/triton/triton.h b/src/virtio/neptune/triton/triton.h
-index 94a72f4..3ccb872 100644
+index 94a72f4..919f13b 100644
 --- a/src/virtio/neptune/triton/triton.h
 +++ b/src/virtio/neptune/triton/triton.h
 @@ -247,7 +247,13 @@ typedef struct TRITON_DEVICE {
@@ -16,7 +16,7 @@ index 94a72f4..3ccb872 100644
  
  /* Defines a CalcPrivate*Size DDI whose private object has a fixed size. */
  #define TR_CALC_PRIVATE_SIZE(name, type, ...)                          \
-@@ -338,6 +344,26 @@ typedef struct TRITON_RESOURCE {
+@@ -338,6 +344,32 @@ typedef struct TRITON_RESOURCE {
  
      /* Head of the intrusive list of live views wrapping this resource. */
      TRITON_VIEWLINK       *pViewList;
@@ -29,6 +29,12 @@ index 94a72f4..3ccb872 100644
 +    D3DKMT_HANDLE          hVgpuCoherent;
 +    UINT                   vgpuCoherentW, vgpuCoherentH;
 +    ID3D11Texture2D       *pVgpuStaging;
++    /* pipelined synchronous blt presents: while the app presents continuously,
++     * the frame shipped is the previous one, whose readback has finished */
++    ID3D11Texture2D       *pVgpuStagingPrev;
++    BOOL                   vgpuPrevValid;
++    UINT                   vgpuFastRun;      /* consecutive presents < 50 ms apart */
++    LONGLONG               vgpuLastBltQpc;
 +    /* asynchronous blt presents: ring of persistently mapped readback textures
 +     * (VIOGPU_BLT_ASYNC); 4 > TRITON_PRESENT_MAX_AHEAD frames in flight */
 +    ID3D11Texture2D       *pVgpuRing[4];
@@ -43,11 +49,36 @@ index 94a72f4..3ccb872 100644
  } TRITON_RESOURCE, *PTRITON_RESOURCE;
  
  /* Views keep the host desc they were created with, so recreating them after
+diff --git a/src/virtio/neptune/triton/tritonDDI.c b/src/virtio/neptune/triton/tritonDDI.c
+index f012201..582dd86 100644
+--- a/src/virtio/neptune/triton/tritonDDI.c
++++ b/src/virtio/neptune/triton/tritonDDI.c
+@@ -638,6 +638,9 @@ static void tritonFillWDDM2_2DeviceFuncs(D3DWDDM2_2DDI_DEVICEFUNCS *p)
+ 
+ /* ---------- DestroyDevice ---------- */
+ 
++#ifdef VGPU_DXVK_INPROC
++void vgpuFbDeviceDestroy(PTRITON_DEVICE pD); /* vgpu_triton_backend.c */
++#endif
+ static void APIENTRY tritonDestroyDevice(D3D10DDI_HDEVICE hDevice)
+ {
+     PTRITON_DEVICE p = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
+@@ -682,6 +685,10 @@ static void APIENTRY tritonDestroyDevice(D3D10DDI_HDEVICE hDevice)
+         }
+     }
+ 
++#ifdef VGPU_DXVK_INPROC
++    /* stop the framebuffer present worker before its device goes away */
++    vgpuFbDeviceDestroy(p);
++#endif
+     if (p->pCtx1)
+         ID3D11DeviceContext1_Flush(p->pCtx1);
+     /* Tear down the present kernel context before the device goes away, under
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
-index bc4e182..009ff16 100644
+index bc4e182..af764d8 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
 +++ b/src/virtio/neptune/triton/tritonDxgi.c
-@@ -22,6 +22,12 @@
+@@ -22,6 +22,13 @@
  
  #include "tritonBlitShaders.h"
  
@@ -55,12 +86,13 @@ index bc4e182..009ff16 100644
 +void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT nrects); /* vgpu_triton_backend.c */
 +D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync);
 +void vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1);
++void vgpuPresentTailStats(BOOL windowed, const LARGE_INTEGER *t1, const LARGE_INTEGER *t2, const LARGE_INTEGER *t3);
 +#endif
 +
  /* Lazily create the GPU-done fence (rationale: the present-fence block in
   * triton.h).  Caller holds presentLock.  Returns TRUE if fencing is
   * available; FALSE => unfenced (bare-Flush) present. */
-@@ -65,6 +71,15 @@ tritonPresentEnsureFenceLocked(PTRITON_DEVICE pD)
+@@ -65,6 +72,15 @@ tritonPresentEnsureFenceLocked(PTRITON_DEVICE pD)
     return TRUE;
  }
  
@@ -76,7 +108,7 @@ index bc4e182..009ff16 100644
  /* Pop a reusable auto-reset event for one GPU-done wait (caller holds
   * presentLock).  Every concurrent waiter takes its own event, for the reason
   * given with the pool in triton.h.  The KMD signals it (via npt_event's
-@@ -621,7 +636,56 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -621,7 +637,58 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -119,6 +151,8 @@ index bc4e182..009ff16 100644
 +   /* vgpu: hand the finished frame to the KMD's 2D framebuffer (see
 +    * vgpuFbPresent): dma-buf scanout of the primary does not reach the host
 +    * display on every host. */
++   LARGE_INTEGER vgpuT2, vgpuT3;
++   QueryPerformanceCounter(&vgpuT2);
 +   if (src->IsPresentable) {
 +      tritonPresentLock(pD);
 +      vgpuFbPresent(pD, src, NULL, 0); /* DXGI Present carries no dirty rects */
@@ -133,7 +167,7 @@ index bc4e182..009ff16 100644
  
     /* DXGIDDICB_PRESENT (MSDN):
      *   hSrcAllocation  the rendered back buffer to present (a flip-primary
-@@ -631,7 +695,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -631,11 +698,24 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
      *   pDXGIContext    runtime cookie threaded through unchanged. */
     DXGIDDICB_PRESENT cb;
     memset(&cb, 0, sizeof(cb));
@@ -145,7 +179,21 @@ index bc4e182..009ff16 100644
     cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
     cb.pDXGIContext   = pArgs->pDXGIContext;
     cb.hContext       = pD->hKMContext;
-@@ -1335,11 +1402,63 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
++#ifdef VGPU_DXVK_INPROC
++   QueryPerformanceCounter(&vgpuT3);
++#endif
+    HRESULT hr = tritonPresentSubmitCb(pD, &cb);
++#ifdef VGPU_DXVK_INPROC
++   {
++      LARGE_INTEGER vgpuT4;
++      QueryPerformanceCounter(&vgpuT4);
++      vgpuPresentTailStats(!src->IsPresentable, &vgpuT2, &vgpuT3, &vgpuT4);
++   }
++#endif
+    InterlockedDecrement(&pD->presentInFlight);
+    return hr;
+ }
+@@ -1335,15 +1415,79 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -188,6 +236,8 @@ index bc4e182..009ff16 100644
 +   /* vgpu: hand the finished frame to the KMD's 2D framebuffer (see
 +    * vgpuFbPresent): dma-buf scanout of the primary does not reach the host
 +    * display on every host. */
++   LARGE_INTEGER vgpuT2, vgpuT3;
++   QueryPerformanceCounter(&vgpuT2);
 +   if (src->IsPresentable) {
 +      tritonPresentLock(pD);
 +      vgpuFbPresent(pD, src, pArgs->pDirtyRects, pArgs->DirtyRects);
@@ -210,6 +260,20 @@ index bc4e182..009ff16 100644
     cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
     cb.pDXGIContext   = pArgs->pDXGIContext;
     cb.hContext       = pD->hKMContext;
++#ifdef VGPU_DXVK_INPROC
++   QueryPerformanceCounter(&vgpuT3);
++#endif
+    HRESULT hr = tritonPresentSubmitCb(pD, &cb);
++#ifdef VGPU_DXVK_INPROC
++   {
++      LARGE_INTEGER vgpuT4;
++      QueryPerformanceCounter(&vgpuT4);
++      vgpuPresentTailStats(!src->IsPresentable, &vgpuT2, &vgpuT3, &vgpuT4);
++   }
++#endif
+    tritonPresentAmortize(pD);
+    InterlockedDecrement(&pD->presentInFlight);
+    return hr;
 diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
 index 4a359d5..8962be5 100644
 --- a/src/virtio/neptune/triton/tritonKm.c
@@ -224,7 +288,7 @@ index 4a359d5..8962be5 100644
        HRESULT hr = tritonKmEscape(km, &esc);
        if (SUCCEEDED(hr))
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
-index e47217f..a068a67 100644
+index e47217f..612e8fc 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
 +++ b/src/virtio/neptune/triton/tritonResource.c
 @@ -15,6 +15,10 @@
@@ -238,7 +302,7 @@ index e47217f..a068a67 100644
  /* tritonQuery.c; the DDI table in tritonDDI.c carries the same prototype. */
  void APIENTRY tritonCheckFormatSupport(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT *);
  
-@@ -206,6 +210,18 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -206,6 +210,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      r->pResource        = NULL;
      r->pPresentCompanion = NULL;
      r->pViewList        = NULL;
@@ -246,6 +310,10 @@ index e47217f..a068a67 100644
 +    r->hVgpuCoherent    = 0;
 +    r->vgpuCoherentW    = r->vgpuCoherentH = 0;
 +    r->pVgpuStaging     = NULL;
++    r->pVgpuStagingPrev = NULL;
++    r->vgpuPrevValid    = FALSE;
++    r->vgpuFastRun      = 0;
++    r->vgpuLastBltQpc   = 0;
 +    memset(r->pVgpuRing, 0, sizeof(r->pVgpuRing));
 +    memset((void *)r->vgpuRingPtr, 0, sizeof(r->vgpuRingPtr));
 +    r->vgpuRingIdx      = 0;
@@ -257,7 +325,7 @@ index e47217f..a068a67 100644
      /* A resource is a display primary only when the runtime supplies
       * pPrimaryDesc (d3d10umddi.h: "If pPrimaryDesc absent, blt/copy style
       * is implied when used with Present").  BIND_PRESENT alone marks any
-@@ -242,10 +258,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -242,10 +262,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      const BOOL exportableShape = pArgs->MipLevels <= 1 &&
                                   pArgs->ArraySize <= 1 &&
                                   pArgs->SampleDesc.Count <= 1;
@@ -280,7 +348,7 @@ index e47217f..a068a67 100644
  
  
      /* Top-level dimensions come from the mip-0 entry of pMipInfoList. */
-@@ -520,6 +548,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+@@ -520,6 +552,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
          ID3D11Resource_Release(r->pResource);
          r->pResource = NULL;
      }

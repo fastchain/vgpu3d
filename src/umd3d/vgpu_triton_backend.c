@@ -493,13 +493,44 @@ tritonSharedBridgeOpenRes(void *pDeviceWrapper, uint32_t res_id,
  * 2D framebuffer resource (VIOGPU_FB_PRESENT): read back the finished frame
  * into a CPU staging texture and let the KMD copy it.  dma-buf scanout of the
  * GPU primary itself reaches QEMU but not the egl-headless display on an
- * NVIDIA host.  Called under tritonPresentLock. */
+ * NVIDIA host.  Called under tritonPresentLock.
+ *
+ * Asynchronous by default: the present only queues the GPU copy into one of
+ * VGPU_FB_RING persistently mapped readback textures and signals a private
+ * fence; a worker thread waits for the fence and does the escape, so the
+ * presenting thread (DWM) does not wait for the GPU or the CPU copy.  Frames
+ * reach the KMD in present order. */
+#define VGPU_FB_RING 3
+struct vgpu_fb_job {
+   UINT64 value; /* fence value signalled after the copy */
+   LONG x0, y0, x1, y1;
+   UINT slot;
+   LARGE_INTEGER queued;
+};
 static struct {
    PTRITON_DEVICE dev;
-   ID3D11Texture2D *staging;
+   ID3D11Texture2D *staging; /* synchronous path */
    UINT width, height;
    DXGI_FORMAT format;
    bool need_full; /* staging recreated or the KMD asked for a full frame */
+   /* asynchronous path */
+   bool async, async_failed;
+   ID3D11Texture2D *ring[VGPU_FB_RING];
+   uint8_t *ptr[VGPU_FB_RING];
+   UINT pitch[VGPU_FB_RING];
+   bool busy[VGPU_FB_RING];
+   UINT dropped; /* queued frames replaced by a newer one */
+   ID3D11Fence *fence;
+   UINT64 fence_value;
+   HANDLE thread;
+   CRITICAL_SECTION lock;
+   bool lock_init;
+   CONDITION_VARIABLE cv_job, cv_done;
+   struct vgpu_fb_job jobs[VGPU_FB_RING];
+   UINT head, count;
+   bool stop;
+   TRITON_KM km;
+   volatile LONG worker_need_full;
 } vgpu_fb;
 
 /* HKLM\SOFTWARE\vgpu  Scanout (REG_SZ): "blob" leaves scanout primaries to the KMD's blob
@@ -512,7 +543,7 @@ vgpu_blob_scanout(void)
    if (mode < 0) {
       char v[16] = "";
       DWORD n = sizeof(v);
-      mode = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "Scanout", RRF_RT_REG_SZ, NULL, v, &n) ==
+      mode = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "Scanout", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, v, &n) ==
                    ERROR_SUCCESS &&
                 !_stricmp(v, "blob");
       TR_LOG("vgpu: scanout mode %s", mode ? "blob (GPU)" : "framebuffer copy");
@@ -547,6 +578,260 @@ vgpu_fb_stats(UINT64 area, UINT64 full, const LARGE_INTEGER t[3])
    }
 }
 
+/* HKLM\SOFTWARE\vgpu FbAsync (REG_DWORD) = 0 turns the asynchronous framebuffer
+ * present off.  Read once per process. */
+static bool
+vgpu_fb_async_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      DWORD v = 1, n = sizeof(v);
+      if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "FbAsync", RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+                       NULL, &v, &n) != ERROR_SUCCESS)
+         v = 1;
+      enabled = v != 0;
+   }
+   return enabled;
+}
+
+/* Worker-side statistics, logged every vgpu_stats_every() frames: queue-to-ready
+ * (GPU copy latency) and the escape. */
+static void
+vgpu_fb_async_stats(UINT64 area, UINT64 full, const LARGE_INTEGER *queued, const LARGE_INTEGER *ready,
+                    const LARGE_INTEGER *done)
+{
+   static LARGE_INTEGER freq;
+   static double wait_us, esc_us;
+   static UINT64 sum_area, sum_full;
+   static UINT n;
+   if (!freq.QuadPart)
+      QueryPerformanceFrequency(&freq);
+   const double us = 1e6 / (double)freq.QuadPart;
+   wait_us += (double)(ready->QuadPart - queued->QuadPart) * us;
+   esc_us += (double)(done->QuadPart - ready->QuadPart) * us;
+   sum_area += area;
+   sum_full += full;
+   if (++n == vgpu_stats_every()) {
+      TR_LOG("vgpu: fb async stats n=%u updated=%u%% avg us: gpu=%u escape=%u, dropped %u", n,
+             (UINT)(sum_area * 100 / (sum_full ? sum_full : 1)), (UINT)(wait_us / n), (UINT)(esc_us / n),
+             vgpu_fb.dropped);
+      vgpu_fb.dropped = 0;
+      wait_us = esc_us = 0;
+      sum_area = sum_full = 0;
+      n = 0;
+   }
+}
+
+static DWORD WINAPI
+vgpu_fb_worker(void *arg)
+{
+   (void)arg;
+   HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+   EnterCriticalSection(&vgpu_fb.lock);
+   for (;;) {
+      while (!vgpu_fb.count && !vgpu_fb.stop)
+         SleepConditionVariableCS(&vgpu_fb.cv_job, &vgpu_fb.lock, INFINITE);
+      if (!vgpu_fb.count)
+         break; /* stopping, queue drained */
+      const struct vgpu_fb_job job = vgpu_fb.jobs[vgpu_fb.head];
+      LeaveCriticalSection(&vgpu_fb.lock);
+
+      /* wait for the readback: yield first, then sleep in 200 us steps; give up
+       * after 2 s (the frame is then copied as it is) */
+      const ULONGLONG deadline = GetTickCount64() + 2000;
+      for (UINT spins = 0; ID3D11Fence_GetCompletedValue(vgpu_fb.fence) < job.value; spins++) {
+         if (GetTickCount64() > deadline) {
+            static LONG n;
+            if (InterlockedIncrement(&n) <= 3)
+               TR_LOG("vgpu: fb async: fence %llu not reached after 2 s", (unsigned long long)job.value);
+            break;
+         }
+         if (spins < 32 || !timer) {
+            SwitchToThread();
+         } else {
+            LARGE_INTEGER due = { .QuadPart = -2000 }; /* 200 us */
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+               WaitForSingleObject(timer, INFINITE);
+         }
+      }
+      LARGE_INTEGER ready, done;
+      QueryPerformanceCounter(&ready);
+
+      VIOGPU_ESCAPE esc;
+      memset(&esc, 0, sizeof(esc));
+      esc.Type = VIOGPU_FB_PRESENT;
+      esc.DataLength = sizeof(esc.FbPresent);
+      esc.FbPresent.Pixels = VioGpuUmPtr(vgpu_fb.ptr[job.slot] + (SIZE_T)job.y0 * vgpu_fb.pitch[job.slot] +
+                                         (SIZE_T)job.x0 * 4);
+      esc.FbPresent.Width = (ULONG)(job.x1 - job.x0);
+      esc.FbPresent.Height = (ULONG)(job.y1 - job.y0);
+      esc.FbPresent.Pitch = vgpu_fb.pitch[job.slot];
+      esc.FbPresent.Format = vgpu_fb.format;
+      esc.FbPresent.DstX = (ULONG)job.x0;
+      esc.FbPresent.DstY = (ULONG)job.y0;
+      HRESULT hr = tritonKmEscape(&vgpu_fb.km, &esc);
+      if (FAILED(hr) || esc.FbPresent.NeedFull)
+         InterlockedExchange(&vgpu_fb.worker_need_full, 1);
+      QueryPerformanceCounter(&done);
+      vgpu_fb_async_stats((UINT64)(job.x1 - job.x0) * (UINT64)(job.y1 - job.y0),
+                          (UINT64)vgpu_fb.width * vgpu_fb.height, &job.queued, &ready, &done);
+
+      EnterCriticalSection(&vgpu_fb.lock);
+      vgpu_fb.busy[job.slot] = false;
+      vgpu_fb.head = (vgpu_fb.head + 1) % VGPU_FB_RING;
+      vgpu_fb.count--;
+      WakeAllConditionVariable(&vgpu_fb.cv_done);
+   }
+   LeaveCriticalSection(&vgpu_fb.lock);
+   if (timer)
+      CloseHandle(timer);
+   return 0;
+}
+
+/* Stops the worker after it drained its queue and frees everything. */
+static void
+vgpu_fb_reset(void)
+{
+   if (vgpu_fb.thread) {
+      EnterCriticalSection(&vgpu_fb.lock);
+      vgpu_fb.stop = true;
+      WakeAllConditionVariable(&vgpu_fb.cv_job);
+      LeaveCriticalSection(&vgpu_fb.lock);
+      WaitForSingleObject(vgpu_fb.thread, INFINITE);
+      CloseHandle(vgpu_fb.thread);
+   }
+   for (UINT i = 0; i < VGPU_FB_RING; i++)
+      if (vgpu_fb.ring[i])
+         ID3D11Texture2D_Release(vgpu_fb.ring[i]);
+   if (vgpu_fb.fence)
+      ID3D11Fence_Release(vgpu_fb.fence);
+   if (vgpu_fb.staging)
+      ID3D11Texture2D_Release(vgpu_fb.staging);
+   const bool lock_init = vgpu_fb.lock_init;
+   const bool async_failed = vgpu_fb.async_failed;
+   CRITICAL_SECTION lock = vgpu_fb.lock;
+   memset(&vgpu_fb, 0, sizeof(vgpu_fb));
+   vgpu_fb.lock = lock;
+   vgpu_fb.lock_init = lock_init;
+   vgpu_fb.async_failed = async_failed;
+}
+
+/* Called from DestroyDevice before the device's state is torn down. */
+void
+vgpuFbDeviceDestroy(PTRITON_DEVICE pD)
+{
+   if (vgpu_fb.dev == pD)
+      vgpu_fb_reset();
+}
+
+/* Ring textures (persistently mapped: the pointer of one blocking Map at
+ * creation stays valid), private fence and worker thread. */
+static bool
+vgpu_fb_async_setup(PTRITON_DEVICE pD, const D3D11_TEXTURE2D_DESC *sd)
+{
+   if (vgpu_fb.async_failed || !pD->pCtx4)
+      return false;
+   ID3D11Device5 *dev5 = NULL;
+   if (FAILED(ID3D11Device1_QueryInterface(pD->pDev1, &IID_ID3D11Device5, (void **)&dev5)))
+      goto fail;
+   HRESULT hr = ID3D11Device5_CreateFence(dev5, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence, (void **)&vgpu_fb.fence);
+   ID3D11Device5_Release(dev5);
+   if (FAILED(hr)) {
+      vgpu_fb.fence = NULL;
+      goto fail;
+   }
+   for (UINT i = 0; i < VGPU_FB_RING; i++) {
+      D3D11_MAPPED_SUBRESOURCE m;
+      if (FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, sd, NULL, &vgpu_fb.ring[i]))) {
+         vgpu_fb.ring[i] = NULL;
+         goto fail;
+      }
+      if (FAILED(ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)vgpu_fb.ring[i], 0, D3D11_MAP_READ, 0, &m)))
+         goto fail;
+      vgpu_fb.ptr[i] = m.pData;
+      vgpu_fb.pitch[i] = m.RowPitch;
+      ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)vgpu_fb.ring[i], 0);
+   }
+   if (!vgpu_fb.lock_init) {
+      InitializeCriticalSection(&vgpu_fb.lock);
+      vgpu_fb.lock_init = true;
+   }
+   InitializeConditionVariable(&vgpu_fb.cv_job);
+   InitializeConditionVariable(&vgpu_fb.cv_done);
+   vgpu_fb.km = pD->Km;
+   vgpu_fb.thread = CreateThread(NULL, 0, vgpu_fb_worker, NULL, 0, NULL);
+   if (!vgpu_fb.thread)
+      goto fail;
+   SetThreadPriority(vgpu_fb.thread, THREAD_PRIORITY_ABOVE_NORMAL);
+   TR_LOG("vgpu: fb presents asynchronous (%u slots, %ux%u)", VGPU_FB_RING, sd->Width, sd->Height);
+   return true;
+
+fail:
+   TR_LOG("vgpu: fb async setup failed; synchronous fb presents");
+   for (UINT i = 0; i < VGPU_FB_RING; i++) {
+      if (vgpu_fb.ring[i])
+         ID3D11Texture2D_Release(vgpu_fb.ring[i]);
+      vgpu_fb.ring[i] = NULL;
+   }
+   if (vgpu_fb.fence)
+      ID3D11Fence_Release(vgpu_fb.fence);
+   vgpu_fb.fence = NULL;
+   vgpu_fb.async_failed = true;
+   return false;
+}
+
+/* Queues the readback of the box and hands it to the worker.  Takes a free
+ * slot; with none free, a queued job the worker has not started whose box lies
+ * inside this one is dropped and its slot reused (the newer frame covers it),
+ * like a sync-interval-0 flip queue.  Otherwise it waits for the worker.
+ * FALSE: present synchronously (no slot within 1 s). */
+static bool
+vgpu_fb_async_present(PTRITON_DEVICE pD, PTRITON_RESOURCE src, LONG x0, LONG y0, LONG x1, LONG y1)
+{
+   UINT slot = VGPU_FB_RING;
+   EnterCriticalSection(&vgpu_fb.lock);
+   for (;;) {
+      for (UINT i = 0; i < VGPU_FB_RING && slot == VGPU_FB_RING; i++)
+         if (!vgpu_fb.busy[i])
+            slot = i;
+      if (slot == VGPU_FB_RING && vgpu_fb.count >= 2) {
+         /* the head job may be in progress; the newest queued one is not */
+         struct vgpu_fb_job *last = &vgpu_fb.jobs[(vgpu_fb.head + vgpu_fb.count - 1) % VGPU_FB_RING];
+         if (last->x0 >= x0 && last->y0 >= y0 && last->x1 <= x1 && last->y1 <= y1) {
+            slot = last->slot; /* stays busy: now owned by this present */
+            vgpu_fb.count--;
+            vgpu_fb.dropped++;
+         }
+      }
+      if (slot != VGPU_FB_RING)
+         break;
+      if (!SleepConditionVariableCS(&vgpu_fb.cv_done, &vgpu_fb.lock, 1000)) {
+         LeaveCriticalSection(&vgpu_fb.lock);
+         TR_LOG("vgpu: fb async: no free slot after 1 s");
+         return false;
+      }
+   }
+   vgpu_fb.busy[slot] = true;
+   LeaveCriticalSection(&vgpu_fb.lock);
+
+   struct vgpu_fb_job job = { .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1, .slot = slot };
+   QueryPerformanceCounter(&job.queued);
+   D3D11_BOX box = { (UINT)x0, (UINT)y0, 0, (UINT)x1, (UINT)y1, 1 };
+   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)vgpu_fb.ring[slot], 0, (UINT)x0,
+                                              (UINT)y0, 0, src->pResource, 0, &box);
+   job.value = ++vgpu_fb.fence_value;
+   ID3D11DeviceContext4_Signal(pD->pCtx4, vgpu_fb.fence, job.value);
+   ID3D11DeviceContext1_Flush(pD->pCtx1);
+
+   EnterCriticalSection(&vgpu_fb.lock);
+   vgpu_fb.jobs[(vgpu_fb.head + vgpu_fb.count) % VGPU_FB_RING] = job;
+   vgpu_fb.count++;
+   WakeConditionVariable(&vgpu_fb.cv_job);
+   LeaveCriticalSection(&vgpu_fb.lock);
+   vgpu_fb.need_full = false;
+   return true;
+}
+
 /* Copies the changed part of the frame (the bounding box of the DXGI dirty rects, or the whole
  * frame) into the KMD framebuffer: only that box is read back, copied and uploaded to the host. */
 void
@@ -563,9 +848,7 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT n
 
    if (vgpu_fb.dev != pD || vgpu_fb.width != d.Width || vgpu_fb.height != d.Height ||
        vgpu_fb.format != d.Format) {
-      if (vgpu_fb.staging)
-         ID3D11Texture2D_Release(vgpu_fb.staging);
-      memset(&vgpu_fb, 0, sizeof(vgpu_fb));
+      vgpu_fb_reset();
       D3D11_TEXTURE2D_DESC sd = d;
       sd.MipLevels = 1;
       sd.ArraySize = 1;
@@ -585,7 +868,10 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT n
       vgpu_fb.height = d.Height;
       vgpu_fb.format = d.Format;
       vgpu_fb.need_full = true;
+      vgpu_fb.async = vgpu_fb_async_enabled() && vgpu_fb_async_setup(pD, &sd);
    }
+   if (InterlockedExchange(&vgpu_fb.worker_need_full, 0))
+      vgpu_fb.need_full = true;
 
    /* bounding box of the dirty rects, clipped to the frame; whole frame when unknown */
    LONG x0 = 0, y0 = 0, x1 = (LONG)d.Width, y1 = (LONG)d.Height;
@@ -600,6 +886,9 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT n
       if (x1 <= x0 || y1 <= y0)
          return; /* nothing visible changed */
    }
+
+   if (vgpu_fb.async && vgpu_fb_async_present(pD, src, x0, y0, x1, y1))
+      return;
 
    LARGE_INTEGER t[3];
    QueryPerformanceCounter(&t[0]);
@@ -655,6 +944,13 @@ vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r)
       ID3D11Texture2D_Release(r->pVgpuStaging);
       r->pVgpuStaging = NULL;
    }
+   if (r->pVgpuStagingPrev) {
+      ID3D11Texture2D_Release(r->pVgpuStagingPrev);
+      r->pVgpuStagingPrev = NULL;
+   }
+   r->vgpuPrevValid = FALSE;
+   r->vgpuFastRun = 0;
+   r->vgpuLastBltQpc = 0;
    for (UINT i = 0; i < 4; i++) {
       if (r->vgpuRingWait[i])
          UnregisterWaitEx(r->vgpuRingWait[i], INVALID_HANDLE_VALUE); /* waits for a running callback */
@@ -707,6 +1003,32 @@ vgpu_stats_every(void)
       every = (e && atoi(e) > 1) ? (UINT)atoi(e) : 600;
    }
    return every;
+}
+
+/* Time spent after the GPU gate: the framebuffer copy (scanout presents) and
+ * the runtime's present callback, where dxgkrnl throttles the caller; logged
+ * every 300 presents of each kind. */
+void
+vgpuPresentTailStats(BOOL windowed, const LARGE_INTEGER *t1, const LARGE_INTEGER *t2, const LARGE_INTEGER *t3)
+{
+   static LARGE_INTEGER freq;
+   static double fb[2], cb[2], cbmax[2];
+   static UINT n[2];
+   const int k = windowed ? 1 : 0;
+   if (!freq.QuadPart)
+      QueryPerformanceFrequency(&freq);
+   const double us = 1e6 / (double)freq.QuadPart;
+   const double c = (double)(t3->QuadPart - t2->QuadPart) * us;
+   fb[k] += (double)(t2->QuadPart - t1->QuadPart) * us;
+   cb[k] += c;
+   if (c > cbmax[k])
+      cbmax[k] = c;
+   if (++n[k] == 300) {
+      TR_LOG("vgpu: %s present tail n=300 avg us: fb=%u cb=%u (max %u)", windowed ? "windowed" : "scanout",
+             (UINT)(fb[k] / 300), (UINT)(cb[k] / 300), (UINT)cbmax[k]);
+      fb[k] = cb[k] = cbmax[k] = 0;
+      n[k] = 0;
+   }
 }
 
 /* Per-process present statistics, logged every 600 windowed presents: count by
@@ -806,6 +1128,23 @@ vgpu_blt_ready_cb(PVOID ctx, BOOLEAN timed_out)
    tritonKmEscape(r->km, &esc);
 }
 
+/* Pipelined synchronous blt presents (see vgpuBltSource); on unless
+ * HKLM\SOFTWARE\vgpu BltPipeline (REG_DWORD) = 0. */
+static bool
+vgpu_blt_pipeline(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      DWORD v = 1, n = sizeof(v);
+      if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "BltPipeline", RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+                       NULL, &v, &n) != ERROR_SUCCESS)
+         v = 1;
+      enabled = v != 0;
+      TR_LOG("vgpu: blt presents %s", enabled ? "pipelined" : "not pipelined");
+   }
+   return enabled;
+}
+
 /* Asynchronous blt present: queue the GPU copy of the frame into the next ring
  * texture and stage a VIOGPU_BLT_ASYNC job for this thread; the KMD copies it
  * into DWM's surface once the present token (armed by the caller after this)
@@ -819,7 +1158,7 @@ vgpu_blt_async(PTRITON_DEVICE pD, PTRITON_RESOURCE src, ID3D11Resource *copy_src
    static int enabled = -1;
    if (enabled < 0) {
       DWORD v = 0, n = sizeof(v);
-      enabled = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "BltAsync", RRF_RT_REG_DWORD, NULL, &v, &n) ==
+      enabled = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "BltAsync", RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v, &n) ==
                    ERROR_SUCCESS && v == 1;
       TR_LOG("vgpu: blt presents %s", enabled ? "asynchronous" : "synchronous");
    }
@@ -994,8 +1333,12 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
       sd.BindFlags = 0;
       sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
       sd.MiscFlags = 0;
-      if (FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuStaging))) {
+      if (FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuStaging)) ||
+          FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuStagingPrev))) {
+         if (src->pVgpuStaging)
+            ID3D11Texture2D_Release(src->pVgpuStaging);
          src->pVgpuStaging = NULL;
+         src->pVgpuStagingPrev = NULL;
          D3DDDICB_DEALLOCATE da;
          memset(&da, 0, sizeof(da));
          da.NumAllocations = 1;
@@ -1017,10 +1360,27 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
 
    LARGE_INTEGER bt[5];
    QueryPerformanceCounter(&bt[0]);
-   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0,
-                                              0, 0, 0, copy_src, 0, NULL);
+   /* Pipelining: after a run of presents less than 50 ms apart, ship the
+    * previous frame, whose copy was flushed a present ago and has finished,
+    * instead of waiting for this one; the frame is shown one present late.
+    * Isolated presents (UI updates) keep waiting, so only the last frame of
+    * an animation can be one frame behind until the window presents again. */
+   static LARGE_INTEGER qpf;
+   if (!qpf.QuadPart)
+      QueryPerformanceFrequency(&qpf);
+   const bool fast = src->vgpuLastBltQpc && bt[0].QuadPart - src->vgpuLastBltQpc < qpf.QuadPart / 20;
+   src->vgpuFastRun = fast ? min(src->vgpuFastRun + 1, 1000u) : 0;
+   src->vgpuLastBltQpc = bt[0].QuadPart;
+   const bool pipelined = vgpu_blt_pipeline() && src->vgpuPrevValid && src->vgpuFastRun >= 8;
+   ID3D11Texture2D *cur = src->pVgpuStaging, *prev = src->pVgpuStagingPrev;
+   ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)cur, 0, 0, 0, 0, copy_src, 0, NULL);
+   ID3D11Texture2D *readback = pipelined ? prev : cur;
+   /* this frame's texture becomes the next present's previous frame */
+   src->pVgpuStagingPrev = cur;
+   src->pVgpuStaging = prev;
+   src->vgpuPrevValid = TRUE;
    D3D11_MAPPED_SUBRESOURCE m;
-   if (FAILED(ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0,
+   if (FAILED(ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)readback, 0,
                                        D3D11_MAP_READ, 0, &m)))
       return 0;
    QueryPerformanceCounter(&bt[1]);
@@ -1076,7 +1436,7 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
       if (InterlockedIncrement(&n) <= 3)
          TR_LOG("vgpu: blt source: lock failed 0x%08lx", hr);
    }
-   ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0);
+   ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)readback, 0);
    QueryPerformanceCounter(&bt[4]);
    vgpu_blt_stats(d.Width, d.Height, bt);
    return ret;

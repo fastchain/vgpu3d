@@ -412,3 +412,38 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   (HKLM\SOFTWARE\vgpu VsyncHz, experiment knob). Old-style windowed presents are paced by DWM, and DWM's
   own frame at 5K takes ~16 ms while using little CPU: it is latency-bound on the guest->host GPU round
   trip as well. Next lever: DWM's per-frame GPU round trip (host-side latency: perf on the render server).
+
+### Guest-only speed-up round (2026-11-07, host changes ruled out)
+- Correction to the two sections above: the 32-bit UMD read HKLM\SOFTWARE\vgpu through the WOW64 view,
+  so BltAsync/Scanout never reached 32-bit apps. The "async blt 60.3 -> 62.0" Heaven result was really
+  the synchronous path. Fixed (RRF_SUBKEY_WOW6464KEY). And Heaven DX11 was not DWM-paced: per-frame
+  timing showed 7.3 ms of each 16.7 ms frame waiting for the synchronous readback of its own frame.
+- New per-present timing (UMD "present tail": time in the framebuffer copy and in the runtime's present
+  callback; DWM's own present costs ~3.4 ms of its ~15 ms frame at 5K).
+- Pipelined blt presents (default on, HKLM\SOFTWARE\vgpu BltPipeline=0 turns off): after 8 presents less
+  than 50 ms apart, a windowed blt present ships the previous frame, whose readback has finished, instead
+  of waiting for the current one (one frame of latency; isolated presents stay synchronous).
+  Heaven DX11 at a 5120x2160 desktop: 58.7 -> 88.5 fps (readback wait 7.3 ms -> 0.4 ms). Run-to-run
+  noise in later runs is about +-5 fps (Defender scans, host load).
+- KMD async blt (BltAsync=1) now really active for 32-bit apps: Heaven 29.7 fps with 1.2-1.5 s present
+  stalls (tokens retiring only at the KMD deadline) and the KMD CPU copy slowing DWM. Stays off.
+- Asynchronous framebuffer present (default on, FbAsync=0 turns off): the scanout present queues the
+  readback into one of 3 persistently mapped textures, signals a private fence and returns; a worker
+  thread waits for the fence and does the escape. A queued frame the worker has not started is
+  replaced by a newer frame that covers its box (sync-interval-0 semantics). Windowed: no measurable
+  change (DWM's rate is not set by our present). Exclusive fullscreen at 5120x2160 (blttest, 64- and
+  32-bit): 31 -> 77 fps app rate; the display shows what the host can upload (~15 ms per full 44 MB
+  frame on the host side: queue+kick in "fb kmd" stats), and flips are paced by the 75 Hz refresh.
+- DWM uploads a blt-model app's whole window with UpdateSubresource every frame (8 MB at 1920x1080):
+  its present has no destination, so Windows uses the GDI-style redirection bitmap. Avoiding that needs
+  DXGI to use a DX redirection surface for these swapchains (not investigated yet).
+- VsyncHz=120 does not lift DWM or fullscreen pacing reliably (mode stayed 75 Hz after a driver
+  restart); no default change. At 5K the host upload limits full frames to ~45/s anyway.
+- Known issue: Heaven DX11 in exclusive fullscreen fails: the host logs "vkQueueSubmit2 resulted in CS
+  error" (a submit references an object the host does not know), the app's Vulkan queue hangs.
+  blttest fullscreen works. Not yet diagnosed (host gives no more detail).
+- Superposition 1.1 (engine arguments, 1920x1080 windowed, shaders/textures quality 2, DX11) at the
+  5120x2160 desktop: avg 69.8 fps (min 35.4, max 107.5) over 17 scenes. At 1280x720 the HUD showed avg
+  117.3 fps pipelined vs ~72 with BltPipeline=0 at the same point. One mid-run frame showed a black streak
+  over a wall poster (possible rendering glitch, to check). superposition_cli.exe exits silently here.
+- Geekbench 6 free CLI runs only the CPU test (no GPU compute without Pro/GUI); not used.
