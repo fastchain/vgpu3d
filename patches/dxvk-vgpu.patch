@@ -134,3 +134,23 @@ index 0eaf992b..c8d3052d 100644
  };
  
  /**
+diff --git a/src/util/util_singleton.h b/src/util/util_singleton.h
+index ee5fe56d..b16f7ecd 100644
+--- a/src/util/util_singleton.h
++++ b/src/util/util_singleton.h
+@@ -20,9 +20,14 @@ public:
+   Rc<T> acquire(Args... constantArgs) {
+     std::lock_guard lock(m_mutex);
+ 
+-    if (!(m_useCount++))
++    // vgpu: count the use only once the object exists.  If the constructor
++    // throws (e.g. the Vulkan instance cannot be created), the exception
++    // reaches the caller and the next acquire() retries, instead of every
++    // later caller getting a null object (DXGI factory null dereference).
++    if (!m_useCount)
+       m_object = new T(constantArgs...);
+ 
++    m_useCount++;
+     return m_object;
+   }
+ 

@@ -3124,6 +3124,23 @@ void VioGpuAdapter::VioGpuAdapterClose()
 
     if (IsHardwareInit())
     {
+        // vgpu: drain the control queue before the reset.  QEMU processes
+        // control commands in order and parks a blob unmap/unref until the
+        // mapping is released; a synchronous GET_DISPLAY_INFO completes only
+        // after everything queued before it.  A reset that arrives while such
+        // a deferred blob destroy is pending makes QEMU abandon the reset and
+        // leaves the renderer unable to create contexts until QEMU restarts.
+        {
+            PGPU_VBUFFER drain = NULL;
+            if (ctrlQueue.AskDisplayInfo(&drain))
+            {
+                ctrlQueue.ReleaseBuffer(drain);
+            }
+            else
+            {
+                DbgPrint(TRACE_LEVEL_ERROR, ("%s control queue did not drain before reset\n", __FUNCTION__));
+            }
+        }
         // The ISR samples IsHardwareInit() and then dereferences
         // ctrlQueue / m_CursorQueue / m_VioDev. Flip the flag and
         // disable interrupts under DxgkCb-synchronisation so the

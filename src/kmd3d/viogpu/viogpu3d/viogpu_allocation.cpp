@@ -450,13 +450,20 @@ VioGpuAllocation::~VioGpuAllocation(void)
 
     if (m_IsBlob && m_Blob.Mapped)
     {
-        // Orphaned mapping (process died without the UMD unmap).  No
-        // UNMAP_BLOB is needed: the host tears the mapping down with the
-        // resource on the RESOURCE_UNREF below, deferring the unref until
-        // the mapping is gone.
+        // Orphaned mapping (process died without the UMD unmap).  The host
+        // would tear the mapping down on the RESOURCE_UNREF below by
+        // deferring the unref until the mapping is gone, but QEMU's device
+        // reset gives up while such a deferred blob destroy is pending
+        // (virtio_gpu_virgl_reset() returns false and the renderer is never
+        // re-initialised: every later context create fails until QEMU
+        // restarts).  Unmap explicitly so the unref finds nothing mapped.
         DbgPrint(TRACE_LEVEL_WARNING,
-                 ("---> %s res_id=%d still-mapped blob at destroy (host unmaps at unref)\n",
+                 ("---> %s res_id=%d still-mapped blob at destroy: unmapping first\n",
                   __FUNCTION__, m_Id));
+        if (m_Id != 0 && !m_IsImport)
+        {
+            m_adapter->ctrlQueue.ResourceUnmapBlob(m_Id, m_CreateCtxId, NULL, NULL);
+        }
         m_Blob.Mapped = FALSE;
     }
 

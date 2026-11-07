@@ -1943,6 +1943,7 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
 
     const BYTE *pSrc = VIOGPU_UM_PTR_AS(const BYTE *, pReq->Pixels);
     BYTE *pBox = pDst + (SIZE_T)y * dstPitch + (SIZE_T)x * 4;
+    LARGE_INTEGER freq, t0 = KeQueryPerformanceCounter(&freq);
     __try
     {
         ProbeForRead((PVOID)pSrc, (SIZE_T)pReq->Pitch * (height - 1) + (SIZE_T)width * 4, 1);
@@ -1956,6 +1957,7 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
         return STATUS_INVALID_PARAMETER;
     }
 
+    LARGE_INTEGER t1 = KeQueryPerformanceCounter(NULL);
     if (x == 0 && y == 0 && width == fbWidth && height == fbHeight)
     {
         m_FbNeedsFull = FALSE;
@@ -1973,6 +1975,24 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
         m_pAdapter->ctrlQueue.SetScanout(0, resid, fbWidth, fbHeight, 0, 0);
     }
     m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y);
+
+    // vgpu: every 600 presents, average copy vs command-queue time and MB/s of the copy
+    {
+        static LONGLONG s_copy, s_cmd, s_bytes;
+        static ULONG s_n;
+        LARGE_INTEGER t2 = KeQueryPerformanceCounter(NULL);
+        s_copy += t1.QuadPart - t0.QuadPart;
+        s_cmd += t2.QuadPart - t1.QuadPart;
+        s_bytes += (LONGLONG)width * height * 4;
+        if (++s_n == 600)
+        {
+            const LONGLONG us_copy = s_copy * 1000000 / freq.QuadPart, us_cmd = s_cmd * 1000000 / freq.QuadPart;
+            DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: fb kmd avg us copy=%lld cmds=%lld, copy %lld MB/s\n", us_copy / s_n,
+                                           us_cmd / s_n, us_copy ? s_bytes / us_copy : 0));
+            s_copy = s_cmd = s_bytes = 0;
+            s_n = 0;
+        }
+    }
     return STATUS_SUCCESS;
 }
 
