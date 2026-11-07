@@ -1,7 +1,7 @@
 /*
  * blttest - windowed blt-model D3D11 swapchain (DXGI_SWAP_EFFECT_DISCARD) that clears to a
  * solid colour every frame; tests the classic redirected (blt) present path through DWM.
- * Usage: blttest [seconds]   (default 30)
+ * Usage: blttest [seconds [sync_interval]]   (default 30 s, interval 1)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -29,6 +29,8 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     (void)prev;
     (void)show;
     int seconds = cmd && *cmd ? atoi(cmd) : 30;
+    const char *sp = cmd ? strchr(cmd, ' ') : NULL;
+    UINT interval = sp ? (UINT)atoi(sp + 1) : 1;
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
@@ -76,8 +78,11 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         /* orange, pulsing slightly so successive frames differ */
         float c[4] = { 1.0f, 0.4f + 0.1f * (float)((frame / 30) & 1), 0.0f, 1.0f };
         ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, c);
-        IDXGISwapChain_Present(sc, 1, 0);
+        IDXGISwapChain_Present(sc, interval, 0);
         frame++;
     }
+    char note[64];
+    snprintf(note, sizeof(note), "blttest frames=%u fps=%.1f interval=%u\n", frame, frame / (double)seconds, interval);
+    OutputDebugStringA(note);
     return 0;
 }

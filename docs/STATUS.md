@@ -401,3 +401,14 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   blt path the app now waits in the present pacing (<= 3 frames ahead of the GPU): the guest->host GPU
   pipeline (DXVK conversion, Venus encode, host decode, GPU) completes one Heaven frame per ~16 ms.
   Next: profile that pipeline (guest WPR on the app's DXVK threads, host perf on virgl_render_server).
+
+### Guest profiling of Heaven DX11 (2026-11-07)
+- WPR CPU trace (20 s mid-run): Heaven main thread busy 28% (0.28 core), DXVK conversion thread 0.11 core,
+  whole process 0.7 core; the VM is 96.5% idle. Main thread is woken ~61x/s, mostly by DXVK's worker and
+  submission threads: one pipeline wait per frame. The guest CPU is not the bottleneck.
+- blttest (trivial clear): 980 presents/s with sync interval 0, 60 with interval 1 -> the copy path is cheap.
+- Heaven DX11 tracks DWM's composition rate: 72.5 fps at a 2560x1080 desktop (DWM ~72-75), 60-62 fps at
+  5120x2160 (DWM ~60), also with -video_vsync 0 and with the vsync source forced to 120 Hz
+  (HKLM\SOFTWARE\vgpu VsyncHz, experiment knob). Old-style windowed presents are paced by DWM, and DWM's
+  own frame at 5K takes ~16 ms while using little CPU: it is latency-bound on the guest->host GPU round
+  trip as well. Next lever: DWM's per-frame GPU round trip (host-side latency: perf on the render server).

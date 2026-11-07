@@ -718,8 +718,26 @@ vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE
    static LARGE_INTEGER freq, last;
    static double gate, gap;
    static UINT n, blt, flip, other;
-   if (!windowed)
+   if (!windowed) {
+      /* scanout presents (DWM): own counters, logged every 300 */
+      static LARGE_INTEGER plast;
+      static double pgate, pgap;
+      static UINT pn;
+      if (!freq.QuadPart)
+         QueryPerformanceFrequency(&freq);
+      const double pus = 1e6 / (double)freq.QuadPart;
+      pgate += (double)(t1->QuadPart - t0->QuadPart) * pus;
+      if (plast.QuadPart)
+         pgap += (double)(t0->QuadPart - plast.QuadPart) * pus;
+      plast = *t1;
+      if (++pn == 300) {
+         TR_LOG("vgpu: scanout present stats n=%u avg us: gate=%u gap=%u (%.1f fps)", pn, (UINT)(pgate / pn),
+                (UINT)(pgap / (pn - 1)), 1e6 * (pn - 1) / (pgap ? pgap : 1));
+         pgate = pgap = 0;
+         pn = 0;
+      }
       return;
+   }
    if (!freq.QuadPart)
       QueryPerformanceFrequency(&freq);
    const double us = 1e6 / (double)freq.QuadPart;
