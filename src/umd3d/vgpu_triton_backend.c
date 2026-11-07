@@ -601,6 +601,65 @@ vgpu_is_bgra8(DXGI_FORMAT f)
           f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8X8_TYPELESS;
 }
 
+/* Per-process present statistics, logged every 600 windowed presents: count by
+ * DXGI present flags, average FlushAndGate (GPU wait) time and the gap between
+ * presents. */
+void
+vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1)
+{
+   static LARGE_INTEGER freq, last;
+   static double gate, gap;
+   static UINT n, blt, flip, other;
+   if (!windowed)
+      return;
+   if (!freq.QuadPart)
+      QueryPerformanceFrequency(&freq);
+   const double us = 1e6 / (double)freq.QuadPart;
+   gate += (double)(t1->QuadPart - t0->QuadPart) * us;
+   if (last.QuadPart)
+      gap += (double)(t0->QuadPart - last.QuadPart) * us;
+   last = *t1;
+   if (flags & 0x1)
+      blt++;
+   else if (flags & 0x2)
+      flip++;
+   else
+      other++;
+   if (++n == 600) {
+      TR_LOG("vgpu: present stats n=%u blt=%u flip=%u other=%u avg us: gate=%u gap=%u", n, blt, flip, other,
+             (UINT)(gate / n), (UINT)(gap / (n - 1)));
+      gate = gap = 0;
+      n = blt = flip = other = 0;
+   }
+}
+
+/* VGPU_BLT_STATS: per-process averages of the blt-source stages, every 600 frames.
+ * wait = GPU copy + Map (stall), lock = pfnLockCb, copy = CPU row copy,
+ * unlock = Unlock + Unmap, gap = time between successive blt presents. */
+static void
+vgpu_blt_stats(UINT w, UINT h, const LARGE_INTEGER bt[5])
+{
+   static LARGE_INTEGER freq, last;
+   static double acc[5];
+   static UINT n;
+   if (!freq.QuadPart)
+      QueryPerformanceFrequency(&freq);
+   const double ms = 1000.0 / (double)freq.QuadPart;
+   for (int i = 0; i < 4; i++)
+      acc[i] += (double)(bt[i + 1].QuadPart - bt[i].QuadPart) * ms;
+   if (last.QuadPart)
+      acc[4] += (double)(bt[0].QuadPart - last.QuadPart) * ms;
+   last = bt[4];
+   if (++n == 600) {
+      /* integer microseconds: TR_LOG has no floating-point formatting */
+      TR_LOG("vgpu: blt stats %ux%u avg us: wait=%u lock=%u copy=%u unlock=%u gap=%u",
+             w, h, (UINT)(acc[0] * 1000 / n), (UINT)(acc[1] * 1000 / n), (UINT)(acc[2] * 1000 / n),
+             (UINT)(acc[3] * 1000 / n), (UINT)(acc[4] * 1000 / (n - 1)));
+      memset(acc, 0, sizeof(acc));
+      n = 0;
+   }
+}
+
 D3DKMT_HANDLE
 vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
 {
@@ -709,18 +768,23 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
       src->vgpuCoherentH = d.Height;
    }
 
+   LARGE_INTEGER bt[5];
+   QueryPerformanceCounter(&bt[0]);
    ID3D11DeviceContext1_CopySubresourceRegion(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0,
                                               0, 0, 0, copy_src, 0, NULL);
    D3D11_MAPPED_SUBRESOURCE m;
    if (FAILED(ID3D11DeviceContext1_Map(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0,
                                        D3D11_MAP_READ, 0, &m)))
       return 0;
+   QueryPerformanceCounter(&bt[1]);
 
    D3DDDICB_LOCK lock;
    memset(&lock, 0, sizeof(lock));
    lock.hAllocation = src->hVgpuCoherent;
    lock.Flags.WriteOnly = 1;
    HRESULT hr = pD->KTCallbacks.pfnLockCb(pD->hRTDevice.handle, &lock);
+   QueryPerformanceCounter(&bt[2]);
+   bt[3] = bt[2];
    D3DKMT_HANDLE ret = 0;
    if (FAILED(hr) || !lock.pData) {
       static LONG n;
@@ -753,6 +817,7 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
                    d.Width, d.Height, (UINT)d.Format, *c, *c0, src->hVgpuCoherent);
          }
       }
+      QueryPerformanceCounter(&bt[3]);
       D3DDDICB_UNLOCK unlock;
       memset(&unlock, 0, sizeof(unlock));
       unlock.NumAllocations = 1;
@@ -765,6 +830,8 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src)
          TR_LOG("vgpu: blt source: lock failed 0x%08lx", hr);
    }
    ID3D11DeviceContext1_Unmap(pD->pCtx1, (ID3D11Resource *)src->pVgpuStaging, 0);
+   QueryPerformanceCounter(&bt[4]);
+   vgpu_blt_stats(d.Width, d.Height, bt);
    return ret;
 }
 

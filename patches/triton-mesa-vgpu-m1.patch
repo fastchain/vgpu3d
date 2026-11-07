@@ -34,27 +34,45 @@ index 94a72f4..ef0c388 100644
  
  /* Views keep the host desc they were created with, so recreating them after
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
-index bc4e182..65c28bd 100644
+index bc4e182..e7fa083 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
 +++ b/src/virtio/neptune/triton/tritonDxgi.c
-@@ -22,6 +22,11 @@
+@@ -22,6 +22,12 @@
  
  #include "tritonBlitShaders.h"
  
 +#ifdef VGPU_DXVK_INPROC
 +void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src); /* vgpu_triton_backend.c */
 +D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src);
++void vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1);
 +#endif
 +
  /* Lazily create the GPU-done fence (rationale: the present-fence block in
   * triton.h).  Caller holds presentLock.  Returns TRUE if fencing is
   * available; FALSE => unfenced (bare-Flush) present. */
-@@ -621,7 +626,35 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -621,7 +627,52 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
 +   D3DKMT_HANDLE vgpuSrc = 0;
++#ifdef VGPU_DXVK_INPROC
++   LARGE_INTEGER vgpuT0, vgpuT1;
++   QueryPerformanceCounter(&vgpuT0);
++#endif
++#ifdef VGPU_DXVK_INPROC
++   /* vgpu: a windowed blt present is copied out by vgpuBltSource, whose
++    * staging Map already waits for the GPU (the copy is queued behind the
++    * frame), so arming + waiting on the present fence here only adds the
++    * fence-event latency (~25-35 ms per frame measured with Fusion). */
++   if (!src->IsPresentable && pArgs->Flags.Blt)
++      tritonPresentFlushAndGate(pD, FALSE /* arm */, FALSE /* wait */);
++   else
++#endif
     tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
++#ifdef VGPU_DXVK_INPROC
++   QueryPerformanceCounter(&vgpuT1);
++   vgpuPresentStats(pArgs->Flags.Value, !src->IsPresentable, &vgpuT0, &vgpuT1);
++#endif
 +#ifdef VGPU_DXVK_INPROC
 +   {
 +      static LONG logged;
@@ -85,7 +103,7 @@ index bc4e182..65c28bd 100644
  
     /* DXGIDDICB_PRESENT (MSDN):
      *   hSrcAllocation  the rendered back buffer to present (a flip-primary
-@@ -631,7 +664,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -631,7 +682,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
      *   pDXGIContext    runtime cookie threaded through unchanged. */
     DXGIDDICB_PRESENT cb;
     memset(&cb, 0, sizeof(cb));
@@ -97,12 +115,29 @@ index bc4e182..65c28bd 100644
     cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
     cb.pDXGIContext   = pArgs->pDXGIContext;
     cb.hContext       = pD->hKMContext;
-@@ -1335,11 +1371,42 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
+@@ -1335,11 +1389,59 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
 +   D3DKMT_HANDLE vgpuSrc = 0;
++#ifdef VGPU_DXVK_INPROC
++   LARGE_INTEGER vgpuT0, vgpuT1;
++   QueryPerformanceCounter(&vgpuT0);
++#endif
++#ifdef VGPU_DXVK_INPROC
++   /* vgpu: a windowed blt present is copied out by vgpuBltSource, whose
++    * staging Map already waits for the GPU (the copy is queued behind the
++    * frame), so arming + waiting on the present fence here only adds the
++    * fence-event latency (~25-35 ms per frame measured with Fusion). */
++   if (!src->IsPresentable && pArgs->Flags.Blt)
++      tritonPresentFlushAndGate(pD, FALSE /* arm */, FALSE /* wait */);
++   else
++#endif
     tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
++#ifdef VGPU_DXVK_INPROC
++   QueryPerformanceCounter(&vgpuT1);
++   vgpuPresentStats(pArgs->Flags.Value, !src->IsPresentable, &vgpuT0, &vgpuT1);
++#endif
 +#ifdef VGPU_DXVK_INPROC
 +   {
 +      static LONG logged;
@@ -307,6 +342,66 @@ index e2da5c4..7c52c08 100644
  {
      return (1ULL << 62) | ((ULONGLONG)create_ctx_id << 44) | (blob_id & ((1ULL << 44) - 1));
  }
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index d34f523..d4b802e 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -11,6 +11,9 @@
+ #include "vn_common.h"
+ 
+ #include <stdarg.h>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ #include "util/log.h"
+ #include "util/os_misc.h"
+@@ -246,6 +249,36 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+    };
+ }
+ 
++#ifdef _WIN32
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++/* vgpu: os_time_sleep() is Sleep(ms) on Windows, which rounds every relax
++ * step (160 us << shift) up to the scheduler tick -- 15.6 ms by default.
++ * A fence that retires in 2 ms then costs one or two ticks (25-30 ms measured
++ * per frame).  A high-resolution waitable timer (Windows 10 1803+) sleeps for
++ * the requested time instead; fall back to Sleep where it is unavailable. */
++static void
++vn_relax_sleep_us(uint32_t us)
++{
++   static __thread HANDLE timer;
++   static __thread bool tried;
++   if (!tried) {
++      tried = true;
++      timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                     TIMER_ALL_ACCESS);
++   }
++   LARGE_INTEGER due;
++   due.QuadPart = -(LONGLONG)us * 10; /* relative, 100 ns units */
++   if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
++       WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0)
++      return;
++   os_time_sleep(us);
++}
++#else
++#define vn_relax_sleep_us(us) os_time_sleep(us)
++#endif
++
+ void
+ vn_relax(struct vn_relax_state *state)
+ {
+@@ -291,7 +324,7 @@ vn_relax(struct vn_relax_state *state)
+    }
+ 
+    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
+-   os_time_sleep(base_sleep_us << shift);
++   vn_relax_sleep_us(base_sleep_us << shift);
+ }
+ 
+ struct vn_ring *
 diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
 index 7566a9f..b3384f2 100644
 --- a/src/virtio/vulkan/vn_common.h

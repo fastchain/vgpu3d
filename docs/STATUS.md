@@ -334,3 +334,15 @@ Fusion Graphics = DirectX -> vgpu_d3d11 (Triton DDI + DXVK) -> Venus -> RTX 4090
 - run 1: avg 58.6 ms, median 50.3, p90 84.5, ~17.1 fps; run 2: avg 73.6 ms, median 69.9, p90 106.1, ~13.6 fps
   (2 docs open). ~10-12x faster than WARP, ~3.5-4x slower than per-app OpenGL/Zink: every windowed frame takes
   the blt path (GPU->staging readback, CPU swizzle, CPU copy, virgl transfer into the DWM redirection surface).
+
+### Per-frame GPU wait: 25-30 ms -> 3 ms (2026-11-07)
+Stage timers (vgpuPresentStats / vgpu_blt_stats in src/umd3d/vgpu_triton_backend.c, logged every 600 frames)
+showed the frame copy costs only ~4 ms. Every GPU wait cost 25-30 ms, even for blttest (a bare clear).
+Cause: Venus waits by polling (vn_relax: yields, then sleeps of 160 us << n), and Mesa's os_time_sleep is
+Sleep(ms) on Windows, which rounds each step up to the 15.6 ms scheduler tick. Fix in vn_common.c: a
+per-thread CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer for the relax sleep. Also: windowed blt presents
+no longer arm and wait on the present fence (the staging Map in vgpuBltSource already waits for the GPU).
+Fusion benchmark (same scene/orbit): 13.4-17 fps -> 48-64 fps (avg 15.6-20.8 ms), level with per-app
+OpenGL/Zink (16.8 ms). blttest present interval 40 ms -> 14 ms. Regression: sharetest, d3d11test,
+vkcompute, vkcube pass; host log clean (only DXVK descriptor-pool growth warnings).
+Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled over the VM ssh).
