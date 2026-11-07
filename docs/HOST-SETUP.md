@@ -1,5 +1,8 @@
 # Host setup for virtio-gpu 3D guests (KVM / libvirt / virt-manager)
 
+> **Superseded:** this page describes the early display-only (stage A) driver. For the current WDDM
+> driver package see [SETUP.md](SETUP.md).
+
 The guest driver can only be as capable as the host's virtio-gpu device. This lists what the
 host must provide and how to check it. Do these checks **before** blaming the guest driver.
 

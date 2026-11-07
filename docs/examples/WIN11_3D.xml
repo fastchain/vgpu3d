@@ -1,0 +1,163 @@
+<domain type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+  <name>WIN11_3D</name>
+  <uuid>460001c5-696b-44e3-b987-c2e436c5b157</uuid>
+  <title>Windows 11 (virtio-gpu 3D test)</title>
+  <metadata>
+    <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
+      <libosinfo:os id="http://microsoft.com/win/11"/>
+    </libosinfo:libosinfo>
+  </metadata>
+
+  <memory unit="GiB">8</memory>
+  <memoryBacking>
+    <source type="memfd"/>
+    <access mode="shared"/>
+  </memoryBacking>
+  <vcpu placement="static">12</vcpu>
+
+  <!-- UEFI, Secure Boot CAPABLE but keys not enrolled: Windows 11 setup is satisfied, and
+       'bcdedit /set testsigning on' works so the test-signed vgpu driver can load. Switch
+       enrolled-keys back to "yes" once the driver is production signed. -->
+  <os firmware="efi">
+    <type arch="x86_64" machine="q35">hvm</type>
+    <firmware>
+      <feature enabled="no" name="enrolled-keys"/>
+      <feature enabled="yes" name="secure-boot"/>
+    </firmware>
+    <loader secure="yes"/>
+    <bootmenu enable="yes" timeout="3000"/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <!-- Hyper-V enlightenments: large perf win for Windows guests -->
+    <hyperv mode="custom">
+      <relaxed state="on"/>
+      <vapic state="on"/>
+      <spinlocks state="on" retries="8191"/>
+      <vpindex state="on"/>
+      <runtime state="on"/>
+      <synic state="on"/>
+      <stimer state="on"><direct state="on"/></stimer>
+      <reset state="on"/>
+      <vendor_id state="on" value="KVM Hv"/>
+      <frequencies state="on"/>
+      <reenlightenment state="on"/>
+      <tlbflush state="on"/>
+      <ipi state="on"/>
+      <evmcs state="off"/>
+    </hyperv>
+    <vmport state="off"/>
+    <!-- Secure Boot needs SMM on q35 -->
+    <smm state="on"/>
+  </features>
+
+  <!-- 1 socket x 4 cores: Windows 11 Home/Pro license at most 2 sockets -->
+  <cpu mode="host-passthrough" check="none" migratable="on">
+    <topology sockets="1" dies="1" cores="12" threads="1"/>
+  </cpu>
+
+  <clock offset="localtime">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="pit" tickpolicy="delay"/>
+    <timer name="hpet" present="no"/>
+    <timer name="hypervclock" present="yes"/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <pm>
+    <suspend-to-mem enabled="no"/>
+    <suspend-to-disk enabled="no"/>
+  </pm>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- System disk: converted WinDev2301Eval (VirtualBox eval image). SATA for first boot
+         (no virtio storage driver in the image); switch to virtio after installing virtio-win. -->
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2" cache="none" discard="unmap"/>
+      <source file="/mnt/st/VM/pool-1/WinDev2301Eval.qcow2"/>
+      <target dev="sda" bus="sata"/>
+      <boot order="1"/>
+    </disk>
+
+    <!-- Windows 11 Enterprise Evaluation 26H2 (build 26300) ISO for the in-place upgrade from 22H2.
+         Run setup.exe from inside Windows; the system disk stays first in the boot order. -->
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="/mnt/st/VM/pool-1/Win11_26H2_EnterpriseEval_x64_en-US.iso"/>
+      <target dev="sdb" bus="sata"/>
+      <readonly/>
+    </disk>
+
+    <controller type="sata" index="0"/>
+    <controller type="pci" index="0" model="pcie-root"/>
+    <controller type="usb" index="0" model="qemu-xhci" ports="15"/>
+    <controller type="virtio-serial" index="0"/>
+
+    <!-- TPM 2.0 via swtpm (Windows 11 hard requirement) -->
+    <tpm model="tpm-crb">
+      <backend type="emulator" version="2.0"/>
+    </tpm>
+
+    <interface type="network">
+      <mac address="52:54:00:bc:04:53"/>
+      <source network="default"/>
+      <model type="e1000e"/>
+    </interface>
+
+    <!-- QEMU guest agent + SPICE agent channels -->
+    <channel type="unix">
+      <target type="virtio" name="org.qemu.guest_agent.0"/>
+    </channel>
+
+    <channel type="spicevmc">
+      <target type="virtio" name="com.redhat.spice.0"/>
+    </channel>
+    <input type="tablet" bus="usb"/>
+    <input type="keyboard" bus="usb"/>
+
+    <!-- virtio-gpu with 3D (virglrenderer).  Needs QEMU built with virglrenderer and a host
+         render node; see docs/HOST-SETUP.md. -->
+    <!-- virtio-gpu with 3D on the RTX 4090 (virglrenderer).  Non-GL fallback: WIN11_3D.nogl.xml -->
+    <!-- GL is rendered inside QEMU (egl-headless on the 4090); SPICE without <gl> only
+         receives finished frames, so the viewer needs no GL of its own (SPICE GL in
+         virt-manager showed only black).  SPICE must be the FIRST graphics element. -->
+    <graphics type="spice" autoport="yes">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+    <graphics type="egl-headless">
+      <gl rendernode="/dev/dri/renderD128"/>
+    </graphics>
+    <video>
+      <model type="virtio" heads="1" primary="yes">
+        <acceleration accel3d="yes"/>
+      </model>
+    </video>
+
+    <sound model="ich9"/>
+    <audio id="1" type="spice"/>
+
+    <redirdev bus="usb" type="spicevmc"/>
+    <redirdev bus="usb" type="spicevmc"/>
+
+
+    <memballoon model="virtio"/>
+    <rng model="virtio">
+      <backend model="random">/dev/urandom</backend>
+    </rng>
+  </devices>
+
+  <!-- libvirt cannot express blob/venus/hostmem yet; set them as device-type defaults.
+       libvirt uses virtio-vga-gl for the primary adapter. -->
+  <qemu:commandline>
+    <qemu:arg value="-global"/><qemu:arg value="virtio-vga-gl.blob=true"/>
+    <qemu:arg value="-global"/><qemu:arg value="virtio-vga-gl.hostmem=4G"/>
+    <qemu:arg value="-global"/><qemu:arg value="virtio-vga-gl.venus=true"/>
+  </qemu:commandline>
+</domain>
