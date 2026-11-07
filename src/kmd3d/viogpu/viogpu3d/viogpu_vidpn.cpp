@@ -1968,28 +1968,32 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
 
     const UINT resid = m_pFrameBuf->GetId();
     // TRANSFER_TO_HOST_2D: offset is the byte offset of the box's first pixel in the backing.
-    m_pAdapter->ctrlQueue.TransferToHost2D(resid, (ULONG)((SIZE_T)y * dstPitch + (SIZE_T)x * 4), width, height, x, y);
+    m_pAdapter->ctrlQueue.TransferToHost2D(resid, (ULONG)((SIZE_T)y * dstPitch + (SIZE_T)x * 4), width, height, x, y, FALSE);
     if (m_pAdapter->ctrlQueue.GetClassicScanoutRes(0) != resid)
     {
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--> %s scanning out framebuffer res_id=%u %ux%u\n", __FUNCTION__, resid, fbWidth, fbHeight));
         m_pAdapter->ctrlQueue.SetScanout(0, resid, fbWidth, fbHeight, 0, 0);
     }
-    m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y);
+    m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y, FALSE);
+    LARGE_INTEGER tq = KeQueryPerformanceCounter(NULL);
+    m_pAdapter->ctrlQueue.FlushKick();
 
     // vgpu: every 600 presents, average copy vs command-queue time and MB/s of the copy
     {
-        static LONGLONG s_copy, s_cmd, s_bytes;
+        static LONGLONG s_copy, s_cmd, s_kick, s_bytes;
         static ULONG s_n;
         LARGE_INTEGER t2 = KeQueryPerformanceCounter(NULL);
         s_copy += t1.QuadPart - t0.QuadPart;
-        s_cmd += t2.QuadPart - t1.QuadPart;
+        s_cmd += tq.QuadPart - t1.QuadPart;
+        s_kick += t2.QuadPart - tq.QuadPart;
         s_bytes += (LONGLONG)width * height * 4;
         if (++s_n == 600)
         {
-            const LONGLONG us_copy = s_copy * 1000000 / freq.QuadPart, us_cmd = s_cmd * 1000000 / freq.QuadPart;
-            DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: fb kmd avg us copy=%lld cmds=%lld, copy %lld MB/s\n", us_copy / s_n,
-                                           us_cmd / s_n, us_copy ? s_bytes / us_copy : 0));
-            s_copy = s_cmd = s_bytes = 0;
+            const LONGLONG us_copy = s_copy * 1000000 / freq.QuadPart, us_cmd = s_cmd * 1000000 / freq.QuadPart,
+                           us_kick = s_kick * 1000000 / freq.QuadPart;
+            DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: fb kmd avg us copy=%lld queue=%lld kick=%lld, copy %lld MB/s\n",
+                                           us_copy / s_n, us_cmd / s_n, us_kick / s_n, us_copy ? s_bytes / us_copy : 0));
+            s_copy = s_cmd = s_kick = s_bytes = 0;
             s_n = 0;
         }
     }

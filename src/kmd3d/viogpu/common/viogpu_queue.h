@@ -347,11 +347,11 @@ class CtrlQueue : public VioGpuQueue
     {
         return scan_id < ARRAYSIZE(m_ScanoutRes) ? m_ScanoutRes[scan_id] : 0;
     }
-    void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y);
+    void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick = TRUE);
     void ResFlush(UINT res_id, GPU_RECT rect) {
 		ResFlush(res_id, rect.width, rect.height, rect.x, rect.y);
 	}
-    void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y);
+    void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick = TRUE);
     void TransferToHost3D(UINT res_id, GPU_BOX *box);
 
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);

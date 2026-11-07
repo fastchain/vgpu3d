@@ -790,7 +790,7 @@ void CtrlQueue::DestroyCtx(UINT ctx_id, void (*complete_cb)(void *, void *, void
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y)
+void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick)
 {
     PAGED_CODE();
 
@@ -811,12 +811,12 @@ void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y)
     cmd->r.x = x;
     cmd->r.y = y;
 
-    QueueBuffer(vbuf);
+    QueueBuffer(vbuf, kick);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick)
 {
     PAGED_CODE();
 
@@ -838,7 +838,7 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
     cmd->r.x = x;
     cmd->r.y = y;
 
-    QueueBuffer(vbuf);
+    QueueBuffer(vbuf, kick);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
