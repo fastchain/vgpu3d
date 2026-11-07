@@ -1,35 +1,130 @@
-# vgpu: Windows guest GPU driver for QEMU/KVM virtio-gpu (3D)
+# vgpu3d: hardware 3D for Windows VMs on QEMU/KVM, using the host's own GPU
 
-Goal: Vulkan/OpenGL/Direct3D acceleration for Windows 11 guests on a KVM host, using
-virglrenderer (virgl + Venus). Plan: `PLAN.md`. Current state: `docs/STATUS.md`.
+`vgpu3d` is a Windows 11 guest graphics driver for QEMU/KVM's `virtio-gpu` device. It gives a
+Windows virtual machine **Vulkan, Direct3D 10/11 and OpenGL acceleration on the host's GPU**
+without dedicating that GPU to the VM. The host keeps its desktop and the GPU keeps working for
+everything else, as in VirtualBox or VMware Workstation, but on standard, unmodified QEMU/KVM.
 
-## Layout
+Windows software uses it by default. The desktop (DWM), CAD tools such as Autodesk Fusion, games
+and benchmarks run on the host GPU without per-app setup. The guest sees the real GPU's name,
+e.g. `Virtio-GPU Venus (NVIDIA GeForce RTX 4090)`.
+
+> Status: working prototype, tested on a Linux host with an NVIDIA RTX 4090 and a Windows 11
+> 24H2/26H2 guest. Test-signed. See [docs/STATUS.md](docs/STATUS.md) for the progress log.
+
+## The problem it solves
+
+On KVM a Windows guest normally gets one of these:
+
+- **No 3D at all.** The stock virtio-gpu/QXL/VGA drivers are display-only. Windows falls back to
+  Microsoft's CPU renderer (WARP), so the desktop is slow, and anything 3D (CAD, games, GPU
+  compute, modern UI) is unusable or refuses to start.
+- **A whole GPU via passthrough (VFIO).** Fast, but the host loses that GPU entirely. You need a
+  second GPU (or a headless host), IOMMU-capable hardware and careful setup, and one GPU serves one VM.
+- **A slice of a GPU via SR-IOV/mediated vGPU.** Only on data-center GPUs (NVIDIA vGPU needs
+  licenses; consumer GeForce cards don't support it) or a few Intel iGPUs.
+
+Linux guests on KVM already have a fourth option: **Venus**, which forwards the guest's Vulkan
+commands to the host's Vulkan driver through `virtio-gpu`, sharing the host GPU. Until now Windows
+guests had no driver for it. **vgpu3d is that driver.**
+
+## How it works
+
+```
+ Windows guest                                              Linux host
+ ┌──────────────────────────────────────────────┐          ┌────────────────────────────────┐
+ │ D3D10/11 app ─► D3D runtime ─► vgpu_d3d11.dll │          │ QEMU virtio-vga-gl             │
+ │                  (Triton DDI layer + DXVK)   │          │   (blob, hostmem, venus)       │
+ │ OpenGL app  ─► opengl32 ─► Mesa Zink ────────┼─┐        │                                │
+ │ Vulkan app  ─► vulkan-1 ─────────────────────┼─┤        │ virglrenderer / virgl_render_  │
+ │                         ▼                    │ │ rings  │ server (Venus decoder)         │
+ │               Mesa Venus ICD (vulkan_virtio) ┼─┴───────►│           ▼                    │
+ │                         │ D3DKMT             │          │ host Vulkan driver (NVIDIA,    │
+ │               viogpu3d.sys (WDDM 2, GpuMmu)  ┼─────────►│ AMD, Intel) ─► host GPU        │
+ └──────────────────────────────────────────────┘ virtio  └────────────────────────────────┘
+```
+
+- **Kernel driver** `viogpu3d.sys`: a WDDM 2 render and display miniport (GPU virtual memory,
+  monitored fences, residency, mode setting) for `virtio-vga-gl`. Based on the virtio-win /
+  "neptune" viogpu3d line.
+- **Vulkan**: Mesa's Venus driver with a Windows backend (D3DKMT virtual contexts, shared
+  memory, cross-process resource sharing). Vulkan is the base layer everything else builds on.
+- **Direct3D 10/11**: a WDDM user-mode driver. Triton's D3D10/11 DDI layer runs DXVK in-process
+  (D3D11 → Vulkan), on Venus. DWM uses it too, so the desktop is GPU-composited.
+- **OpenGL 4.6**: Mesa's Zink (OpenGL on Vulkan), registered as the system OpenGL ICD.
+- **32-bit apps**: a full WOW64 set of the above, on the same 64-bit kernel driver.
+- **Display**: modes up to 5120×2160. Frames reach the host's QEMU display through a 2D
+  framebuffer copy, which works on every host, including NVIDIA with egl-headless.
+
+## How it compares
+
+| | vgpu3d | Display-only virtio/QXL | GPU passthrough (VFIO) | SR-IOV / NVIDIA vGPU | VirtualBox / VMware 3D |
+|---|---|---|---|---|---|
+| Hypervisor | stock QEMU/KVM | QEMU/KVM | QEMU/KVM | QEMU/KVM, others | their own |
+| Host keeps using the GPU | **yes** | yes | no (GPU is dedicated) | yes | yes |
+| Hardware needed | any Vulkan GPU with Venus support | none | 2nd GPU + IOMMU | data-center GPU / licenses | any |
+| Windows 3D APIs | Vulkan 1.4, D3D10/11, OpenGL 4.6 (64+32-bit) | none (CPU WARP) | everything native | everything native | D3D9–11, GL (via SVGA translation) |
+| Several VMs on one GPU | yes | – | no | yes | yes |
+| Performance | good, CPU-bound for light workloads (see below) | very slow 3D | native | near native | moderate |
+| Open source | yes (BSD/MIT/zlib parts) | yes | yes | no | partly |
+
+**Advantages over the alternatives:**
+- **vs. display-only drivers:** real GPU acceleration. The 2.5M-triangle Fusion benchmark runs at
+  ~60 fps instead of 1.4 fps on WARP (~42× faster); DWM and modern UI are smooth.
+- **vs. passthrough:** no second GPU, no IOMMU fiddling, the host desktop stays on its GPU, and
+  several VMs can share one card.
+- **vs. SR-IOV/vGPU:** works with consumer GPUs and needs no licenses.
+- **vs. VirtualBox/VMware:** stays on standard QEMU/KVM (libvirt, virt-manager, existing VMs and
+  tooling), and passes the host GPU's real Vulkan capabilities through instead of an emulated SVGA device.
+
+**Trade-offs, honestly:** commands cross the VM boundary. Each frame costs CPU time for translation
+(D3D/GL → Vulkan), encoding and decoding, and the display copy. Light and medium workloads are
+CPU-bound and won't saturate a high-end GPU, and the gap grows with desktop resolution.
+Direct3D 12 and Direct3D 9 aren't implemented yet. See [docs/SETUP.md §8](docs/SETUP.md#8-known-limitations).
+
+### Measured (RTX 4090 host, 1920×1080 windowed unless noted)
+
+| Benchmark | Result |
+|---|---|
+| Autodesk Fusion, 2.5M triangles, maximized 2560×1080 | 66–69 fps (WARP: 1.4 fps) |
+| Unigine Heaven 4.0 (32-bit), DX11 / OpenGL | 48.4 / 95.7 fps |
+| Unigine Valley 1.0 (32-bit), DX11 / OpenGL | 52.0 / 76.8 fps |
+| GravityMark 1.89, Vulkan / DX11 | 9463 / 6574 |
+| FurMark 2, 1080p preset, OpenGL | 7258 |
+
+## Getting started
+
+1. Set up the host and VM: **[docs/SETUP.md](docs/SETUP.md)**. It covers QEMU, libvirt and the
+   virglrenderer requirements, the domain XML (complete example in
+   [docs/examples/WIN11_3D.xml](docs/examples/WIN11_3D.xml)), and installing the driver.
+2. Build the driver package (Linux, cross-compiled):
+   ```sh
+   build/package_kmd3d.sh          # kernel driver, 64+32-bit UMDs, Venus and Zink -> out/vgpu3d-m1.zip
+   ```
+   The individual builds are `build_kmd3d.sh`, `build_umd.sh [32]`, `build_dxvk.sh [32]`,
+   `build_triton_venus.sh [32]` and `build_gl.sh [32]`. Toolchain: MinGW-w64 (posix), clang/lld
+   (clang-cl for the kernel driver), meson, ninja, plus the WDK/SDK headers in `toolchain/`.
+3. Copy the zip into the guest and run `install.ps1` from it (elevated PowerShell).
+
+## Repository layout
 
 | Path | Contents |
 |---|---|
-| `PLAN.md` | Phased plan and progress log |
-| `docs/` | `STATUS.md`, `PHASE1_DESIGN.md`, `HOST-SETUP.md`, `GUEST-README.txt` |
-| `src/include/vgpu_abi.h` | User/kernel ABI of the `\\.\VGpu3D` control device |
-| `src/kmd/` | Kernel driver: virtio-win `VirtIO` library + forked `viogpu` + `vgpu3d.cpp`; `inf/vgpu.inf` |
-| `src/umd/vgputest/` | Smoke test run inside the Windows guest |
-| `build/` | Cross-build scripts (Linux, clang-cl + lld-link): `build_kmd.sh`, `build_tools.sh`, `package.sh` |
-| `toolchain/` | Downloaded WDK/SDK headers and libraries (NuGet), compile wrappers (not source) |
-| `upstream/` | Pristine shallow clones of VirtualBox, virtio-win, Mesa (reference only) |
-| `tests/` | Host-side checks (`build/run_tests.sh`) |
-| `tools/windows/` | PowerShell install/uninstall/diagnostics scripts shipped in the guest package |
-| `out/` | Build products; `out/vgpu-guest.zip` is what goes to the Windows machine |
+| `src/kmd3d/viogpu/` | WDDM kernel driver (`viogpu3d.sys`); `src/kmd3d-inf/` has the INF and Vulkan ICD manifests |
+| `src/umd3d/` | D3D10/11 user-mode driver backend (Triton DDI layer → in-process DXVK) |
+| `src/umd/` | guest test programs: `d3d11test`, `blttest`, `sharetest`, `vkcompute`, `vkfeat`, `gltest`, `modes`, … |
+| `patches/` | our changes to Mesa (Venus Windows backend, Zink fixes), Triton and DXVK |
+| `build/` | cross-build and packaging scripts |
+| `tests/` | host-side checks, e.g. `tests/abi32/check.sh` (32/64-bit ABI layout) |
+| `tools/windows/` | guest scripts: install/rollback, test rounds, benchmark runners |
+| `tools/fusion-bench/` | Fusion viewport benchmark over Fusion's MCP scripting server |
+| `docs/` | `SETUP.md` (setup manual), `STATUS.md` (progress log), design notes |
+| `upstream/`, `mesa/`, `toolchain/`, `out/` | third-party trees, toolchain and build output (git-ignored) |
 
-## Build
+`src/kmd/` and `src/include/vgpu_abi.h` hold the earlier display-only prototype (stage A), kept for reference.
 
-```sh
-build/run_tests.sh     # ABI layout checks
-build/package.sh       # driver + tools + guest zip (about 20 s)
-```
+## Licensing
 
-Needs `clang`, `lld`, `llvm` from apt, and the WDK/SDK packages already unpacked in `toolchain/`
-(see `docs/PHASE1_DESIGN.md` section 5 for how they were obtained).
-
-## Licensing note
-
-`src/kmd` derives from virtio-win (BSD-3-Clause). Anything copied from VirtualBox
-(GPLv3) in later stages makes the combined kernel driver GPLv3; keep that code in its own tree.
+The kernel driver derives from virtio-win (BSD-3-Clause, Red Hat and others). Mesa (Venus, Zink)
+is MIT. DXVK is zlib. Triton's DDI layer comes with its own license, in `upstream/triton`. No
+VirtualBox code is used in the current driver. Check each component's license before redistributing binaries.
