@@ -1,0 +1,9 @@
+# third-party trees (our changes live in patches/ and on their local branches)
+/upstream/
+/mesa/
+/toolchain/
+# build output
+/out/
+/scratch/
+*.obj
+*.o

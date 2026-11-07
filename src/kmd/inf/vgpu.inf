@@ -1,0 +1,92 @@
+;/*++
+;
+; vgpu.inf - virtio-gpu display driver with 3D control device (virgl/Venus)
+;
+; Derived from the virtio-win viogpudo INF (BSD-3-Clause).
+; Binds to the QEMU virtio-gpu PCI device (1AF4:1050).
+;
+;--*/
+
+[Version]
+Signature="$Windows NT$"
+Class=Display
+ClassGUID={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%VENDOR%
+DriverVer=11/03/2026,1.0.0.1
+CatalogFile=vgpu.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+vgpu.sys = 1,,
+
+[Manufacturer]
+%VENDOR%=VGpu,NTamd64
+
+[VGpu.NTamd64]
+%VGpu.DeviceDesc% = VGpu_Inst, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01, PCI\VEN_1AF4&DEV_1050
+
+[VGpu_Files_Driver]
+vgpu.sys,,,2
+
+[VGpu_Inst]
+Include=msdv.inf
+FeatureScore=F9
+CopyFiles=VGpu_Files_Driver
+AddReg=VGpu_DeviceSettings
+
+[VGpu_Inst.Services]
+AddService = VGpu,0x00000002,VGpu_Service_Inst, VGpu_EventLog_Inst
+
+[VGpu_Inst.HW]
+AddReg = VGpu_PCI_MSIX
+
+[VGpu_Service_Inst]
+ServiceType = %SERVICE_KERNEL_DRIVER%
+StartType = %SERVICE_DEMAND_START%
+ErrorControl = %SERVICE_ERROR_IGNORE%
+ServiceBinary = %12%\vgpu.sys
+
+[VGpu_EventLog_Inst]
+AddReg = VGpu_EventLog_Inst.AddReg
+
+[VGpu_EventLog_Inst.AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[VGpu_DeviceSettings]
+HKR,, HWCursor,                    %REG_DWORD%, 0
+HKR,, FlexResolution,              %REG_DWORD%, 1
+HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
+HKR,, UsePresentProgress,          %REG_DWORD%, 0
+
+[VGpu_PCI_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+HKR, "Interrupt Management\Affinity Policy",, 0x00000010
+HKR, "Interrupt Management\Affinity Policy", DevicePolicy, 0x00010001, 5
+HKR, "Interrupt Management\Affinity Policy", DevicePriority, 0x00010001, 3
+
+[Strings]
+VENDOR = "vgpu project"
+DiskId1 = "vgpu installation disk"
+VGpu.DeviceDesc = "vgpu VirtIO GPU (3D control device)"
+
+SERVICE_BOOT_START = 0x0
+SERVICE_SYSTEM_START = 0x1
+SERVICE_AUTO_START = 0x2
+SERVICE_DEMAND_START = 0x3
+SERVICE_DISABLED = 0x4
+SERVICE_KERNEL_DRIVER = 0x1
+SERVICE_ERROR_IGNORE = 0x0
+SERVICE_ERROR_NORMAL = 0x1
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ = 0x00020000
+REG_DWORD = 0x00010001

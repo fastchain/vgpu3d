@@ -1,0 +1,1233 @@
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index ff48d24..b0263f3 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -126,6 +126,9 @@ vn_libs = []
+ 
+ if not with_platform_windows
+   libvn_files += files('vn_renderer_vtest.c')
++else
++  # \\.\VGpu3D backend on top of the vgpu kernel driver
++  libvn_files += files('vn_renderer_vgpu.c')
+ endif
+ 
+ if system_has_kms_drm
+diff --git a/src/virtio/vulkan/vgpu_abi.h b/src/virtio/vulkan/vgpu_abi.h
+new file mode 100644
+index 0000000..6759bee
+--- /dev/null
++++ b/src/virtio/vulkan/vgpu_abi.h
+@@ -0,0 +1,223 @@
++/*
++ * vgpu_abi.h - user/kernel ABI of the vgpu kernel driver control device.
++ *
++ * The control device mirrors the Linux DRM virtgpu ioctl set
++ * (include/uapi/drm/virtgpu_drm.h) so Mesa's Venus/virgl winsys logic ports with
++ * minimal change.  One open file handle == one virtio-gpu context (like a DRM file).
++ * Everything a handle owns (context, resources, user mappings) is torn down on
++ * IRP_MJ_CLEANUP, so a crashing process cannot leak GPU state.
++ *
++ * Shared by the kernel driver (C++), the test tool and the Mesa winsys (C).
++ * Version 1.  All structures are 8-byte aligned; pointers are never passed (variable
++ * payloads are appended to the structure inside the same METHOD_BUFFERED buffer).
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++#pragma once
++
++#if defined(VGPU_ABI_STANDALONE)
++/* No Windows headers at all (CRT-less tools, cross builds without the MSVC headers). */
++typedef unsigned char      UINT8;
++typedef unsigned short     UINT16;
++typedef unsigned int       UINT32;
++typedef unsigned long long UINT64;
++#define FILE_DEVICE_UNKNOWN 0x00000022
++#define METHOD_BUFFERED     0
++#define FILE_READ_ACCESS    0x0001
++#define FILE_WRITE_ACCESS   0x0002
++#define CTL_CODE(t, f, m, a) (((t) << 16) | ((a) << 14) | ((f) << 2) | (m))
++#elif defined(_KERNEL_MODE)
++#include <ntddk.h>      /* CTL_CODE, UINT32, UINT64, UINT8 */
++#else
++#include <windows.h>
++#include <winioctl.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VGPU_ABI_VERSION 1
++
++/* \\.\VGpu3D */
++#define VGPU_DEVICE_NT_NAME  L"\\Device\\VGpu3D"
++#define VGPU_DEVICE_DOS_NAME L"\\DosDevices\\VGpu3D"
++#define VGPU_DEVICE_USER_PATH L"\\\\.\\VGpu3D"
++
++/* ---- GETPARAM (numbers match VIRTGPU_PARAM_* in Linux) ---------------------------- */
++#define VGPU_PARAM_3D_FEATURES          1 /* VIRTIO_GPU_F_VIRGL negotiated               */
++#define VGPU_PARAM_CAPSET_QUERY_FIX     2 /* always 1                                    */
++#define VGPU_PARAM_RESOURCE_BLOB        3 /* VIRTIO_GPU_F_RESOURCE_BLOB negotiated       */
++#define VGPU_PARAM_HOST_VISIBLE         4 /* host-visible shared memory region present   */
++#define VGPU_PARAM_CROSS_DEVICE         5 /* always 0                                    */
++#define VGPU_PARAM_CONTEXT_INIT         6 /* VIRTIO_GPU_F_CONTEXT_INIT negotiated        */
++#define VGPU_PARAM_SUPPORTED_CAPSET_IDS 7 /* bitmask of capset ids (ids < 64)            */
++#define VGPU_PARAM_EXPLICIT_DEBUG_NAME  8 /* always 1                                    */
++/* driver specific */
++#define VGPU_PARAM_ABI_VERSION          0x100
++#define VGPU_PARAM_HOST_VISIBLE_SIZE    0x101 /* bytes                                   */
++#define VGPU_PARAM_MAX_EXECBUF_SIZE     0x102 /* largest accepted EXECBUFFER cmd payload */
++#define VGPU_PARAM_NUM_CAPSETS          0x103
++
++/* ---- capsets ---------------------------------------------------------------------- */
++#define VGPU_CAPSET_VIRGL  1
++#define VGPU_CAPSET_VIRGL2 2
++#define VGPU_CAPSET_VENUS  4
++#define VGPU_CAPSET_DRM    6
++
++/* ---- blob (numbers match VIRTGPU_BLOB_* in Linux) --------------------------------- */
++#define VGPU_BLOB_MEM_GUEST        0x0001
++#define VGPU_BLOB_MEM_HOST3D       0x0002
++#define VGPU_BLOB_MEM_HOST3D_GUEST 0x0003
++#define VGPU_BLOB_FLAG_USE_MAPPABLE  0x0001
++#define VGPU_BLOB_FLAG_USE_SHAREABLE 0x0002
++#define VGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
++
++/* ---- execbuffer flags ------------------------------------------------------------- */
++#define VGPU_EXECBUF_RING_IDX 0x04   /* ring_idx field is valid (same value as Linux)   */
++#define VGPU_EXECBUF_FENCE    0x100  /* request a fence; id returned in fence_id        */
++
++#define VGPU_MAX_RINGS 64
++#define VGPU_RING_NONE 0xFFFFFFFFu   /* ring_idx value meaning "global timeline"        */
++
++#pragma pack(push, 8)
++
++typedef struct _VGPU_GETPARAM {
++    UINT64 param;
++    UINT64 value;                 /* out */
++} VGPU_GETPARAM;
++
++typedef struct _VGPU_GET_CAPSET_INFO {
++    UINT32 index;                 /* in:  0 .. VGPU_PARAM_NUM_CAPSETS-1 */
++    UINT32 capset_id;             /* out */
++    UINT32 max_version;           /* out */
++    UINT32 max_size;              /* out */
++} VGPU_GET_CAPSET_INFO;
++
++typedef struct _VGPU_GET_CAPS {
++    UINT32 cap_set_id;            /* in  */
++    UINT32 cap_set_ver;           /* in  */
++    UINT32 size;                  /* in: bytes available after this header; out: bytes written */
++    UINT32 reserved;
++    /* UINT8 data[size] follows */
++} VGPU_GET_CAPS;
++
++typedef struct _VGPU_CONTEXT_INIT {
++    UINT32 capset_id;             /* in: 0 = legacy virgl context w/o capset */
++    UINT32 num_rings;             /* in: 0..VGPU_MAX_RINGS                   */
++    UINT64 poll_rings_mask;       /* in: informational (Venus)               */
++    char   debug_name[64];        /* in: NUL terminated, may be empty        */
++    UINT32 ctx_id;                /* out */
++    UINT32 reserved;
++} VGPU_CONTEXT_INIT;
++
++typedef struct _VGPU_RESOURCE_CREATE_BLOB {
++    UINT32 blob_mem;              /* in: VGPU_BLOB_MEM_*   */
++    UINT32 blob_flags;            /* in: VGPU_BLOB_FLAG_*  */
++    UINT64 blob_id;               /* in: host object id for HOST3D*            */
++    UINT64 size;                  /* in: bytes                                  */
++    UINT32 cmd_size;              /* in: bytes of a SUBMIT_3D payload sent first */
++    UINT32 handle;                /* out: resource handle (== virtio resource_id) */
++    /* UINT8 cmd[cmd_size] follows */
++} VGPU_RESOURCE_CREATE_BLOB;
++
++typedef struct _VGPU_RESOURCE_CREATE {   /* legacy virgl 3D resource, guest backed */
++    UINT32 target;
++    UINT32 format;
++    UINT32 bind;
++    UINT32 width;
++    UINT32 height;
++    UINT32 depth;
++    UINT32 array_size;
++    UINT32 last_level;
++    UINT32 nr_samples;
++    UINT32 flags;
++    UINT64 size;                  /* in: guest backing bytes (0 = none) */
++    UINT32 stride;                /* in: unused by the kernel, kept for parity */
++    UINT32 handle;                /* out */
++} VGPU_RESOURCE_CREATE;
++
++typedef struct _VGPU_RESOURCE_INFO {
++    UINT32 handle;                /* in  */
++    UINT32 res_handle;            /* out (== handle) */
++    UINT64 size;                  /* out */
++    UINT32 blob_mem;              /* out: 0 for non-blob */
++    UINT32 reserved;
++} VGPU_RESOURCE_INFO;
++
++typedef struct _VGPU_MAP {
++    UINT32 handle;                /* in  */
++    UINT32 flags;                 /* in: reserved, 0 */
++    UINT64 user_va;               /* out: address in the calling process */
++    UINT64 size;                  /* out */
++} VGPU_MAP;
++
++typedef struct _VGPU_HANDLE {     /* UNMAP, RESOURCE_CLOSE */
++    UINT32 handle;
++    UINT32 reserved;
++} VGPU_HANDLE;
++
++typedef struct _VGPU_BOX { UINT32 x, y, z, w, h, d; } VGPU_BOX;
++
++typedef struct _VGPU_TRANSFER {   /* TRANSFER_TO_HOST / TRANSFER_FROM_HOST, synchronous */
++    UINT32   handle;
++    UINT32   level;
++    UINT32   stride;
++    UINT32   layer_stride;
++    UINT64   offset;
++    VGPU_BOX box;
++} VGPU_TRANSFER;
++
++typedef struct _VGPU_EXECBUFFER {
++    UINT32 flags;                 /* VGPU_EXECBUF_* */
++    UINT32 size;                  /* bytes of command stream */
++    UINT32 ring_idx;              /* valid if VGPU_EXECBUF_RING_IDX */
++    UINT32 num_bo_handles;        /* resources to attach to the context first */
++    UINT64 fence_id;              /* out: valid if VGPU_EXECBUF_FENCE */
++    /* UINT32 bo_handles[num_bo_handles]; then UINT8 cmd[size] (see VGPU_EXECBUF_CMD) */
++} VGPU_EXECBUFFER;
++#define VGPU_EXECBUF_CMD(p) \
++    ((UINT8 *)((UINT32 *)((VGPU_EXECBUFFER *)(p) + 1) + ((VGPU_EXECBUFFER *)(p))->num_bo_handles))
++#define VGPU_EXECBUF_HANDLES(p) ((UINT32 *)((VGPU_EXECBUFFER *)(p) + 1))
++#define VGPU_EXECBUF_TOTAL(num_bo, cmd_size) \
++    (sizeof(VGPU_EXECBUFFER) + (num_bo) * sizeof(UINT32) + (cmd_size))
++
++typedef struct _VGPU_WAIT_FENCE {
++    UINT32 ring_idx;              /* VGPU_RING_NONE = global timeline */
++    UINT32 flags;                 /* reserved */
++    UINT64 fence_id;              /* in */
++    UINT32 timeout_ms;            /* in: 0 = poll, 0xFFFFFFFF = infinite (capped at 60s per call) */
++    UINT32 signaled;              /* out: 1 if fence_id completed */
++} VGPU_WAIT_FENCE;
++
++typedef struct _VGPU_QUERY_FENCE {
++    UINT32 ring_idx;              /* in */
++    UINT32 reserved;
++    UINT64 submitted;             /* out: last fence id issued on this ring  */
++    UINT64 completed;             /* out: last fence id completed            */
++} VGPU_QUERY_FENCE;
++
++#pragma pack(pop)
++
++/* ---- IOCTLs ----------------------------------------------------------------------- */
++#define VGPU_IOCTL(n) CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800 + (n), METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
++
++#define IOCTL_VGPU_GETPARAM            VGPU_IOCTL(0x01)  /* VGPU_GETPARAM            */
++#define IOCTL_VGPU_GET_CAPSET_INFO     VGPU_IOCTL(0x02)  /* VGPU_GET_CAPSET_INFO     */
++#define IOCTL_VGPU_GET_CAPS            VGPU_IOCTL(0x03)  /* VGPU_GET_CAPS + data     */
++#define IOCTL_VGPU_CONTEXT_INIT        VGPU_IOCTL(0x04)  /* VGPU_CONTEXT_INIT        */
++#define IOCTL_VGPU_RESOURCE_CREATE_BLOB VGPU_IOCTL(0x05) /* VGPU_RESOURCE_CREATE_BLOB + cmd */
++#define IOCTL_VGPU_RESOURCE_CREATE     VGPU_IOCTL(0x06)  /* VGPU_RESOURCE_CREATE     */
++#define IOCTL_VGPU_RESOURCE_INFO       VGPU_IOCTL(0x07)  /* VGPU_RESOURCE_INFO       */
++#define IOCTL_VGPU_MAP                 VGPU_IOCTL(0x08)  /* VGPU_MAP                 */
++#define IOCTL_VGPU_UNMAP               VGPU_IOCTL(0x09)  /* VGPU_HANDLE              */
++#define IOCTL_VGPU_RESOURCE_CLOSE      VGPU_IOCTL(0x0A)  /* VGPU_HANDLE              */
++#define IOCTL_VGPU_TRANSFER_TO_HOST    VGPU_IOCTL(0x0B)  /* VGPU_TRANSFER            */
++#define IOCTL_VGPU_TRANSFER_FROM_HOST  VGPU_IOCTL(0x0C)  /* VGPU_TRANSFER            */
++#define IOCTL_VGPU_EXECBUFFER          VGPU_IOCTL(0x0D)  /* VGPU_EXECBUFFER + handles + cmd */
++#define IOCTL_VGPU_WAIT_FENCE          VGPU_IOCTL(0x0E)  /* VGPU_WAIT_FENCE          */
++#define IOCTL_VGPU_QUERY_FENCE         VGPU_IOCTL(0x0F)  /* VGPU_QUERY_FENCE         */
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 86235f6..fd60e54 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -50,7 +50,28 @@
+ #include "vk_util.h"
+ 
+ #if DETECT_OS_WINDOWS
++#include <errno.h>
+ #include <processthreadsapi.h>
++
++/* Windows has no sync files; the vgpu renderer reports has_external_sync=false,
++ * so the only fd that can reach these helpers is -1 ("already signaled").
++ */
++static inline int
++sync_wait(int fd, int timeout)
++{
++   (void)timeout;
++   if (fd < 0)
++      return 0;
++   errno = EINVAL;
++   return -1;
++}
++
++static inline bool
++sync_valid_fd(int fd)
++{
++   (void)fd;
++   return false;
++}
+ #else
+ #include <sys/syscall.h>
+ 
+diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
+index 3af0561..6f10426 100644
+--- a/src/virtio/vulkan/vn_instance.c
++++ b/src/virtio/vulkan/vn_instance.c
+@@ -56,7 +56,10 @@ static const struct vk_instance_extension_table
+ #ifdef VK_USE_PLATFORM_XLIB_XRANDR_EXT
+       .EXT_acquire_xlib_display = true,
+ #endif
+-#ifndef VK_USE_PLATFORM_WIN32_KHR
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++      /* common win32 wsi, CPU present path (no D3D12 queue) */
++      .KHR_win32_surface = true,
++#else
+       .EXT_headless_surface = true,
+ #endif
+ #ifdef VK_USE_PLATFORM_DISPLAY_KHR
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 788a8e5..3a530b2 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1058,6 +1058,18 @@ vn_physical_device_init_memory_properties(
+    if (!has_coherent_cached) {
+       props->memoryTypes[first_coherent].propertyFlags |=
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++   } else if (instance->renderer->info.needs_cached_host_visible) {
++      /* Only the cached types are really coherent for this renderer: hide
++       * host visibility of the others so apps never map them.
++       */
++      for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++         VkMemoryPropertyFlags *flags = &props->memoryTypes[i].propertyFlags;
++         if ((*flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++             !(*flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
++            *flags &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++         }
++      }
+    }
+ }
+ 
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..23cfc10 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -69,6 +69,16 @@ struct vn_renderer_info {
+    bool has_timeline_sync;
+    bool has_implicit_fencing;
+    bool has_guest_vram;
++   /* Mappings of non-cached host memory are not coherent with device writes
++    * (e.g. KVM ignoring the guest PAT while the host GPU writes without
++    * snooping), so only HOST_CACHED memory types may be host visible.
++    */
++   bool needs_cached_host_visible;
++   /* Present synchronously.  The win32 WSI CPU path records and submits a blit
++    * on the presenting queue, which must not run on the async present thread
++    * concurrently with app submissions to the same queue.
++    */
++   bool no_async_present;
+ 
+    uint32_t max_timeline_count;
+ 
+@@ -225,12 +235,22 @@ vn_renderer_create_vtest(struct vn_instance *instance,
+                          const VkAllocationCallbacks *alloc,
+                          struct vn_renderer **renderer);
+ 
++#if DETECT_OS_WINDOWS
++VkResult
++vn_renderer_create_vgpu(struct vn_instance *instance,
++                        const VkAllocationCallbacks *alloc,
++                        struct vn_renderer **renderer);
++#endif
++
+ static inline VkResult
+ vn_renderer_create(struct vn_instance *instance,
+                    const VkAllocationCallbacks *alloc,
+                    struct vn_renderer **renderer)
+ {
+-#ifdef HAVE_LIBDRM
++#if DETECT_OS_WINDOWS
++   /* vgpu kernel driver (\\.\VGpu3D); vtest needs unix sockets */
++   return vn_renderer_create_vgpu(instance, alloc, renderer);
++#elif defined(HAVE_LIBDRM)
+    VkResult result;
+    if (VN_DEBUG(VTEST)) {
+       result = vn_renderer_create_vtest(instance, alloc, renderer);
+diff --git a/src/virtio/vulkan/vn_renderer_vgpu.c b/src/virtio/vulkan/vn_renderer_vgpu.c
+new file mode 100644
+index 0000000..1bb0589
+--- /dev/null
++++ b/src/virtio/vulkan/vn_renderer_vgpu.c
+@@ -0,0 +1,855 @@
++/*
++ * Copyright 2026 vgpu authors
++ * SPDX-License-Identifier: MIT
++ *
++ * Venus renderer backend for Windows guests, on top of the vgpu kernel driver's
++ * \\.\VGpu3D control device (see vgpu_abi.h).  The ioctl set mirrors Linux DRM
++ * virtgpu, so this follows vn_renderer_virtgpu.c closely.  The differences:
++ *
++ *  - no dma-buf / sync file interop (has_dma_buf_import = has_external_sync = false),
++ *    like the vtest backend;
++ *  - no kernel timeline syncobjs: vn_renderer_sync timelines are emulated here on top
++ *    of the per-ring fence ids returned by EXECBUFFER (similar in spirit to
++ *    vn_renderer_sim_syncobj.c);
++ *  - mappings are placed by the kernel, so placed maps are not supported.
++ */
++
++#include <windows.h>
++#include <winioctl.h>
++#include <xmmintrin.h>
++
++#include "virtio/virtio-gpu/venus_hw.h"
++
++#include "util/os_time.h"
++
++#include "vgpu_abi.h"
++#include "vn_renderer_internal.h"
++
++#define VGPU_PCI_VENDOR_ID 0x1af4
++#define VGPU_PCI_DEVICE_ID 0x1050
++
++struct vgpu_shmem {
++   struct vn_renderer_shmem base;
++   uint32_t handle;
++};
++
++struct vgpu_bo {
++   struct vn_renderer_bo base;
++   uint32_t handle;
++   uint32_t blob_flags;
++};
++
++/* a not-yet-observed signal: the sync reaches `value` once fence `fence_id`
++ * on ring `ring_idx` completes
++ */
++struct vgpu_sync_point {
++   uint32_t ring_idx;
++   uint64_t fence_id;
++   uint64_t value;
++};
++
++struct vgpu_sync {
++   struct vn_renderer_sync base;
++
++   /* protected by vgpu::sync_mutex */
++   uint64_t value;
++   struct vgpu_sync_point *points;
++   uint32_t point_count;
++   uint32_t point_capacity;
++};
++
++struct vgpu {
++   struct vn_renderer base;
++
++   struct vn_instance *instance;
++
++   HANDLE dev;
++
++   uint32_t max_timeline_count;
++   uint32_t blob_alignment;
++
++   struct {
++      uint32_t id;
++      uint32_t version;
++      struct virgl_renderer_capset_venus data;
++   } capset;
++
++   mtx_t sync_mutex;
++
++   struct vn_renderer_shmem_cache shmem_cache;
++};
++
++static bool
++vgpu_ioctl(struct vgpu *gpu, DWORD code, void *buf, size_t size)
++{
++   DWORD ret = 0;
++   if (!DeviceIoControl(gpu->dev, code, buf, (DWORD)size, buf, (DWORD)size,
++                        &ret, NULL)) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(gpu->instance, "vgpu ioctl 0x%lx failed: %lu",
++                (unsigned long)code, (unsigned long)GetLastError());
++      }
++      return false;
++   }
++   return true;
++}
++
++static uint64_t
++vgpu_getparam(struct vgpu *gpu, uint64_t param)
++{
++   VGPU_GETPARAM args = { .param = param };
++   return vgpu_ioctl(gpu, IOCTL_VGPU_GETPARAM, &args, sizeof(args))
++             ? args.value
++             : 0;
++}
++
++static uint32_t
++vgpu_create_blob(struct vgpu *gpu,
++                 const struct vn_renderer_submit_batch *batch,
++                 uint32_t blob_mem,
++                 uint32_t blob_flags,
++                 size_t size,
++                 uint64_t blob_id)
++{
++   const size_t cmd_size = batch ? batch->cs_size : 0;
++   const size_t total = sizeof(VGPU_RESOURCE_CREATE_BLOB) + cmd_size;
++   VGPU_RESOURCE_CREATE_BLOB *args = calloc(1, total);
++   if (!args)
++      return 0;
++
++   args->blob_mem = blob_mem;
++   args->blob_flags = blob_flags;
++   args->blob_id = blob_id;
++   args->size = align64(size, gpu->blob_alignment);
++   args->cmd_size = (uint32_t)cmd_size;
++   if (cmd_size)
++      memcpy(args + 1, batch->cs_data, cmd_size);
++
++   uint32_t handle = 0;
++   if (vgpu_ioctl(gpu, IOCTL_VGPU_RESOURCE_CREATE_BLOB, args, total)) {
++      handle = args->handle;
++   } else {
++      vn_log(gpu->instance,
++             "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
++             "id=%" PRIu64 ", err=%lu",
++             blob_mem, blob_flags, size, blob_id,
++             (unsigned long)GetLastError());
++   }
++
++   free(args);
++   return handle;
++}
++
++static void *
++vgpu_map(struct vgpu *gpu, uint32_t handle)
++{
++   VGPU_MAP args = { .handle = handle };
++   if (!vgpu_ioctl(gpu, IOCTL_VGPU_MAP, &args, sizeof(args))) {
++      vn_log(gpu->instance, "MAP failed: handle=%u, err=%lu", handle,
++             (unsigned long)GetLastError());
++      return NULL;
++   }
++   return (void *)(uintptr_t)args.user_va;
++}
++
++static void
++vgpu_close(struct vgpu *gpu, uint32_t handle, bool mapped)
++{
++   VGPU_HANDLE args = { .handle = handle };
++   if (mapped)
++      vgpu_ioctl(gpu, IOCTL_VGPU_UNMAP, &args, sizeof(args));
++   vgpu_ioctl(gpu, IOCTL_VGPU_RESOURCE_CLOSE, &args, sizeof(args));
++}
++
++/* ---- syncs ---------------------------------------------------------------- */
++
++static uint64_t
++vgpu_ring_completed(struct vgpu *gpu, uint32_t ring_idx)
++{
++   VGPU_QUERY_FENCE q = { .ring_idx = ring_idx };
++   return vgpu_ioctl(gpu, IOCTL_VGPU_QUERY_FENCE, &q, sizeof(q)) ? q.completed
++                                                                 : 0;
++}
++
++/* fold completed points into sync->value; call with sync_mutex held */
++static void
++vgpu_sync_update_locked(struct vgpu *gpu, struct vgpu_sync *sync)
++{
++   uint64_t completed[VGPU_MAX_RINGS];
++   uint64_t queried = 0; /* bitmask of rings already queried */
++
++   uint32_t kept = 0;
++   for (uint32_t i = 0; i < sync->point_count; i++) {
++      const struct vgpu_sync_point *pt = &sync->points[i];
++      const uint32_t r = pt->ring_idx;
++      if (!(queried & BITFIELD64_BIT(r))) {
++         completed[r] = vgpu_ring_completed(gpu, r);
++         queried |= BITFIELD64_BIT(r);
++      }
++      if (completed[r] >= pt->fence_id) {
++         sync->value = MAX2(sync->value, pt->value);
++      } else {
++         sync->points[kept++] = *pt;
++      }
++   }
++   sync->point_count = kept;
++}
++
++static bool
++vgpu_sync_add_point_locked(struct vgpu_sync *sync,
++                           uint32_t ring_idx,
++                           uint64_t fence_id,
++                           uint64_t value)
++{
++   if (sync->point_count == sync->point_capacity) {
++      const uint32_t cap = MAX2(sync->point_capacity * 2, 4);
++      struct vgpu_sync_point *pts =
++         realloc(sync->points, cap * sizeof(*sync->points));
++      if (!pts)
++         return false;
++      sync->points = pts;
++      sync->point_capacity = cap;
++   }
++   sync->points[sync->point_count++] = (struct vgpu_sync_point){
++      .ring_idx = ring_idx,
++      .fence_id = fence_id,
++      .value = value,
++   };
++   return true;
++}
++
++static VkResult
++vgpu_sync_write(struct vn_renderer *renderer,
++                struct vn_renderer_sync *_sync,
++                uint64_t val)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_sync *sync = (struct vgpu_sync *)_sync;
++
++   mtx_lock(&gpu->sync_mutex);
++   sync->value = MAX2(sync->value, val);
++   mtx_unlock(&gpu->sync_mutex);
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++vgpu_sync_read(struct vn_renderer *renderer,
++               struct vn_renderer_sync *_sync,
++               uint64_t *val)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_sync *sync = (struct vgpu_sync *)_sync;
++
++   mtx_lock(&gpu->sync_mutex);
++   vgpu_sync_update_locked(gpu, sync);
++   *val = sync->value;
++   mtx_unlock(&gpu->sync_mutex);
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++vgpu_sync_reset(struct vn_renderer *renderer, struct vn_renderer_sync *_sync)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_sync *sync = (struct vgpu_sync *)_sync;
++
++   mtx_lock(&gpu->sync_mutex);
++   sync->value = 0;
++   sync->point_count = 0;
++   mtx_unlock(&gpu->sync_mutex);
++
++   return VK_SUCCESS;
++}
++
++static void
++vgpu_sync_destroy(struct vn_renderer *renderer, struct vn_renderer_sync *_sync)
++{
++   struct vgpu_sync *sync = (struct vgpu_sync *)_sync;
++
++   free(sync->points);
++   free(sync);
++}
++
++static VkResult
++vgpu_sync_create(struct vn_renderer *renderer,
++                 uint64_t initial_val,
++                 struct vn_renderer_sync **out_sync)
++{
++   struct vgpu_sync *sync = calloc(1, sizeof(*sync));
++   if (!sync)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   sync->value = initial_val;
++   *out_sync = &sync->base;
++
++   return VK_SUCCESS;
++}
++
++/* ---- bos ------------------------------------------------------------------ */
++
++static void
++vgpu_bo_invalidate(struct vn_renderer *renderer,
++                   struct vn_renderer_bo *bo,
++                   VkDeviceSize offset,
++                   VkDeviceSize size)
++{
++   /* nop: the host visible window is mapped coherent */
++}
++
++static void
++vgpu_bo_flush(struct vn_renderer *renderer,
++              struct vn_renderer_bo *bo,
++              VkDeviceSize offset,
++              VkDeviceSize size)
++{
++   /* the window may be write-combined: drain WC buffers */
++   _mm_sfence();
++}
++
++static void *
++vgpu_bo_map(struct vn_renderer *renderer,
++            struct vn_renderer_bo *_bo,
++            void *placed_addr)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_bo *bo = (struct vgpu_bo *)_bo;
++   const bool mappable = bo->blob_flags & VGPU_BLOB_FLAG_USE_MAPPABLE;
++
++   /* the kernel picks the address; VK_EXT_map_memory_placed is not exposed */
++   if (placed_addr)
++      return NULL;
++
++   /* not thread-safe but is fine */
++   if (!bo->base.mmap_ptr && mappable)
++      bo->base.mmap_ptr = vgpu_map(gpu, bo->handle);
++
++   return bo->base.mmap_ptr;
++}
++
++static int
++vgpu_bo_export_dma_buf(struct vn_renderer *renderer,
++                       struct vn_renderer_bo *bo)
++{
++   return -1;
++}
++
++static int
++vgpu_bo_export_sync_file(struct vn_renderer *renderer,
++                         struct vn_renderer_bo *bo)
++{
++   return -1;
++}
++
++static bool
++vgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_bo *bo = (struct vgpu_bo *)_bo;
++
++   /* no imports, so nothing can revive the refcount */
++   vgpu_close(gpu, bo->handle, bo->base.mmap_ptr != NULL);
++   free(bo);
++
++   return true;
++}
++
++static VkResult
++vgpu_bo_create_from_device_memory(
++   struct vn_renderer *renderer,
++   struct vn_renderer_submit_batch *batch,
++   VkDeviceSize size,
++   vn_object_id mem_id,
++   VkMemoryPropertyFlags flags,
++   VkExternalMemoryHandleTypeFlags external_handles,
++   struct vn_renderer_bo **out_bo)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++
++   uint32_t blob_flags = 0;
++   if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++      blob_flags |= VGPU_BLOB_FLAG_USE_MAPPABLE;
++   if (external_handles)
++      blob_flags |= VGPU_BLOB_FLAG_USE_SHAREABLE;
++
++   struct vgpu_bo *bo = calloc(1, sizeof(*bo));
++   if (!bo)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   const uint32_t handle = vgpu_create_blob(gpu, batch, VGPU_BLOB_MEM_HOST3D,
++                                            blob_flags, size, mem_id);
++   if (!handle) {
++      free(bo);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   *bo = (struct vgpu_bo){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = handle,
++         .mmap_size = size,
++      },
++      .handle = handle,
++      .blob_flags = blob_flags,
++   };
++
++   *out_bo = &bo->base;
++
++   return VK_SUCCESS;
++}
++
++/* ---- shmem ---------------------------------------------------------------- */
++
++static void
++vgpu_shmem_destroy_now(struct vn_renderer *renderer,
++                       struct vn_renderer_shmem *_shmem)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   struct vgpu_shmem *shmem = (struct vgpu_shmem *)_shmem;
++
++   vgpu_close(gpu, shmem->handle, true);
++   free(shmem);
++}
++
++static void
++vgpu_shmem_destroy(struct vn_renderer *renderer,
++                   struct vn_renderer_shmem *shmem)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++
++   if (vn_renderer_shmem_cache_add(&gpu->shmem_cache, shmem))
++      return;
++
++   vgpu_shmem_destroy_now(&gpu->base, shmem);
++}
++
++static struct vn_renderer_shmem *
++vgpu_shmem_create(struct vn_renderer *renderer, size_t size)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++
++   struct vn_renderer_shmem *cached_shmem =
++      vn_renderer_shmem_cache_get(&gpu->shmem_cache, size);
++   if (cached_shmem) {
++      cached_shmem->refcount = VN_REFCOUNT_INIT(1);
++      return cached_shmem;
++   }
++
++   struct vgpu_shmem *shmem = calloc(1, sizeof(*shmem));
++   if (!shmem)
++      return NULL;
++
++   /* HOST3D + MAPPABLE + blob_id 0 makes the render server allocate host
++    * shmem (supports_blob_id_0), see virtgpu_init_shmem_blob_mem
++    */
++   const uint32_t handle = vgpu_create_blob(
++      gpu, NULL, VGPU_BLOB_MEM_HOST3D, VGPU_BLOB_FLAG_USE_MAPPABLE, size, 0);
++   if (!handle) {
++      free(shmem);
++      return NULL;
++   }
++
++   void *ptr = vgpu_map(gpu, handle);
++   if (!ptr) {
++      vgpu_close(gpu, handle, false);
++      free(shmem);
++      return NULL;
++   }
++
++   *shmem = (struct vgpu_shmem){
++      .base = {
++         .refcount = VN_REFCOUNT_INIT(1),
++         .res_id = handle,
++         .mmap_size = size,
++         .mmap_ptr = ptr,
++      },
++      .handle = handle,
++   };
++
++   return &shmem->base;
++}
++
++/* ---- submit / wait -------------------------------------------------------- */
++
++static VkResult
++vgpu_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++   const uint64_t abs_timeout = os_time_get_absolute_timeout(wait->timeout);
++
++   while (true) {
++      /* find one fence that would make progress on an unsatisfied sync */
++      bool done = !wait->wait_any;
++      bool have_fence = false;
++      VGPU_WAIT_FENCE wf = { 0 };
++
++      mtx_lock(&gpu->sync_mutex);
++      for (uint32_t i = 0; i < wait->sync_count; i++) {
++         struct vgpu_sync *sync = (struct vgpu_sync *)wait->syncs[i];
++         const uint64_t target = wait->sync_values[i];
++
++         vgpu_sync_update_locked(gpu, sync);
++         if (sync->value >= target) {
++            if (wait->wait_any) {
++               done = true;
++               break;
++            }
++            continue;
++         }
++
++         if (!wait->wait_any)
++            done = false;
++
++         for (uint32_t j = 0; j < sync->point_count && !have_fence; j++) {
++            if (sync->points[j].value >= target) {
++               wf.ring_idx = sync->points[j].ring_idx;
++               wf.fence_id = sync->points[j].fence_id;
++               have_fence = true;
++            }
++         }
++      }
++      mtx_unlock(&gpu->sync_mutex);
++
++      if (done)
++         return VK_SUCCESS;
++
++      const uint64_t now = os_time_get_nano();
++      if (now >= abs_timeout)
++         return VK_TIMEOUT;
++
++      /* Block on the kernel fence in short slices so that CPU-side writes
++       * (vkSignalSemaphore) and the other syncs of a wait-any are rechecked.
++       * Without a pending fence the target can only be reached by a CPU
++       * write, so just yield.
++       */
++      const uint64_t left_ms = (abs_timeout - now) / 1000000;
++      if (have_fence) {
++         wf.timeout_ms = (uint32_t)MIN2(MAX2(left_ms, 1), 20);
++         if (!vgpu_ioctl(gpu, IOCTL_VGPU_WAIT_FENCE, &wf, sizeof(wf)))
++            return VK_ERROR_DEVICE_LOST;
++      } else {
++         Sleep(left_ms ? 1 : 0);
++      }
++   }
++}
++
++static VkResult
++vgpu_submit(struct vn_renderer *renderer,
++            const struct vn_renderer_submit_batch *batch)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++
++   const size_t total = VGPU_EXECBUF_TOTAL(0, batch->cs_size);
++   VGPU_EXECBUFFER *args = malloc(total);
++   if (!args)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   *args = (VGPU_EXECBUFFER){
++      .flags = VGPU_EXECBUF_RING_IDX | (batch->sync_count ? VGPU_EXECBUF_FENCE : 0),
++      .size = (uint32_t)batch->cs_size,
++      .ring_idx = batch->ring_idx,
++   };
++   if (batch->cs_size)
++      memcpy(VGPU_EXECBUF_CMD(args), batch->cs_data, batch->cs_size);
++
++   /* The host visible window can be mapped write-combined (e.g. resizable-BAR
++    * VRAM on the host).  Drain WC buffers so the device never sees stores that
++    * land after it has already written the memory.
++    */
++   _mm_sfence();
++
++   /* A fence that completes before its point is recorded is still folded in by
++    * the next update, so the lock is not needed across the ioctl.
++    */
++   const bool ok = vgpu_ioctl(gpu, IOCTL_VGPU_EXECBUFFER, args, total);
++   mtx_lock(&gpu->sync_mutex);
++   if (ok) {
++      for (uint32_t i = 0; i < batch->sync_count; i++) {
++         struct vgpu_sync *sync = (struct vgpu_sync *)batch->syncs[i];
++         vgpu_sync_update_locked(gpu, sync);
++         if (!vgpu_sync_add_point_locked(sync, batch->ring_idx, args->fence_id,
++                                         batch->sync_values[i])) {
++            mtx_unlock(&gpu->sync_mutex);
++            free(args);
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++         }
++      }
++   }
++   mtx_unlock(&gpu->sync_mutex);
++
++   free(args);
++   return ok ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
++}
++
++/* ---- init ----------------------------------------------------------------- */
++
++static void
++vgpu_init_renderer_info(struct vgpu *gpu)
++{
++   struct vn_renderer_info *info = &gpu->base.info;
++
++   info->pci.vendor_id = VGPU_PCI_VENDOR_ID;
++   info->pci.device_id = VGPU_PCI_DEVICE_ID;
++
++   info->has_dma_buf_import = false;
++   info->has_external_sync = false;
++   info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
++   info->has_implicit_fencing = false;
++
++   const struct virgl_renderer_capset_venus *capset = &gpu->capset.data;
++   info->wire_format_version = capset->wire_format_version;
++   info->vk_xml_version = capset->vk_xml_version;
++   info->vk_ext_command_serialization_spec_version =
++      capset->vk_ext_command_serialization_spec_version;
++   info->vk_mesa_venus_protocol_spec_version =
++      capset->vk_mesa_venus_protocol_spec_version;
++   assert(capset->supports_blob_id_0);
++
++   /* ensure vk_extension_mask is large enough to hold all capset masks */
++   STATIC_ASSERT(sizeof(info->vk_extension_mask) >=
++                 sizeof(capset->vk_extension_mask1));
++   memcpy(info->vk_extension_mask, capset->vk_extension_mask1,
++          sizeof(capset->vk_extension_mask1));
++
++   assert(capset->allow_vk_wait_syncs);
++
++   assert(capset->supports_multiple_timelines);
++   info->max_timeline_count = gpu->max_timeline_count;
++
++   /* KVM ignores the guest PAT for host RAM by default, so the guest maps
++    * everything write-back while the host GPU writes uncached/WC system memory
++    * without snooping: only HOST_CACHED types stay coherent.  Set
++    * VN_VGPU_ALLOW_UNCACHED=1 when the host honors the guest PAT.
++    */
++   const char *allow_uncached = getenv("VN_VGPU_ALLOW_UNCACHED");
++   info->needs_cached_host_visible =
++      !(allow_uncached && allow_uncached[0] == '1');
++
++   /* the win32 WSI blits on the present queue (CPU present path) */
++   info->no_async_present = true;
++
++   /* Use guest blob allocations from dedicated heap (Host visible memory) */
++   if (capset->use_guest_vram)
++      info->has_guest_vram = true;
++}
++
++static void
++vgpu_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
++{
++   struct vgpu *gpu = (struct vgpu *)renderer;
++
++   vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
++
++   /* closing the handle tears down the context and every resource it owns */
++   if (gpu->dev != INVALID_HANDLE_VALUE)
++      CloseHandle(gpu->dev);
++
++   mtx_destroy(&gpu->sync_mutex);
++
++   vk_free(alloc, gpu);
++}
++
++static VkResult
++vgpu_init_params(struct vgpu *gpu)
++{
++   if (vgpu_getparam(gpu, VGPU_PARAM_ABI_VERSION) != VGPU_ABI_VERSION) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "vgpu ABI version mismatch");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   const uint64_t required_params[] = {
++      VGPU_PARAM_3D_FEATURES,
++      VGPU_PARAM_CAPSET_QUERY_FIX,
++      VGPU_PARAM_RESOURCE_BLOB,
++      VGPU_PARAM_CONTEXT_INIT,
++      VGPU_PARAM_HOST_VISIBLE,
++   };
++   for (uint32_t i = 0; i < ARRAY_SIZE(required_params); i++) {
++      if (!vgpu_getparam(gpu, required_params[i])) {
++         if (VN_DEBUG(INIT)) {
++            vn_log(gpu->instance, "required vgpu param %d is missing",
++                   (int)required_params[i]);
++         }
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++   }
++
++   if (!(vgpu_getparam(gpu, VGPU_PARAM_SUPPORTED_CAPSET_IDS) &
++         BITFIELD64_BIT(VGPU_CAPSET_VENUS))) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "host does not offer the venus capset");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   /* the kernel hands out host visible space in pages */
++   gpu->blob_alignment = 4096;
++   gpu->max_timeline_count = VGPU_MAX_RINGS;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++vgpu_init_capset(struct vgpu *gpu)
++{
++   gpu->capset.id = VGPU_CAPSET_VENUS;
++   gpu->capset.version = 0;
++
++   struct {
++      VGPU_GET_CAPS hdr;
++      struct virgl_renderer_capset_venus data;
++   } args = {
++      .hdr = {
++         .cap_set_id = gpu->capset.id,
++         .cap_set_ver = gpu->capset.version,
++         .size = sizeof(args.data),
++      },
++   };
++   if (!vgpu_ioctl(gpu, IOCTL_VGPU_GET_CAPS, &args, sizeof(args))) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(gpu->instance, "failed to get venus v%d capset",
++                gpu->capset.version);
++      }
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   gpu->capset.data = args.data;
++
++   if (gpu->capset.data.wire_format_version == 0) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(gpu->instance, "Unsupported wire format version %u",
++                gpu->capset.data.wire_format_version);
++      }
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++vgpu_init_context(struct vgpu *gpu)
++{
++   VGPU_CONTEXT_INIT args = {
++      .capset_id = gpu->capset.id,
++      .num_rings = gpu->max_timeline_count,
++      .poll_rings_mask = 0, /* fences are polled through the kernel */
++   };
++   snprintf(args.debug_name, sizeof(args.debug_name), "venus");
++
++   if (!vgpu_ioctl(gpu, IOCTL_VGPU_CONTEXT_INIT, &args, sizeof(args))) {
++      if (VN_DEBUG(INIT))
++         vn_log(gpu->instance, "failed to initialize context");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++vgpu_init(struct vgpu *gpu)
++{
++   mtx_init(&gpu->sync_mutex, mtx_plain);
++
++   gpu->dev = CreateFileW(VGPU_DEVICE_USER_PATH, GENERIC_READ | GENERIC_WRITE,
++                          0, NULL, OPEN_EXISTING, 0, NULL);
++   if (gpu->dev == INVALID_HANDLE_VALUE) {
++      if (VN_DEBUG(INIT)) {
++         vn_log(gpu->instance, "failed to open \\\\.\\VGpu3D: %lu",
++                (unsigned long)GetLastError());
++      }
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   VkResult result = vgpu_init_params(gpu);
++   if (result == VK_SUCCESS)
++      result = vgpu_init_capset(gpu);
++   if (result == VK_SUCCESS)
++      result = vgpu_init_context(gpu);
++   if (result != VK_SUCCESS)
++      return result;
++
++   vn_renderer_shmem_cache_init(&gpu->shmem_cache, &gpu->base,
++                                vgpu_shmem_destroy_now);
++
++   vgpu_init_renderer_info(gpu);
++
++   gpu->base.ops.destroy = vgpu_destroy;
++   gpu->base.ops.submit = vgpu_submit;
++   gpu->base.ops.wait = vgpu_wait;
++
++   gpu->base.shmem_ops.create = vgpu_shmem_create;
++   gpu->base.shmem_ops.destroy = vgpu_shmem_destroy;
++
++   gpu->base.bo_ops.create_from_device_memory =
++      vgpu_bo_create_from_device_memory;
++   gpu->base.bo_ops.create_from_dma_buf = NULL;
++   gpu->base.bo_ops.destroy = vgpu_bo_destroy;
++   gpu->base.bo_ops.export_dma_buf = vgpu_bo_export_dma_buf;
++   gpu->base.bo_ops.export_sync_file = vgpu_bo_export_sync_file;
++   gpu->base.bo_ops.map = vgpu_bo_map;
++   gpu->base.bo_ops.flush = vgpu_bo_flush;
++   gpu->base.bo_ops.invalidate = vgpu_bo_invalidate;
++
++   gpu->base.sync_ops.create = vgpu_sync_create;
++   gpu->base.sync_ops.create_from_syncobj = NULL;
++   gpu->base.sync_ops.destroy = vgpu_sync_destroy;
++   gpu->base.sync_ops.export_syncobj = NULL;
++   gpu->base.sync_ops.reset = vgpu_sync_reset;
++   gpu->base.sync_ops.read = vgpu_sync_read;
++   gpu->base.sync_ops.write = vgpu_sync_write;
++
++   return VK_SUCCESS;
++}
++
++VkResult
++vn_renderer_create_vgpu(struct vn_instance *instance,
++                        const VkAllocationCallbacks *alloc,
++                        struct vn_renderer **renderer)
++{
++   struct vgpu *gpu = vk_zalloc(alloc, sizeof(*gpu), VN_DEFAULT_ALIGN,
++                                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
++   if (!gpu)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   gpu->instance = instance;
++   gpu->dev = INVALID_HANDLE_VALUE;
++
++   VkResult result = vgpu_init(gpu);
++   if (result != VK_SUCCESS) {
++      vgpu_destroy(&gpu->base, alloc);
++      return result;
++   }
++
++   *renderer = &gpu->base;
++
++   if (VN_DEBUG(INIT))
++      vn_log(gpu->instance, "vgpu backend initialized");
++
++   return VK_SUCCESS;
++}
++
++/* Venus never compiles SPIR-V in the guest, but vk_util.c references these
++ * from vk_spec_info_to_nir_spirv and the PE linker does not drop the
++ * unreferenced section.  This build links no spirv library, so define them
++ * (weak definitions are not resolved by MinGW ld for archive references).
++ */
++void *vtn_alloc_specialization(void *mem_ctx, uint32_t count);
++void vtn_free_specialization(void *spec);
++void vtn_add_specialization_entry(void *spec, uint32_t id, uint32_t value);
++
++void *
++vtn_alloc_specialization(void *mem_ctx, uint32_t count)
++{
++   assert(!"SPIR-V specialization is not used by venus");
++   return NULL;
++}
++
++void
++vtn_free_specialization(void *spec)
++{
++}
++
++void
++vtn_add_specialization_entry(void *spec, uint32_t id, uint32_t value)
++{
++}
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index 62a1ca2..8a57532 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -1017,6 +1017,7 @@ vn_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
+ 
+    if (!dev->renderer->info.has_implicit_fencing &&
++       !dev->renderer->info.no_async_present &&
+        !VN_PERF(NO_ASYNC_PRESENT)) {
+       struct vn_queue *queue = vn_queue_from_handle(_queue);
+       return vn_wsi_present_async(dev, queue, pPresentInfo);

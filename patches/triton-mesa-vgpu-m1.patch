@@ -1,0 +1,1387 @@
+diff --git a/src/virtio/neptune/triton/triton.h b/src/virtio/neptune/triton/triton.h
+index 94a72f4..ef0c388 100644
+--- a/src/virtio/neptune/triton/triton.h
++++ b/src/virtio/neptune/triton/triton.h
+@@ -247,7 +247,13 @@ typedef struct TRITON_DEVICE {
+  * in dxvk_shared_resource.h): with MISC_SHARED, forces the dmabuf export to
+  * DRM_FORMAT_MOD_LINEAR so scanout consumers without modifier plumbing can
+  * import it.  Value is ABI with the host dxvk build. */
++#ifdef VGPU_DXVK_INPROC
++/* vgpu: the in-process DXVK has no such bit (it would be rejected as an unknown
++ * misc flag); primaries get their scanout layout from the vgpu backend. */
++#define TRITON_D3D11_MISC_LINEAR_EXPORT 0u
++#else
+ #define TRITON_D3D11_MISC_LINEAR_EXPORT 0x40000000u
++#endif
+ 
+ /* Defines a CalcPrivate*Size DDI whose private object has a fixed size. */
+ #define TR_CALC_PRIVATE_SIZE(name, type, ...)                          \
+@@ -338,6 +344,16 @@ typedef struct TRITON_RESOURCE {
+ 
+     /* Head of the intrusive list of live views wrapping this resource. */
+     TRITON_VIEWLINK       *pViewList;
++
++#ifdef VGPU_DXVK_INPROC
++    /* vgpu: blt-model windowed presents: a guest-memory (coherent) virgl 3D
++     * allocation the frame is copied into on the CPU, so the KMD's coherent
++     * blt path can upload it into DWM's redirection surface (see
++     * vgpuBltSource). */
++    D3DKMT_HANDLE          hVgpuCoherent;
++    UINT                   vgpuCoherentW, vgpuCoherentH;
++    ID3D11Texture2D       *pVgpuStaging;
++#endif
+ } TRITON_RESOURCE, *PTRITON_RESOURCE;
+ 
+ /* Views keep the host desc they were created with, so recreating them after
+diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
+index bc4e182..65c28bd 100644
+--- a/src/virtio/neptune/triton/tritonDxgi.c
++++ b/src/virtio/neptune/triton/tritonDxgi.c
+@@ -22,6 +22,11 @@
+ 
+ #include "tritonBlitShaders.h"
+ 
++#ifdef VGPU_DXVK_INPROC
++void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src); /* vgpu_triton_backend.c */
++D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src);
++#endif
++
+ /* Lazily create the GPU-done fence (rationale: the present-fence block in
+  * triton.h).  Caller holds presentLock.  Returns TRUE if fencing is
+  * available; FALSE => unfenced (bare-Flush) present. */
+@@ -621,7 +626,35 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+       tritonResourceSyncPresentCompanion(pD, src);
+       tritonPresentUnlock(pD);
+    }
++   D3DKMT_HANDLE vgpuSrc = 0;
+    tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
++#ifdef VGPU_DXVK_INPROC
++   {
++      static LONG logged;
++      if (!src->IsPresentable && InterlockedIncrement(&logged) <= 12)
++         TR_LOG("vgpu: windowed present flags=0x%x src=%ux%u fmt=%u kmalloc=0x%x dst=%p dstRes=%p dstFmt=%u %ux%u",
++                pArgs->Flags.Value, src->Width, src->Height, (UINT)src->Format, src->hKMAllocation, (void *)dst,
++                dst ? (void *)dst->pResource : NULL, dst ? (UINT)dst->Format : 0,
++                dst ? dst->Width : 0, dst ? dst->Height : 0);
++   }
++   /* vgpu: hand the finished frame to the KMD's 2D framebuffer (see
++    * vgpuFbPresent): dma-buf scanout of the primary does not reach the host
++    * display on every host. */
++   if (src->IsPresentable) {
++      tritonPresentLock(pD);
++      vgpuFbPresent(pD, src);
++      tritonPresentUnlock(pD);
++   } else {
++      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
++       * a virgl copy, which cannot read Venus memory -- give it a coherent
++       * source filled on the CPU instead */
++      if (pArgs->Flags.Blt) {
++         tritonPresentLock(pD);
++         vgpuSrc = vgpuBltSource(pD, src);
++         tritonPresentUnlock(pD);
++      }
++   }
++#endif
+ 
+    /* DXGIDDICB_PRESENT (MSDN):
+     *   hSrcAllocation  the rendered back buffer to present (a flip-primary
+@@ -631,7 +664,10 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+     *   pDXGIContext    runtime cookie threaded through unchanged. */
+    DXGIDDICB_PRESENT cb;
+    memset(&cb, 0, sizeof(cb));
+-   cb.hSrcAllocation = src->hKMAllocation;
++   cb.hSrcAllocation = vgpuSrc ? vgpuSrc : src->hKMAllocation;
++#ifdef VGPU_DXVK_INPROC
++   { static LONG n; if (pArgs->Flags.Blt && InterlockedIncrement(&n) <= 6) TR_LOG("vgpu: blt present src=0x%x (vgpu 0x%x) dst=0x%x", cb.hSrcAllocation, vgpuSrc, cb.hDstAllocation); }
++#endif
+    cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
+    cb.pDXGIContext   = pArgs->pDXGIContext;
+    cb.hContext       = pD->hKMContext;
+@@ -1335,11 +1371,42 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
+       tritonResourceSyncPresentCompanion(pD, src);
+       tritonPresentUnlock(pD);
+    }
++   D3DKMT_HANDLE vgpuSrc = 0;
+    tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
++#ifdef VGPU_DXVK_INPROC
++   {
++      static LONG logged;
++      if (!src->IsPresentable && InterlockedIncrement(&logged) <= 12)
++         TR_LOG("vgpu: windowed present flags=0x%x src=%ux%u fmt=%u kmalloc=0x%x dst=%p dstRes=%p dstFmt=%u %ux%u",
++                pArgs->Flags.Value, src->Width, src->Height, (UINT)src->Format, src->hKMAllocation, (void *)dst,
++                dst ? (void *)dst->pResource : NULL, dst ? (UINT)dst->Format : 0,
++                dst ? dst->Width : 0, dst ? dst->Height : 0);
++   }
++   /* vgpu: hand the finished frame to the KMD's 2D framebuffer (see
++    * vgpuFbPresent): dma-buf scanout of the primary does not reach the host
++    * display on every host. */
++   if (src->IsPresentable) {
++      tritonPresentLock(pD);
++      vgpuFbPresent(pD, src);
++      tritonPresentUnlock(pD);
++   } else {
++      /* windowed: the KMD blts into DWM's (coherent) redirection surface with
++       * a virgl copy, which cannot read Venus memory -- give it a coherent
++       * source filled on the CPU instead */
++      if (pArgs->Flags.Blt) {
++         tritonPresentLock(pD);
++         vgpuSrc = vgpuBltSource(pD, src);
++         tritonPresentUnlock(pD);
++      }
++   }
++#endif
+ 
+    DXGIDDICB_PRESENT cb;
+    memset(&cb, 0, sizeof(cb));
+-   cb.hSrcAllocation = src->hKMAllocation;
++   cb.hSrcAllocation = vgpuSrc ? vgpuSrc : src->hKMAllocation;
++#ifdef VGPU_DXVK_INPROC
++   { static LONG n; if (pArgs->Flags.Blt && InterlockedIncrement(&n) <= 6) TR_LOG("vgpu: blt present src=0x%x (vgpu 0x%x) dst=0x%x", cb.hSrcAllocation, vgpuSrc, cb.hDstAllocation); }
++#endif
+    cb.hDstAllocation = dst ? dst->hKMAllocation : 0;
+    cb.pDXGIContext   = pArgs->pDXGIContext;
+    cb.hContext       = pD->hKMContext;
+diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
+index 4a359d5..8962be5 100644
+--- a/src/virtio/neptune/triton/tritonKm.c
++++ b/src/virtio/neptune/triton/tritonKm.c
+@@ -78,7 +78,7 @@ tritonKmEnsureRuntimeCtx(TRITON_KM *km)
+       memset(&esc, 0, sizeof(esc));
+       esc.Type             = VIOGPU_CTX_INIT;
+       esc.DataLength       = sizeof(esc.CtxInit);
+-      esc.CtxInit.CapsetID = 7;
++      esc.CtxInit.CapsetID = 4; /* vgpu: Venus (stock host), not the Neptune capset 7 */
+       esc.CtxInit.NumRings = 1;
+       HRESULT hr = tritonKmEscape(km, &esc);
+       if (SUCCEEDED(hr))
+diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
+index e47217f..0504efa 100644
+--- a/src/virtio/neptune/triton/tritonResource.c
++++ b/src/virtio/neptune/triton/tritonResource.c
+@@ -15,6 +15,10 @@
+ 
+ #include "virtio/virtio-gpu/wddm_hw.h"   /* VIOGPU resource / shared-allocation ABI */
+ 
++#ifdef VGPU_DXVK_INPROC
++void vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r); /* vgpu_triton_backend.c */
++#endif
++
+ /* tritonQuery.c; the DDI table in tritonDDI.c carries the same prototype. */
+ void APIENTRY tritonCheckFormatSupport(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT *);
+ 
+@@ -206,6 +210,11 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+     r->pResource        = NULL;
+     r->pPresentCompanion = NULL;
+     r->pViewList        = NULL;
++#ifdef VGPU_DXVK_INPROC
++    r->hVgpuCoherent    = 0;
++    r->vgpuCoherentW    = r->vgpuCoherentH = 0;
++    r->pVgpuStaging     = NULL;
++#endif
+     /* A resource is a display primary only when the runtime supplies
+      * pPrimaryDesc (d3d10umddi.h: "If pPrimaryDesc absent, blt/copy style
+      * is implied when used with Present").  BIND_PRESENT alone marks any
+@@ -242,10 +251,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+     const BOOL exportableShape = pArgs->MipLevels <= 1 &&
+                                  pArgs->ArraySize <= 1 &&
+                                  pArgs->SampleDesc.Count <= 1;
++#ifdef VGPU_DXVK_INPROC
++    /* vgpu: a shared (exportable) surface is a LINEAR image on the host, and
++     * NVIDIA cannot render to pitch-linear colour targets in every
++     * configuration (graphics class error Xid 69 with Fusion 360's viewport).
++     * Back buffers therefore keep optimal private storage and always present
++     * through a shared companion filled by a GPU copy at present time. */
++    BOOL isShared = is2D &&
++                    (pArgs->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) != 0;
++    const BOOL needCompanion = presentOnly;
++    (void)exportableShape;
++#else
+     BOOL isShared = is2D &&
+                     ((pArgs->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) != 0 ||
+                      (presentOnly && exportableShape));
+     const BOOL needCompanion = presentOnly && !exportableShape;
++#endif
+ 
+ 
+     /* Top-level dimensions come from the mip-0 entry of pMipInfoList. */
+@@ -520,6 +541,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+         ID3D11Resource_Release(r->pResource);
+         r->pResource = NULL;
+     }
++#ifdef VGPU_DXVK_INPROC
++    vgpuBltSourceRelease(pD, r);
++#endif
+     if (r->pPresentCompanion) {
+         ID3D11Resource_Release(r->pPresentCompanion);
+         r->pPresentCompanion = NULL;
+diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
+index e2da5c4..7c52c08 100644
+--- a/src/virtio/virtio-gpu/wddm_hw.h
++++ b/src/virtio/virtio-gpu/wddm_hw.h
+@@ -45,12 +45,12 @@ typedef ULONGLONG VIOGPU_UM_PTR;    // user-mode VA, zero-extended
+ typedef ULONGLONG VIOGPU_UM_HANDLE; // user-mode HANDLE, zero-extended
+ 
+ // Pack (user mode).
+-static __inline VIOGPU_UM_PTR VioGpuUmPtr(const void *p)
++static inline VIOGPU_UM_PTR VioGpuUmPtr(const void *p)
+ {
+     return (VIOGPU_UM_PTR)(ULONG_PTR)p;
+ }
+ 
+-static __inline VIOGPU_UM_HANDLE VioGpuUmHandle(HANDLE h)
++static inline VIOGPU_UM_HANDLE VioGpuUmHandle(HANDLE h)
+ {
+     return (VIOGPU_UM_HANDLE)(ULONG_PTR)h;
+ }
+@@ -60,7 +60,7 @@ static __inline VIOGPU_UM_HANDLE VioGpuUmHandle(HANDLE h)
+ // function would have to return.
+ #define VIOGPU_UM_PTR_AS(type, v) ((type)(ULONG_PTR)(v))
+ 
+-static __inline HANDLE VioGpuUmHandleValue(VIOGPU_UM_HANDLE v)
++static inline HANDLE VioGpuUmHandleValue(VIOGPU_UM_HANDLE v)
+ {
+     return (HANDLE)(ULONG_PTR)v;
+ }
+@@ -154,6 +154,13 @@ typedef struct _VIOGPU_ADAPTERINFO
+ // wait for that frame.  No payload.
+ #define VIOGPU_PRESENT_GATE_HINT     0x402
+ 
++// vgpu: VIOGPU_FB_PRESENT copies a finished frame (B8G8R8A8/X8, CPU memory of
++// the calling process) into the KMD's 2D framebuffer resource and scans that
++// out with a classic SET_SCANOUT.  Used while dma-buf (blob) scanout of the
++// GPU primaries does not reach the host display (egl-headless on NVIDIA);
++// the first such escape turns blob scanout off for the adapter.
++#define VIOGPU_FB_PRESENT            0x500
++
+ #pragma pack(1)
+ typedef struct _VIOGPU_DISP_MODE
+ {
+@@ -311,6 +318,17 @@ typedef struct _VIOGPU_GATE_ARM_REQ
+ #pragma pack()
+ 
+ #pragma pack(1)
++#pragma pack(1)
++typedef struct _VIOGPU_FB_PRESENT_REQ
++{
++    VIOGPU_UM_PTR Pixels; // first row, Pitch bytes apart
++    ULONG Width;
++    ULONG Height;
++    ULONG Pitch;
++    ULONG Format;         // DXGI_FORMAT
++} VIOGPU_FB_PRESENT_REQ;
++#pragma pack()
++
+ typedef struct _VIOGPU_ESCAPE
+ {
+     USHORT Type;
+@@ -334,6 +352,8 @@ typedef struct _VIOGPU_ESCAPE
+         VIOGPU_PRESENT_FENCE_REQ PresentFence;
+ 
+         VIOGPU_GATE_ARM_REQ GateArm;
++
++        VIOGPU_FB_PRESENT_REQ FbPresent;
+     } DUMMYUNIONNAME;
+ } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
+ #pragma pack()
+@@ -443,6 +463,14 @@ typedef struct _VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS
+ } VIOGPU_RESOURCE_SHARED_TEXTURE_OPTIONS;
+ #pragma pack()
+ 
++// vgpu: VIOGPU_RESOURCE_TYPE_SHARED with create_ctx_id == VIOGPU_SHARED_IMPORT_CTX
++// adopts an existing host resource instead of creating one from a pending
++// blob: blob_id carries its res_id (the exporter's Venus allocation, which
++// owns it).  Keeps the shared-texture scanout/primary handling; the KMD
++// mints no id and never destroys the resource.  modifier carries the
++// exporter's global D3DKMT share handle for opening UMDs.
++#define VIOGPU_SHARED_IMPORT_CTX 0xFFFFFFFFu
++
+ #define VIOGPU_RESOURCE_TYPE_3D     0
+ #define VIOGPU_RESOURCE_TYPE_BLOB   1
+ #define VIOGPU_RESOURCE_TYPE_IMPORT 2
+@@ -482,7 +510,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX
+ // blob_id) is unique among live shared textures -- the pending blob is
+ // staged per transport context under a per-context-monotonic blob_id.
+ // Bit 62 namespaces these away from KMD-minted EX cookies (bit 63).
+-static __inline ULONGLONG VioGpuSharedTexCookie(ULONG create_ctx_id, ULONGLONG blob_id)
++static inline ULONGLONG VioGpuSharedTexCookie(ULONG create_ctx_id, ULONGLONG blob_id)
+ {
+     return (1ULL << 62) | ((ULONGLONG)create_ctx_id << 44) | (blob_id & ((1ULL << 44) - 1));
+ }
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 7566a9f..b3384f2 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -50,7 +50,9 @@
+ 
+ #if DETECT_OS_WINDOWS
+ #include <processthreadsapi.h>
++#ifndef __MINGW32__ /* vgpu: MinGW defines pid_t (64-bit) */
+ typedef int pid_t;
++#endif
+ #else
+ #include <sys/syscall.h>
+ 
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 4386d62..4623345 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -372,6 +372,27 @@ vn_device_memory_alloc(struct vn_device *dev,
+    const bool has_guest_vram = dev->renderer->info.has_guest_vram;
+    const bool host_visible =
+       mem_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++
++#if DETECT_OS_WINDOWS
++   /* vgpu: memory dedicated to an image that could not be made shareable
++    * (vn_image_fix_create_info) cannot be exported either: allocate it as
++    * plain device memory. */
++   VkMemoryAllocateInfo vgpu_plain_info;
++   VkMemoryDedicatedAllocateInfo vgpu_plain_dedicated;
++   if (mem_vk->export_handle_types) {
++      const VkMemoryDedicatedAllocateInfo *ded =
++         vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
++      if (ded && ded->image != VK_NULL_HANDLE &&
++          vn_image_from_handle(ded->image)->vgpu_not_shareable) {
++         vgpu_plain_dedicated = *ded;
++         vgpu_plain_dedicated.pNext = NULL;
++         vgpu_plain_info = *alloc_info;
++         vgpu_plain_info.pNext = &vgpu_plain_dedicated;
++         alloc_info = &vgpu_plain_info;
++         mem_vk->export_handle_types = 0;
++      }
++   }
++#endif
+    const bool export_alloc = mem_vk->export_handle_types;
+ 
+    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+@@ -663,7 +684,16 @@ vn_GetMemoryWin32HandleKHR(VkDevice device,
+    assert(pGetWin32HandleInfo->handleType &
+           (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT));
+-   assert(mem->base_bo);
++   if (!mem->base_bo) {
++      /* vgpu: report instead of asserting (DXVK asks for every shared image) */
++      vn_log(dev->instance,
++             "vgpu: GetMemoryWin32Handle(type 0x%x) on memory without a bo: size=%llu "
++             "type=%u export=0x%x import=0x%x",
++             pGetWin32HandleInfo->handleType, (unsigned long long)mem->base.vk.size,
++             mem->base.vk.memory_type_index, mem->base.vk.export_handle_types,
++             mem->base.vk.import_handle_type);
++      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   }
+    const bool is_kmt = !(pGetWin32HandleInfo->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
+    *pHandle = vn_renderer_bo_export_handle(dev->renderer, mem->base_bo, is_kmt);
+    if (*pHandle == NULL)
+diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
+index 584ccb8..a7a9e94 100644
+--- a/src/virtio/vulkan/vn_image.c
++++ b/src/virtio/vulkan/vn_image.c
+@@ -558,6 +558,9 @@ struct vn_image_create_info {
+    VkImageStencilUsageCreateInfo stencil;
+    VkImageDrmFormatModifierListCreateInfoEXT modifier_list;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_explicit;
++   /* vgpu: optimal image that cannot be made LINEAR: created without external
++    * memory (not shareable) */
++   bool vgpu_not_shareable;
+ };
+ 
+ static const VkImageCreateInfo *
+@@ -567,12 +570,54 @@ vn_image_fix_create_info(
+    struct vn_image_create_info *local_info)
+ {
+    local_info->create = *create_info;
++   local_info->vgpu_not_shareable = false;
+    VkBaseOutStructure *cur = (void *)&local_info->create;
+ 
++#if DETECT_OS_WINDOWS
++   /* vgpu: shareable optimal images use the LINEAR DRM format modifier on the
++    * host, so exporter and importer get the same layout (dma-buf sharing
++    * between virglrenderer contexts; see vn_physical_device_init_external_memory) */
++   static const uint64_t vgpu_linear_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
++   /* Linear surfaces only exist as single-sample, single-mip, single-layer 2D
++    * color images; anything else forced to LINEAR makes the GPU raise a
++    * graphics class error (NVIDIA Xid 69 with Fusion 360). */
++   /* VN_VGPU_NO_LINEAR=1: never rewrite (shared images become non-shareable);
++    * a diagnostic switch */
++   static int no_linear = -1;
++   if (no_linear < 0) {
++      const char *e = getenv("VN_VGPU_NO_LINEAR");
++      no_linear = e && e[0] == '1';
++   }
++   const bool linear_ok = !no_linear &&
++      create_info->imageType == VK_IMAGE_TYPE_2D &&
++      create_info->samples == VK_SAMPLE_COUNT_1_BIT &&
++      create_info->mipLevels == 1 && create_info->arrayLayers == 1 &&
++      !(create_info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
++   if (create_info->tiling == VK_IMAGE_TILING_OPTIMAL && !linear_ok)
++      local_info->vgpu_not_shareable = true;
++   if (create_info->tiling == VK_IMAGE_TILING_OPTIMAL && linear_ok &&
++       !vk_find_struct_const(create_info->pNext,
++                             IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) &&
++       !vk_find_struct_const(create_info->pNext,
++                             IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)) {
++      local_info->create.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      local_info->modifier_list = (VkImageDrmFormatModifierListCreateInfoEXT){
++         .sType =
++            VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++         .drmFormatModifierCount = 1,
++         .pDrmFormatModifiers = &vgpu_linear_modifier,
++      };
++      cur->pNext = (void *)&local_info->modifier_list;
++      cur = (void *)&local_info->modifier_list;
++   }
++#endif
++
+    vk_foreach_struct_const(src, create_info->pNext) {
+       void *next = NULL;
+       switch (src->sType) {
+       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
++         if (local_info->vgpu_not_shareable)
++            break; /* vgpu: see linear_ok */
+          memcpy(&local_info->external, src, sizeof(local_info->external));
+          local_info->external.handleTypes = renderer_handle_type;
+          next = &local_info->external;
+@@ -687,12 +732,26 @@ vn_CreateImage(VkDevice device,
+    } else {
+       struct vn_image_create_info local_info;
+       if (external_info &&
+-          external_info->handleTypes != renderer_handle_type) {
++          (external_info->handleTypes != renderer_handle_type ||
++           (DETECT_OS_WINDOWS &&
++            pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL))) {
+          pCreateInfo = vn_image_fix_create_info(
+             pCreateInfo, renderer_handle_type, &local_info);
+       }
+ 
+       result = vn_image_create(dev, pCreateInfo, alloc, &img);
++      if (result == VK_SUCCESS && external_info &&
++          pCreateInfo == &local_info.create) {
++         img->vgpu_not_shareable = local_info.vgpu_not_shareable;
++         if (VN_DEBUG(INIT))
++            vn_log(dev->instance,
++                   "vgpu: shareable image fmt=%d %ux%u samples=%d mips=%u layers=%u usage=0x%x -> %s",
++                   local_info.create.format, local_info.create.extent.width,
++                   local_info.create.extent.height, local_info.create.samples,
++                   local_info.create.mipLevels, local_info.create.arrayLayers,
++                   local_info.create.usage,
++                   local_info.vgpu_not_shareable ? "optimal, not shareable" : "LINEAR");
++      }
+    }
+ 
+    if (result != VK_SUCCESS)
+diff --git a/src/virtio/vulkan/vn_image.h b/src/virtio/vulkan/vn_image.h
+index 4e18632..30c6b95 100644
+--- a/src/virtio/vulkan/vn_image.h
++++ b/src/virtio/vulkan/vn_image.h
+@@ -54,6 +54,9 @@ struct vn_image_create_deferred_info {
+ struct vn_image {
+    struct vn_image_base base;
+ 
++   /* vgpu: created without its external memory info (see vn_image_fix_create_info) */
++   bool vgpu_not_shareable;
++
+    struct vn_image_memory_requirements requirements[4];
+ 
+    /* For VK_ANDROID_external_memory_android_hardware_buffer, real image
+diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
+index 3355409..d62370f 100644
+--- a/src/virtio/vulkan/vn_physical_device.c
++++ b/src/virtio/vulkan/vn_physical_device.c
+@@ -1015,6 +1015,18 @@ vn_physical_device_init_memory_properties(
+    if (!has_coherent_cached) {
+       props->memoryTypes[first_coherent].propertyFlags |=
+          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++   } else if (instance->renderer->info.needs_cached_host_visible) {
++      /* vgpu: only the cached types are really coherent for this renderer:
++       * hide host visibility of the others so apps never map them.
++       */
++      for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++         VkMemoryPropertyFlags *flags = &props->memoryTypes[i].propertyFlags;
++         if ((*flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++             !(*flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
++            *flags &= ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++         }
++      }
+    }
+ }
+ 
+@@ -1044,6 +1056,27 @@ vn_physical_device_init_external_memory(
+     * For vtest, the protocol does not support external memory import. So we
+     * only mask out the importable bit so that wsi over vtest can be supported.
+     */
++#if DETECT_OS_WINDOWS
++   /* vgpu: Windows apps share images between processes of the same guest
++    * (DXGI/D3DKMT share handles; DWM composites every window this way).
++    * The host must hand them between virglrenderer contexts as dma-bufs
++    * (the proxy refuses to attach opaque-fd resources), so the renderer
++    * type stays dma_buf and the guest advertises the win32 handle types it
++    * actually hands around.  Optimal-tiled shareable images are created
++    * with the LINEAR DRM format modifier (vn_image_fix_create_info), which
++    * gives exporter and importer the same layout with nothing to exchange. */
++   if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf &&
++       physical_dev->renderer_extensions.EXT_image_drm_format_modifier) {
++      physical_dev->external_memory.renderer_handle_type =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      physical_dev->external_memory.supported_handle_types =
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT |
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
++      return;
++   }
++#endif
+    if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
+       physical_dev->external_memory.renderer_handle_type =
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+@@ -1218,7 +1251,11 @@ vn_physical_device_get_native_extensions(
+    if (physical_dev->external_memory.renderer_handle_type) {
+ #if DETECT_OS_WINDOWS
+       exts->KHR_external_memory_win32 = true;
+-      exts->KHR_win32_keyed_mutex = true;
++      /* vgpu: not advertised: VkWin32KeyedMutexAcquireReleaseInfoKHR would be
++       * encoded into queue submits (it is only stripped on the feedback fix-up
++       * path) and the Linux host decoder rejects it -> ring fatal (seen with
++       * Fusion's Chromium UI). */
++      exts->KHR_win32_keyed_mutex = false;
+ #else
+       exts->KHR_external_memory_fd = true;
+       exts->EXT_external_memory_dma_buf = true;
+@@ -2333,6 +2370,22 @@ vn_physical_device_fix_image_format_info(
+    local_info->format = *info;
+    VkBaseOutStructure *dst = (void *)&local_info->format;
+ 
++#if DETECT_OS_WINDOWS
++   /* vgpu: shareable optimal images become LINEAR-modifier images on the
++    * host (see vn_physical_device_init_external_memory) */
++   if (info->tiling == VK_IMAGE_TILING_OPTIMAL) {
++      local_info->format.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++      local_info->modifier = (VkPhysicalDeviceImageDrmFormatModifierInfoEXT){
++         .sType =
++            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++         .drmFormatModifier = 0, /* DRM_FORMAT_MOD_LINEAR */
++         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      };
++      dst->pNext = (void *)&local_info->modifier;
++      dst = (void *)&local_info->modifier;
++   }
++#endif
++
+    vk_foreach_struct_const(src, info->pNext) {
+       void *pnext = NULL;
+       switch (src->sType) {
+@@ -2835,15 +2888,20 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+          external_info->handleType !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
+ 
+-      /* venus doesn't support legacy tiling for scanout purpose */
+-      if (renderer_handle_type ==
++      /* venus doesn't support legacy tiling for scanout purpose
++       * (vgpu: on Windows optimal tiling is translated, see
++       * vn_physical_device_fix_image_format_info) */
++      if (!DETECT_OS_WINDOWS &&
++          renderer_handle_type ==
+              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+           pImageFormatInfo->tiling !=
+              VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+          return VK_ERROR_FORMAT_NOT_SUPPORTED;
+       }
+ 
+-      if (external_info->handleType != renderer_handle_type) {
++      if (external_info->handleType != renderer_handle_type ||
++          (DETECT_OS_WINDOWS &&
++           pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL)) {
+          pImageFormatInfo = vn_physical_device_fix_image_format_info(
+             pImageFormatInfo, renderer_handle_type, &local_info);
+          if (!pImageFormatInfo) {
+diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
+index fd5d1c7..6b288d2 100644
+--- a/src/virtio/vulkan/vn_queue.c
++++ b/src/virtio/vulkan/vn_queue.c
+@@ -1009,6 +1009,50 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
+    return VK_SUCCESS;
+ }
+ 
++/* vgpu: describe a submission the renderer rejected (VN_PERF=no_async_queue_submit
++ * makes the failing submit report here instead of a later ring fatal) */
++static void
++vn_queue_submission_dump(struct vn_instance *instance,
++                         struct vn_queue_submission *submit, VkResult result)
++{
++   vn_log(instance, "vgpu: submit failed (%d): type=%d batches=%u fence=%" PRIu64, result,
++          submit->batch_type, submit->batch_count,
++          submit->fence_handle
++             ? vn_fence_from_handle(submit->fence_handle)->base.id
++             : 0);
++   if (submit->batch_type != VK_STRUCTURE_TYPE_SUBMIT_INFO_2)
++      return;
++   for (uint32_t b = 0; b < submit->batch_count; b++) {
++      const VkSubmitInfo2 *si = &submit->submit2_batches[b];
++      vn_log(instance, "  batch %u: flags=0x%x waits=%u cmds=%u signals=%u", b, si->flags,
++             si->waitSemaphoreInfoCount, si->commandBufferInfoCount,
++             si->signalSemaphoreInfoCount);
++      vk_foreach_struct_const(ext, si->pNext)
++         vn_log(instance, "    pNext sType %d", ext->sType);
++      for (uint32_t i = 0; i < si->waitSemaphoreInfoCount; i++) {
++         const VkSemaphoreSubmitInfo *w = &si->pWaitSemaphoreInfos[i];
++         struct vn_semaphore *sem = vn_semaphore_from_handle(w->semaphore);
++         vn_log(instance, "    wait sem id=%" PRIu64 " type=%d payload=%d value=%" PRIu64
++                " stage=0x%" PRIx64 " dev=%u pNext=%p",
++                sem->base.id, sem->type, sem->payload ? (int)sem->payload->type : -1,
++                w->value, (uint64_t)w->stageMask, w->deviceIndex, w->pNext);
++      }
++      for (uint32_t i = 0; i < si->commandBufferInfoCount; i++) {
++         const VkCommandBufferSubmitInfo *c = &si->pCommandBufferInfos[i];
++         struct vn_command_buffer *cmd = vn_command_buffer_from_handle(c->commandBuffer);
++         vn_log(instance, "    cmd id=%" PRIu64 " pNext=%p", cmd->base.id, c->pNext);
++      }
++      for (uint32_t i = 0; i < si->signalSemaphoreInfoCount; i++) {
++         const VkSemaphoreSubmitInfo *sg = &si->pSignalSemaphoreInfos[i];
++         struct vn_semaphore *sem = vn_semaphore_from_handle(sg->semaphore);
++         vn_log(instance, "    signal sem id=%" PRIu64 " type=%d payload=%d value=%" PRIu64
++                " stage=0x%" PRIx64 " pNext=%p",
++                sem->base.id, sem->type, sem->payload ? (int)sem->payload->type : -1,
++                sg->value, (uint64_t)sg->stageMask, sg->pNext);
++      }
++   }
++}
++
+ static VkResult
+ vn_queue_submit(struct vn_queue_submission *submit)
+ {
+@@ -1046,6 +1090,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
+       }
+ 
+       if (result != VK_SUCCESS) {
++         vn_queue_submission_dump(instance, submit, result); /* vgpu */
+          vn_queue_submission_cleanup(submit);
+          return vn_error(instance, result);
+       }
+@@ -1694,6 +1739,13 @@ vn_CreateFence(VkDevice device,
+       goto out_payloads_fini;
+ 
+    *pFence = vn_fence_to_handle(fence);
++#if DETECT_OS_WINDOWS
++   /* vgpu: as for semaphores, win32-exportable fences cannot exist on the
++    * Linux host; export is emulated guest-side */
++   VkFenceCreateInfo host_fence_info = *pCreateInfo;
++   host_fence_info.pNext = NULL;
++   pCreateInfo = &host_fence_info;
++#endif
+    vn_async_vkCreateFence(dev->primary_ring, device, pCreateInfo, NULL,
+                           pFence);
+ 
+@@ -2321,8 +2373,25 @@ vn_CreateSemaphore(VkDevice device,
+    }
+ 
+    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
++#if DETECT_OS_WINDOWS
++   /* vgpu: export is emulated guest-side (payloads); the Linux host cannot
++    * create a semaphore exportable as a win32 handle, and an async create
++    * that fails there leaves an id the next vkQueueSubmit2 cannot decode
++    * ("vkQueueSubmit2 resulted in CS error").  Forward only the type info. */
++   VkSemaphoreTypeCreateInfo host_type;
++   VkSemaphoreCreateInfo host_info = *pCreateInfo;
++   host_info.pNext = NULL;
++   if (type_info) {
++      host_type = *type_info;
++      host_type.pNext = NULL;
++      host_info.pNext = &host_type;
++   }
++   vn_async_vkCreateSemaphore(dev->primary_ring, device, &host_info, NULL,
++                              &sem_handle);
++#else
+    vn_async_vkCreateSemaphore(dev->primary_ring, device, pCreateInfo, NULL,
+                               &sem_handle);
++#endif
+ 
+    *pSemaphore = sem_handle;
+ 
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index dbee43f..5d1acab 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -63,6 +63,16 @@ struct vn_renderer_info {
+    bool has_external_sync;
+    bool has_implicit_fencing;
+    bool has_guest_vram;
++   /* vgpu: mappings of non-cached host memory are not coherent with device
++    * writes (KVM ignores the guest PAT while the host GPU writes without
++    * snooping), so only HOST_CACHED memory types may be host visible.
++    */
++   bool needs_cached_host_visible;
++   /* vgpu: present synchronously.  The win32 WSI CPU path records and submits
++    * a blit on the presenting queue, which must not run on the async present
++    * thread concurrently with app submissions to the same queue.
++    */
++   bool no_async_present;
+ 
+    uint32_t max_timeline_count;
+ 
+diff --git a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
+index 0acb349..dd4ce91 100644
+--- a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
+@@ -2,6 +2,7 @@
+ 
+ #include <winddk_compat.h>
+ #include <d3d10umddi.h>
++#include <xmmintrin.h>
+ #include <d3dkmthk.h>
+ #include <d3dukmdt.h>
+ #include <dxgiddi.h>
+@@ -24,6 +25,8 @@ struct virtgpu;
+ struct virtgpu_shmem {
+    struct vn_renderer_shmem base;
+    D3DKMT_HANDLE alloc;
++   /* vgpu: mmap_ptr is the WDDM2 KMD's RES_INFO UserVa (no D3DKMTLock/MAP_BLOB) */
++   bool kmd_mapped;
+    union {
+       D3DKMT_HANDLE kmt;
+       HANDLE h;
+@@ -42,6 +45,8 @@ struct virtgpu_bo {
+       HANDLE h;
+    } /* resource */;
+    uint32_t blob_flags;
++   /* vgpu: WDDM2 KMD's RES_INFO UserVa, used instead of D3DKMTLock */
++   void *kmd_va;
+ };
+ 
+ struct virtgpu_sync {
+@@ -93,6 +98,13 @@ struct virtgpu {
+          PFND3DKMT_DESTROYDEVICE destroyDevice;
+          PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
+          PFND3DKMT_CLOSEADAPTER closeAdapter;
++         /* vgpu: WDDM2 native submission (virtual context) */
++         PFND3DKMT_CREATECONTEXTVIRTUAL createContextVirtual;
++         PFND3DKMT_SUBMITCOMMAND submitCommand;
++         PFND3DKMT_CREATESYNCHRONIZATIONOBJECT2 createSynchronizationObject2;
++         PFND3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroySynchronizationObject;
++         PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU signalSynchronizationObjectFromGpu;
++         PFND3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU waitForSynchronizationObjectFromCpu;
+       } cb;
+    } d3dkmt;
+ 
+@@ -112,6 +124,15 @@ struct virtgpu {
+ 
+       D3DDDI_PATCHLOCATIONLIST *patch_list;
+       size_t patch_size;
++
++      /* vgpu: standalone ICD on a WDDM2 (GpuMmu) KMD.  dxgkrnl rejects
++       * D3DKMTRender there, so the context is virtual: commands ride
++       * D3DKMTSubmitCommand private data (VIOGPU_DMA_PRIVATE) and CPU
++       * events are signalled through a monitored fence. */
++      bool virt;
++      D3DKMT_HANDLE drain_fence;
++      uint64_t drain_value;
++      mtx_t drain_lock;
+    } ctx;
+ 
+    struct {
+@@ -550,6 +571,101 @@ sim_submit_signal_syncs(struct virtgpu *gpu,
+    return VK_SUCCESS;
+ }
+ 
++/* vgpu: KMD SHMEM_GPU_BASE_VA.  D3DKMTSubmitCommand needs a nonzero Commands
++ * GPU VA; the KMD takes the command body from the private data instead. */
++#define VIRTGPU_SHMEM_GPU_BASE_VA 0x700000000ull
++
++static bool
++virtgpu_create_context_virtual(struct virtgpu *gpu)
++{
++   if (!gpu->d3dkmt.cb.createContextVirtual || !gpu->d3dkmt.cb.submitCommand ||
++       !gpu->d3dkmt.cb.createSynchronizationObject2 ||
++       !gpu->d3dkmt.cb.signalSynchronizationObjectFromGpu ||
++       !gpu->d3dkmt.cb.waitForSynchronizationObjectFromCpu)
++      return false;
++
++   D3DKMT_CREATECONTEXTVIRTUAL create = {
++      .hDevice = gpu->d3dkmt.device,
++      .ClientHint = D3DKMT_CLIENTHINT_VULKAN,
++   };
++   NTSTATUS status = gpu->d3dkmt.cb.createContextVirtual(&create);
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "vgpu: D3DKMTCreateContextVirtual failed: 0x%lx", status);
++      return false;
++   }
++
++   D3DKMT_CREATESYNCHRONIZATIONOBJECT2 fence = {
++      .hDevice = gpu->d3dkmt.device,
++      .Info = { .Type = D3DDDI_MONITORED_FENCE },
++   };
++   status = gpu->d3dkmt.cb.createSynchronizationObject2(&fence);
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "vgpu: monitored fence create failed: 0x%lx", status);
++      D3DKMT_DESTROYCONTEXT destroy = { .hContext = create.hContext };
++      gpu->d3dkmt.cb.destroyContext(&destroy);
++      return false;
++   }
++
++   gpu->ctx.kmt = create.hContext;
++   gpu->ctx.virt = true;
++   gpu->ctx.drain_fence = fence.hSyncObject;
++   gpu->ctx.drain_value = 0;
++   /* no kernel command buffer or allocation lists on a virtual context */
++   gpu->ctx.cmd_buf = NULL;
++   gpu->ctx.cmd_size = VIOGPU_DMA_PRIV_BODY_MAX;
++   gpu->ctx.alloc_list = NULL;
++   gpu->ctx.alloc_size = SIZE_MAX;
++   gpu->ctx.patch_list = NULL;
++   gpu->ctx.patch_size = 0;
++   if (VN_DEBUG(INIT))
++      vn_log(gpu->instance, "vgpu: using a virtual (WDDM2) context");
++   return true;
++}
++
++/* Sends one VIOGPU command on a virtual context. */
++static NTSTATUS
++virtgpu_submit_virtual(struct virtgpu *gpu, UINT type, UINT flags,
++                       UINT ring_idx, const void *payload, size_t payload_size)
++{
++   const size_t total = sizeof(VIOGPU_COMMAND_HDR) + payload_size;
++   if (total > VIOGPU_DMA_PRIV_BODY_MAX) {
++      /* the KMD would execute the packet fence-only and drop the command */
++      vn_log(gpu->instance, "vgpu: cmd %u too large for DMA private body (%zu > %u)",
++             type, total, VIOGPU_DMA_PRIV_BODY_MAX);
++      return STATUS_BUFFER_TOO_SMALL;
++   }
++
++   VIOGPU_DMA_PRIVATE priv;
++   priv.cmdRaw = 0;
++   priv.magic = VIOGPU_DMA_PRIV_MAGIC;
++   priv.bodySize = (ULONG)total;
++
++   VIOGPU_COMMAND_HDR *hdr = (VIOGPU_COMMAND_HDR *)priv.body;
++   hdr->type = type;
++   hdr->size = (UINT)payload_size;
++   hdr->flags = flags;
++   hdr->ring_idx = ring_idx;
++   if (payload_size)
++      memcpy(hdr + 1, payload, payload_size);
++
++   /* the host visible window can be write-combined: drain WC buffers so the
++    * host never reads ring/shmem stores that land after this submit */
++   _mm_sfence();
++
++   D3DKMT_SUBMITCOMMAND submit = {
++      .Commands = VIRTGPU_SHMEM_GPU_BASE_VA,
++      .CommandLength = (UINT)total,
++      .BroadcastContextCount = 1,
++      .BroadcastContext = { gpu->ctx.kmt },
++      .pPrivateDriverData = &priv,
++      .PrivateDriverDataSize = sizeof(priv),
++   };
++   NTSTATUS status = gpu->d3dkmt.cb.submitCommand(&submit);
++   if (!NT_SUCCESS(status))
++      vn_log(gpu->instance, "vgpu: D3DKMTSubmitCommand(type %u) failed: 0x%lx", type, status);
++   return status;
++}
++
+ static NTSTATUS
+ virtgpu_ioctl_create_context(struct virtgpu *gpu)
+ {
+@@ -577,6 +693,9 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu)
+ 
+       return STATUS_SUCCESS;
+    } else {
++      if (virtgpu_create_context_virtual(gpu))
++         return STATUS_SUCCESS;
++
+       D3DKMT_CREATECONTEXT context = {
+          .hDevice = gpu->d3dkmt.device,
+          .ClientHint = D3DKMT_CLIENTHINT_VULKAN,
+@@ -663,6 +782,33 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
+ static NTSTATUS
+ virtgpu_ioctl_signal(struct virtgpu *gpu, HANDLE fence)
+ {
++   if (gpu->ctx.virt) {
++      /* dxgkrnl rejects a GPU signal below one already queued: mint and
++       * queue in value order */
++      mtx_lock(&gpu->ctx.drain_lock);
++      const UINT64 value = ++gpu->ctx.drain_value;
++      D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU signal = {
++         .hContext = gpu->ctx.kmt,
++         .ObjectCount = 1,
++         .ObjectHandleArray = &gpu->ctx.drain_fence,
++         .MonitoredFenceValueArray = &value,
++      };
++      NTSTATUS status = gpu->d3dkmt.cb.signalSynchronizationObjectFromGpu(&signal);
++      mtx_unlock(&gpu->ctx.drain_lock);
++      if (!NT_SUCCESS(status))
++         return status;
++
++      /* hAsyncEvent: returns at once, the event is set once the fence passes */
++      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {
++         .hDevice = gpu->d3dkmt.device,
++         .ObjectCount = 1,
++         .ObjectHandleArray = &gpu->ctx.drain_fence,
++         .FenceValueArray = &value,
++         .hAsyncEvent = fence,
++      };
++      return gpu->d3dkmt.cb.waitForSynchronizationObjectFromCpu(&wait);
++   }
++
+    if (gpu->ddicb != NULL) {
+       D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signal = {
+            .hContext = gpu->ctx.h,
+@@ -702,6 +848,20 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+       const struct vn_renderer_submit_batch *batch = &submit->batches[i];
+       mtx_lock(&gpu->ctx.lock);
+ 
++      if (gpu->ctx.virt) {
++         /* blob resources are attached to the context at open time; the
++          * virtual wire carries no allocation list */
++         NTSTATUS status = virtgpu_submit_virtual(
++            gpu, VIOGPU_CMD_SUBMIT, VIOGPU_EXECBUF_RING_IDX, batch->ring_idx,
++            batch->cs_data, batch->cs_size);
++         mtx_unlock(&gpu->ctx.lock);
++         if (!NT_SUCCESS(status)) {
++            ret = VK_ERROR_DEVICE_LOST;
++            break;
++         }
++         goto signal_syncs;
++      }
++
+       for (uint32_t i = 0; i < submit->bo_count; i++) {
+          struct virtgpu_bo *bo = (struct virtgpu_bo *)submit->bos[i];
+          assert(bo->alloc != 0);
+@@ -726,6 +886,7 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+          break;
+       }
+ 
++signal_syncs:
+       if (batch->sync_count > 0) {
+          HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
+          // vn_log(gpu->instance, "created handle %p", fence);
+@@ -818,9 +979,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
+    return virtgpu_ioctl_escape(gpu, &caps);
+ }
+ 
++static NTSTATUS virtgpu_ioctl_wait(struct virtgpu *gpu);
++
+ static NTSTATUS
+-virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
++virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle,
++                       uint32_t res_id)
+ {
++   if (gpu->ctx.virt) {
++      const ULONG payload = res_id;
++      mtx_lock(&gpu->ctx.lock);
++      NTSTATUS status = virtgpu_submit_virtual(gpu, VIOGPU_CMD_MAP_BLOB_BY_ID, 0, 0,
++                                               &payload, sizeof(payload));
++      mtx_unlock(&gpu->ctx.lock);
++      if (!NT_SUCCESS(status))
++         return status;
++      return virtgpu_ioctl_wait(gpu);
++   }
++
+    mtx_lock(&gpu->ctx.lock);
+ 
+    gpu->ctx.alloc_list[0].hAllocation = handle;
+@@ -859,8 +1034,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
+ }
+ 
+ static NTSTATUS
+-virtgpu_ioctl_destroy_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
++virtgpu_ioctl_destroy_map(struct virtgpu *gpu, D3DKMT_HANDLE handle,
++                       uint32_t res_id)
+ {
++   if (gpu->ctx.virt) {
++      const ULONG payload = res_id;
++      mtx_lock(&gpu->ctx.lock);
++      NTSTATUS status = virtgpu_submit_virtual(gpu, VIOGPU_CMD_UNMAP_BLOB_BY_ID, 0, 0,
++                                               &payload, sizeof(payload));
++      mtx_unlock(&gpu->ctx.lock);
++      if (!NT_SUCCESS(status))
++         return status;
++      return virtgpu_ioctl_wait(gpu);
++   }
++
+    mtx_lock(&gpu->ctx.lock);
+ 
+    gpu->ctx.alloc_list[0].hAllocation = handle;
+@@ -906,6 +1093,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+    // vn_log(gpu->instance, "created handle %p", fence);
+    NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
+    if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "vgpu: sync signal failed: 0x%lx", status);
+       return status;
+    }
+    // vn_log(gpu->instance, "waiting for handle %p", fence);
+@@ -924,6 +1112,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+       } \
+    } while (0)
+ 
++/* vgpu: unique-per-live-allocation lookup cookie (wddm_hw.h
++ * VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX): the WDDM2 KMD's handle-based
++ * RES_INFO resolution is unreliable under GpuMmu; the cookie is
++ * authoritative.  pid<<32 | counter keeps bits 62/63 clear (KMD namespaces). */
++static uint64_t
++virtgpu_mint_alloc_cookie(void)
++{
++   static volatile LONG counter;
++   return ((uint64_t)GetCurrentProcessId() << 32) |
++          (uint32_t)InterlockedIncrement(&counter);
++}
++
+ static NTSTATUS
+ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+                                    uint32_t blob_mem,
+@@ -934,19 +1134,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+                                    D3DKMT_HANDLE *alloc_handle,
+                                    D3DKMT_HANDLE *res_kmt_local,
+                                    D3DKMT_HANDLE *res_kmt_global,
+-                                   HANDLE *res_h)
++                                   HANDLE *res_h,
++                                   void **user_va,
++                                   uint64_t *out_cookie)
+ {
++   if (user_va)
++      *user_va = NULL;
++
+    blob_size = align64(blob_size, 4096);
+ 
+-   VIOGPU_CREATE_ALLOCATION_EXCHANGE alloc_priv = {
+-       .Type = VIOGPU_RESOURCE_TYPE_BLOB,
+-       .OptionsBlob = {
+-           .blob_mem = blob_mem,
+-           .blob_flags = blob_flags,
+-           .blob_id = blob_id,
+-       },
+-       .Size = blob_size,
++   VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX alloc_priv = {
++      .Base = {
++         .Type = VIOGPU_RESOURCE_TYPE_BLOB,
++         .OptionsBlob = {
++            .blob_mem = blob_mem,
++            .blob_flags = blob_flags,
++            .blob_id = blob_id,
++         },
++         .Size = blob_size,
++      },
++      .LookupCookie = virtgpu_mint_alloc_cookie(),
+    };
++   if (out_cookie)
++      *out_cookie = alloc_priv.LookupCookie;
+ 
+    VIOGPU_CREATE_RESOURCE_EXCHANGE res_priv = { 0 };
+ 
+@@ -991,6 +1201,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+       };
+       NTSTATUS status = gpu->d3dkmt.cb.createAllocation(&alloc);
+       if (!NT_SUCCESS(status)) {
++         vn_log(gpu->instance, "vgpu: D3DKMTCreateAllocation failed: 0x%lx", status);
+          return status;
+       }
+       *res_kmt_local = alloc.hResource;
+@@ -1008,22 +1219,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+       .DataLength = sizeof(res_info.ResourceInfo),
+       .ResourceInfo = {
+          .ResHandle = *alloc_handle,
++         .LookupCookie = alloc_priv.LookupCookie,
+       },
+    };
+ 
+-   NTSTATUS status = virtgpu_ioctl_escape(gpu, &res_info);
+-   if (!NT_SUCCESS(status)) {
+-      return status;
+-   }
+-
+-   if (!res_info.ResourceInfo.IsBlob || !res_info.ResourceInfo.IsCreated) {
+-      return STATUS_INVALID_PARAMETER;
++   /* vgpu: the KMD issues RESOURCE_CREATE_BLOB from the in-create open on
++    * the asynchronous ctrl queue, so right after CreateAllocation the blob
++    * can still be pending: retry briefly (as Neptune does). */
++   NTSTATUS status;
++   for (int attempt = 0;; attempt++) {
++      status = virtgpu_ioctl_escape(gpu, &res_info);
++      if (!NT_SUCCESS(status)) {
++         vn_log(gpu->instance, "vgpu: RES_INFO escape failed: 0x%lx", status);
++         return status;
++      }
++      if (res_info.ResourceInfo.IsBlob && res_info.ResourceInfo.IsCreated)
++         break;
++      if (attempt >= 100) {
++         vn_log(gpu->instance, "vgpu: RES_INFO blob=%d created=%d after %d tries",
++                (int)res_info.ResourceInfo.IsBlob, (int)res_info.ResourceInfo.IsCreated,
++                attempt + 1);
++         return STATUS_INVALID_PARAMETER;
++      }
++      Sleep(1);
+    }
+ 
+    *res_id = res_info.ResourceInfo.Id;
+ 
+-   return is_mappable ? virtgpu_ioctl_init_map(gpu, *alloc_handle)
+-                      : STATUS_SUCCESS;
++   /* vgpu: a WDDM2 KMD maps the blob (host and this process) in RES_INFO and
++    * returns the CPU VA; D3DKMTLock would hand out system staging pages. */
++   if (is_mappable && res_info.ResourceInfo.UserVa) {
++      if (user_va)
++         *user_va = (void *)(uintptr_t)res_info.ResourceInfo.UserVa;
++      return STATUS_SUCCESS;
++   }
++
++   if (is_mappable) {
++      status = virtgpu_ioctl_init_map(gpu, *alloc_handle, *res_id);
++      if (!NT_SUCCESS(status))
++         vn_log(gpu->instance, "vgpu: init_map (MAP_BLOB render) failed: 0x%lx", status);
++   }
++   return is_mappable ? status : STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS
+@@ -1379,6 +1615,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
+          (void *)GetProcAddress(gdi32lib, "D3DKMTOpenAdapterFromHdc");
+       gpu->d3dkmt.cb.closeAdapter =
+          (void *)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
++      gpu->d3dkmt.cb.createContextVirtual =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTCreateContextVirtual");
++      gpu->d3dkmt.cb.submitCommand =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTSubmitCommand");
++      gpu->d3dkmt.cb.createSynchronizationObject2 =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTCreateSynchronizationObject2");
++      gpu->d3dkmt.cb.destroySynchronizationObject =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTDestroySynchronizationObject");
++      gpu->d3dkmt.cb.signalSynchronizationObjectFromGpu =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTSignalSynchronizationObjectFromGpu");
++      gpu->d3dkmt.cb.waitForSynchronizationObjectFromCpu =
++         (void *)GetProcAddress(gdi32lib, "D3DKMTWaitForSynchronizationObjectFromCpu");
+ 
+       NTSTATUS status = virtgpu_find_adapter(gpu);
+       if (!NT_SUCCESS(status)) {
+@@ -1496,11 +1744,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
+       *alloc = alloc_list[0].hAllocation;
+       *res_kmt_local = open.hResource;
+ 
++      /* vgpu: the opened allocation's create-time private data carries the
++       * creator's lookup cookie; handle-based RES_INFO resolution is
++       * unreliable under GpuMmu and can name a different allocation. */
++      uint64_t cookie = 0;
++      if (alloc_list[0].PrivateDriverDataSize >= sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX))
++         cookie = ((const VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX *)alloc_list[0].pPrivateDriverData)
++                     ->LookupCookie;
++
+       VIOGPU_ESCAPE res_esc = {
+          .Type = VIOGPU_RES_INFO,
+          .DataLength = sizeof(res_esc.ResourceInfo),
+          .ResourceInfo = {
+              .ResHandle = *alloc,
++             .LookupCookie = cookie,
+          },
+       };
+ 
+@@ -1551,6 +1808,15 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
+ 
+    if (!alloc)
+       goto fail;
++
++   /* vgpu: the KMD attaches the opened resource to our host context with a
++    * control-queue command, while the import that names it rides the venus
++    * ring, which the host processes independently ("vkr: failed to import
++    * resource: invalid res_id").  A fenced submission on the same control
++    * queue completes only after the attach. */
++   status = virtgpu_ioctl_wait(gpu);
++   if (!NT_SUCCESS(status))
++      vn_log(gpu->instance, "vgpu: attach sync after open failed: 0x%lx", status);
+    bo = util_sparse_array_get(&gpu->bo_array, alloc);
+ 
+    /* Upon import, blob_flags is not passed to the kernel and is only for
+@@ -1668,9 +1934,11 @@ virtgpu_bo_create_from_device_memory(
+    }
+ 
+    D3DKMT_HANDLE alloc, kmt_local, kmt_global;
++   void *kmd_va;
++   uint64_t cookie;
+    NTSTATUS status = virtgpu_ioctl_resource_create_blob(
+       gpu, gpu->bo_blob_mem, blob_flags, size, mem_id, &res_id, &alloc,
+-      &kmt_local, &kmt_global, &h);
++      &kmt_local, &kmt_global, &h, &kmd_va, &cookie);
+    if (!NT_SUCCESS(status)) {
+       vn_log(gpu->instance,
+              "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
+@@ -1692,6 +1960,7 @@ virtgpu_bo_create_from_device_memory(
+          .DataLength = sizeof(res_info.ResourceInfo),
+          .ResourceInfo = {
+             .ResHandle = alloc,
++            .LookupCookie = cookie,
+          },
+       };
+ 
+@@ -1725,6 +1994,7 @@ virtgpu_bo_create_from_device_memory(
+       },
+       .alloc = alloc,
+       .blob_flags = blob_flags,
++      .kmd_va = kmd_va,
+    };
+ 
+    if (gpu->ddicb != NULL) {
+@@ -1770,7 +2040,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
+    const bool mappable = bo->blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE;
+ 
+    /* not thread-safe but is fine */
+-   if (!bo->base.mmap_ptr && mappable) {
++   if (!bo->base.mmap_ptr && mappable && bo->kmd_va) {
++      bo->base.mmap_ptr = bo->kmd_va;
++   } else if (!bo->base.mmap_ptr && mappable) {
+       NTSTATUS status =
+          virtgpu_ioctl_lock(gpu, bo->alloc, &bo->base.mmap_ptr);
+       if (!NT_SUCCESS(status)) {
+@@ -1817,9 +2089,10 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+       return false;
+    }
+ 
+-   if (bo->base.mmap_ptr) {
++   /* a KMD-owned mapping is torn down by the KMD at allocation destroy */
++   if (bo->base.mmap_ptr && !bo->kmd_va) {
+       virtgpu_ioctl_unlock(gpu, bo->alloc);
+-      virtgpu_ioctl_destroy_map(gpu, bo->alloc);
++      virtgpu_ioctl_destroy_map(gpu, bo->alloc, bo->base.res_id);
+    }
+ 
+    /* Set alloc and res to 0 to indicate that the bo is invalid. Must be set
+@@ -1981,8 +2254,10 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+    struct virtgpu_shmem *shmem = (struct virtgpu_shmem *)_shmem;
+ 
+-   virtgpu_ioctl_unlock(gpu, shmem->alloc);
+-   virtgpu_ioctl_destroy_map(gpu, shmem->alloc);
++   if (!shmem->kmd_mapped) {
++      virtgpu_ioctl_unlock(gpu, shmem->alloc);
++      virtgpu_ioctl_destroy_map(gpu, shmem->alloc, shmem->base.res_id);
++   }
+    virtgpu_ioctl_resource_destroy_blob(gpu, shmem->alloc, shmem->kmt,
+                                        shmem->h);
+ }
+@@ -2015,14 +2290,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+    HANDLE h = NULL; /* This is a device allocation */
+    D3DKMT_HANDLE alloc, kmt;
+ 
++   void *ptr = NULL;
+    NTSTATUS status = virtgpu_ioctl_resource_create_blob(
+       gpu, gpu->shmem_blob_mem, VIOGPU_BLOB_FLAG_USE_MAPPABLE, size, 0,
+-      &res_id, &alloc, &kmt, NULL, &h);
+-   if (!NT_SUCCESS(status))
++      &res_id, &alloc, &kmt, NULL, &h, &ptr, NULL);
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "vgpu: shmem create_blob(%zu) failed: 0x%lx", size, status);
+       return NULL;
++   }
+ 
+-   void *ptr = NULL;
+-   status = virtgpu_ioctl_lock(gpu, alloc, &ptr);
++   const bool kmd_mapped = ptr != NULL;
++   if (!kmd_mapped)
++      status = virtgpu_ioctl_lock(gpu, alloc, &ptr);
+    if (!NT_SUCCESS(status)) {
+       virtgpu_ioctl_resource_destroy_blob(gpu, alloc, kmt, h);
+       vn_log(gpu->instance, "failed to map blob resource: 0x%lx", status);
+@@ -2039,6 +2318,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+          .mmap_ptr = ptr,
+       },
+       .alloc = alloc,
++      .kmd_mapped = kmd_mapped,
+    };
+ 
+    if (gpu->ddicb != NULL) {
+@@ -2108,6 +2388,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
+    assert(capset->supports_multiple_timelines);
+    info->max_timeline_count = gpu->max_timeline_count;
+ 
++   /* vgpu: KVM ignores the guest PAT for host RAM by default, so the guest
++    * maps everything write-back while the host GPU writes uncached/WC system
++    * memory without snooping: only HOST_CACHED types stay coherent.  Set
++    * VN_VGPU_ALLOW_UNCACHED=1 when the host honors the guest PAT.
++    */
++   const char *allow_uncached = getenv("VN_VGPU_ALLOW_UNCACHED");
++   info->needs_cached_host_visible =
++      !(allow_uncached && allow_uncached[0] == '1');
++
++   /* the win32 WSI blits on the present queue (CPU present path) */
++   info->no_async_present = true;
++
+    /* Use guest blob allocations from dedicated heap (Host visible memory) */
+    //if (gpu->bo_blob_mem == VIOGPU_BLOB_MEM_HOST3D && capset->use_guest_vram)
+    //   info->has_guest_vram = true;
+@@ -2170,6 +2462,12 @@ virtgpu_destroy(struct vn_renderer *renderer,
+ 
+    if (gpu->ctx.h)
+       virtgpu_ioctl_destroy_context(gpu);
++   if (gpu->ctx.drain_fence && gpu->d3dkmt.cb.destroySynchronizationObject) {
++      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {
++         .hSyncObject = gpu->ctx.drain_fence,
++      };
++      gpu->d3dkmt.cb.destroySynchronizationObject(&destroy);
++   }
+    if (gpu->d3dkmt.device)
+       virtgpu_ioctl_destroy_device(gpu);
+    if (gpu->d3dkmt.adapter)
+@@ -2179,6 +2477,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
+ 
+    mtx_destroy(&gpu->win32_handle_import_mutex);
+    mtx_destroy(&gpu->ctx.lock);
++   mtx_destroy(&gpu->ctx.drain_lock);
+ 
+    util_sparse_array_finish(&gpu->shmem_array);
+    util_sparse_array_finish(&gpu->bo_array);
+@@ -2199,6 +2498,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+    mtx_init(&gpu->win32_handle_import_mutex, mtx_plain);
+ 
+    mtx_init(&gpu->ctx.lock, mtx_plain);
++   mtx_init(&gpu->ctx.drain_lock, mtx_plain);
+ 
+    VkResult result = virtgpu_open(gpu, info);
+    if (result == VK_SUCCESS)
+@@ -2274,3 +2574,41 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
+ 
+    return VK_SUCCESS;
+ }
++
++#ifdef __MINGW32__
++/* vgpu: MinGW's msvcrt assert() opens a MessageBox, which inside DWM (no
++ * visible desktop) hangs the compositor forever.  Log through the debugger
++ * channel instead and abort, so the process restarts and the log names the
++ * failed assertion.  These definitions take precedence over the msvcrt
++ * imports for this DLL only. */
++#include <wchar.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++void __cdecl
++_assert(const char *expr, const char *file, unsigned line)
++{
++   char buf[512];
++   snprintf(buf, sizeof(buf), "vgpu: VENUS ASSERTION FAILED: %s (%s:%u)\n", expr, file, line);
++   OutputDebugStringA(buf);
++   fputs(buf, stderr);
++   abort();
++}
++
++void __cdecl
++_wassert(const wchar_t *expr, const wchar_t *file, unsigned line)
++{
++   char buf[512];
++   snprintf(buf, sizeof(buf), "vgpu: VENUS ASSERTION FAILED: %ls (%ls:%u)\n", expr, file, line);
++   OutputDebugStringA(buf);
++   fputs(buf, stderr);
++   abort();
++}
++#endif
++
++#ifdef __MINGW32__
++/* assert.h declares _assert/_wassert dllimport, so callers go through the
++ * import slot; provide it for the renamed functions. */
++void (__cdecl *__imp_vgpu_mesa_assert)(const char *, const char *, unsigned) = _assert;
++void (__cdecl *__imp_vgpu_mesa_wassert)(const wchar_t *, const wchar_t *, unsigned) = _wassert;
++#endif
+diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
+index 71ff678..898595e 100644
+--- a/src/virtio/vulkan/vn_wsi.c
++++ b/src/virtio/vulkan/vn_wsi.c
+@@ -1011,6 +1011,7 @@ vn_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
+ 
+    if (!dev->renderer->info.has_implicit_fencing &&
++       !dev->renderer->info.no_async_present &&
+        !VN_PERF(NO_ASYNC_PRESENT)) {
+       struct vn_queue *queue = vn_queue_from_handle(_queue);
+       return vn_wsi_present_async(dev, queue, pPresentInfo);

@@ -1,0 +1,45 @@
+LIBRARY dcomp.dll
+EXPORTS
+  DCompositionCreateDevice @1020
+  DCompositionCreateDevice2 @1021
+  DCompositionCreateDevice3 @1022
+  DCompositionAttachMouseDragToHwnd = dcomp_sys.DCompositionAttachMouseDragToHwnd @1017
+  DCompositionAttachMouseWheelToHwnd = dcomp_sys.DCompositionAttachMouseWheelToHwnd @1018
+  DCompositionCreateSurfaceHandle = dcomp_sys.DCompositionCreateSurfaceHandle @1023
+  DllCanUnloadNow = dcomp_sys.DllCanUnloadNow @1024
+  DllGetActivationFactory = dcomp_sys.DllGetActivationFactory @1025
+  DllGetClassObject = dcomp_sys.DllGetClassObject @1026
+  DwmEnableMMCSS = dcomp_sys.DwmEnableMMCSS @1027
+  DwmFlush = dcomp_sys.DwmFlush @1029
+  DwmpEnableDDASupport = dcomp_sys.DwmpEnableDDASupport @1030
+  DCompositionGetFrameId = dcomp_sys.DCompositionGetFrameId @1100
+  DCompositionGetStatistics = dcomp_sys.DCompositionGetStatistics @1101
+  DCompositionGetTargetStatistics = dcomp_sys.DCompositionGetTargetStatistics @1102
+  DCompositionBoostCompositorClock = dcomp_sys.DCompositionBoostCompositorClock @1103
+  DCompositionWaitForCompositorClock = dcomp_sys.DCompositionWaitForCompositorClock @1104
+  CreatePresentationFactory = dcomp_sys.CreatePresentationFactory @2005
+  ord1019 = win32u.NtCreateCompositionInputSink @1019 NONAME
+  ord1028 = win32u.NtDesktopCaptureBits @1028 NONAME
+  ord1043 = win32u.NtCompositionSetDropTarget @1043 NONAME
+  ord1044 = win32u.NtCreateImplicitCompositionInputSink @1044 NONAME
+  ord1045 = win32u.NtDCompositionCommitSynchronizationObject @1045 NONAME
+  ord1046 = win32u.NtDCompositionGetFrameStatistics @1046 NONAME
+  ord1047 = win32u.NtDCompositionGetMaterialProperty @1047 NONAME
+  ord1048 = win32u.NtDCompositionSetMaterialProperty @1048 NONAME
+  ord1031 = "dcomp_sys.#1031" @1031 NONAME
+  ord1038 = "dcomp_sys.#1038" @1038 NONAME
+  ord1039 = "dcomp_sys.#1039" @1039 NONAME
+  ord1040 = "dcomp_sys.#1040" @1040 NONAME
+  ord1041 = "dcomp_sys.#1041" @1041 NONAME
+  ord1042 = "dcomp_sys.#1042" @1042 NONAME
+  ord1060 = "dcomp_sys.#1060" @1060 NONAME
+  ord2000 = "dcomp_sys.#2000" @2000 NONAME
+  ord2001 = "dcomp_sys.#2001" @2001 NONAME
+  ord2002 = "dcomp_sys.#2002" @2002 NONAME
+  ord2006 = "dcomp_sys.#2006" @2006 NONAME
+  ord2007 = "dcomp_sys.#2007" @2007 NONAME
+  ord2500 = "dcomp_sys.#2500" @2500 NONAME
+  ord2501 = "dcomp_sys.#2501" @2501 NONAME
+  ord2502 = "dcomp_sys.#2502" @2502 NONAME
+  ord2503 = "dcomp_sys.#2503" @2503 NONAME
+  ord2504 = "dcomp_sys.#2504" @2504 NONAME

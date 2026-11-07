@@ -1,0 +1,137 @@
+diff --git a/meson.build b/meson.build
+index 4964301b..9fcd6fce 100644
+--- a/meson.build
++++ b/meson.build
+@@ -125,7 +125,8 @@ if platform == 'windows'
+     )
+   endif
+ 
+-  dxvk_name_prefix = ''
++  # vgpu: loaded inside our WDDM UMD alongside Windows' own d3d11.dll/dxgi.dll
++  dxvk_name_prefix = 'dxvk_'
+   compiler_args += ['-DDXVK_WSI_WIN32']
+ else
+   dxvk_abi_version = '0'
+diff --git a/src/d3d11/d3d11.def b/src/d3d11/d3d11.def
+index d406ba0b..2db017ad 100644
+--- a/src/d3d11/d3d11.def
++++ b/src/d3d11/d3d11.def
+@@ -1,4 +1,4 @@
+-LIBRARY D3D11.DLL
++LIBRARY DXVK_D3D11.DLL
+ EXPORTS  
+     D3D11CoreCreateDevice @18
+     D3D11CreateDevice @22
+diff --git a/src/d3d11/d3d11_interop.cpp b/src/d3d11/d3d11_interop.cpp
+index 04fef383..8d6d9e64 100644
+--- a/src/d3d11/d3d11_interop.cpp
++++ b/src/d3d11/d3d11_interop.cpp
+@@ -157,4 +157,48 @@ namespace dxvk {
+       return E_INVALIDARG;
+     }
+   }
++
++  HRESULT STDMETHODCALLTYPE D3D11VkInterop::CreateTexture2DFromSharedHandle(
++          const D3D11_TEXTURE2D_DESC1 *pDesc,
++          HANDLE hKmtHandle,
++          ID3D11Texture2D **ppTexture2D) {
++    InitReturnPtr(ppTexture2D);
++
++    if (!pDesc || !hKmtHandle || hKmtHandle == INVALID_HANDLE_VALUE)
++      return E_INVALIDARG;
++
++    D3D11_COMMON_TEXTURE_DESC desc;
++    desc.Width          = pDesc->Width;
++    desc.Height         = pDesc->Height;
++    desc.Depth          = 1;
++    desc.MipLevels      = pDesc->MipLevels;
++    desc.ArraySize      = pDesc->ArraySize;
++    desc.Format         = pDesc->Format;
++    desc.SampleDesc     = pDesc->SampleDesc;
++    desc.Usage          = pDesc->Usage;
++    desc.BindFlags      = pDesc->BindFlags;
++    desc.CPUAccessFlags = pDesc->CPUAccessFlags;
++    desc.MiscFlags      = pDesc->MiscFlags | D3D11_RESOURCE_MISC_SHARED;
++    desc.TextureLayout  = pDesc->TextureLayout;
++
++    HRESULT hr = D3D11CommonTexture::NormalizeTextureProperties(&desc);
++
++    if (FAILED(hr))
++      return hr;
++
++    if (!ppTexture2D)
++      return S_FALSE;
++
++    try {
++      /* Same construction as OpenSharedResource: identical image parameters
++       * to the exporter, memory imported from the KMT handle. */
++      Com<D3D11Texture2D> texture = new D3D11Texture2D(m_device, &desc, nullptr, hKmtHandle);
++      *ppTexture2D = texture.ref();
++      return S_OK;
++    } catch (const DxvkError& e) {
++      Logger::err(e.message());
++      return E_INVALIDARG;
++    }
++  }
++
+ }
+\ No newline at end of file
+diff --git a/src/d3d11/d3d11_interop.h b/src/d3d11/d3d11_interop.h
+index 48ee4c3b..15290807 100644
+--- a/src/d3d11/d3d11_interop.h
++++ b/src/d3d11/d3d11_interop.h
+@@ -56,6 +56,11 @@ namespace dxvk {
+             const D3D11_TEXTURE2D_DESC1* pDesc,
+             VkImage                      vkImage,
+             ID3D11Texture2D**            ppTexture2D);
++
++    HRESULT STDMETHODCALLTYPE CreateTexture2DFromSharedHandle(
++            const D3D11_TEXTURE2D_DESC1* pDesc,
++            HANDLE                       hKmtHandle,
++            ID3D11Texture2D**            ppTexture2D);
+     
+   private:
+     
+diff --git a/src/d3d11/meson.build b/src/d3d11/meson.build
+index af2b7b27..065b3ff4 100644
+--- a/src/d3d11/meson.build
++++ b/src/d3d11/meson.build
+@@ -72,7 +72,7 @@ d3d11_ld_args      = []
+ d3d11_link_depends = []
+ 
+ if platform == 'windows'
+-  d3d11_dxgi_deps = [ lib_gdi32, lib_dxgi ]
++  d3d11_dxgi_deps = [ lib_gdi32, dxgi_dep ] # vgpu: our dxvk_dxgi, not System32 dxgi
+ else
+   d3d11_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d11.sym') ]
+   d3d11_link_depends += files('d3d11.sym')
+diff --git a/src/dxgi/dxgi.def b/src/dxgi/dxgi.def
+index c5509571..3b09c4e5 100644
+--- a/src/dxgi/dxgi.def
++++ b/src/dxgi/dxgi.def
+@@ -1,4 +1,4 @@
+-LIBRARY DXGI.DLL
++LIBRARY DXVK_DXGI.DLL
+ EXPORTS  
+     CreateDXGIFactory @9
+     CreateDXGIFactory1 @10
+diff --git a/src/dxgi/dxgi_interfaces.h b/src/dxgi/dxgi_interfaces.h
+index 0eaf992b..c8d3052d 100644
+--- a/src/dxgi/dxgi_interfaces.h
++++ b/src/dxgi/dxgi_interfaces.h
+@@ -423,6 +423,15 @@ IDXGIVkInteropDevice1 : public IDXGIVkInteropDevice {
+     const D3D11_TEXTURE2D_DESC1* pDesc,
+           VkImage               vkImage,
+           ID3D11Texture2D**     ppTexture2D) = 0;
++
++  /* vgpu: open a texture whose memory was exported by another DXVK device
++   * (D3D11_RESOURCE_MISC_SHARED, KMT handle from IDXGIResource::GetSharedHandle),
++   * with the creator's description supplied by the caller (our WDDM UMD
++   * carries it in the KM allocation private data). */
++  virtual HRESULT STDMETHODCALLTYPE CreateTexture2DFromSharedHandle(
++    const D3D11_TEXTURE2D_DESC1* pDesc,
++          HANDLE                hKmtHandle,
++          ID3D11Texture2D**     ppTexture2D) = 0;
+ };
+ 
+ /**
