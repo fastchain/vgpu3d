@@ -396,3 +396,8 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   but Heaven DX11 only 60.3 -> 62.0 fps: the KMD commander runs packets one at a time and a parked
   PRESENT_WAIT holds its slot, so the next frame's submissions wait behind it. Real gain needs the
   commander to execute later packets while an earlier present is parked (complete in order only).
+- Tried: a parked PRESENT_WAIT releasing the commander's running slot (later packets execute while it
+  waits, completions still in fence order). Heaven DX11 unchanged (61.4 fps) -> reverted. With the async
+  blt path the app now waits in the present pacing (<= 3 frames ahead of the GPU): the guest->host GPU
+  pipeline (DXVK conversion, Venus encode, host decode, GPU) completes one Heaven frame per ~16 ms.
+  Next: profile that pipeline (guest WPR on the app's DXVK threads, host perf on virgl_render_server).
