@@ -597,3 +597,20 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   then PerformanceTest64 waits indefinitely with no subtest process alive and nothing in our DLLs on any
   stack -- not diagnosed (its own orchestration; subtest exes need PassMark's arguments).
 - Fullscreen Unigine remains open (see above); the validation layer is installed in the VM for the next try.
+
+### Exclusive fullscreen fixed (2026-11-08)
+- Cause: in-process DXVK builds rendered exclusive-fullscreen apps straight into the scanout primary,
+  which Triton creates pitch-LINEAR (shared, LINEAR_EXPORT) for blob scanout. NVIDIA cannot use linear
+  colour targets in every configuration (the same Xid 69 class Triton already avoided for windowed back
+  buffers); Unigine's first fullscreen frame hung the host GPU channel silently: a Venus submit trace
+  (new VN_VGPU_TRACE_SUBMIT) showed the 14th submission, with no semaphore waits, never completing.
+  Fix (tritonResource.c): with the framebuffer-copy scanout the app renders into an optimal private
+  texture and the linear primary only keeps the KM allocation as the present companion, synced only
+  for blob scanout (tritonDxgi.c).
+- Results, 3840x2160 desktop: Heaven DX11 exclusive fullscreen 3840x2160 72.0 fps, 1920x1080 (mode change)
+  187.2 fps, both complete; Superposition fullscreen presents 100-114 fps with real frame content (centre
+  pixels logged by the fb worker); GravityMark D3D11 fullscreen unchanged (28.0 fps).
+- Test-environment traps found on the way: a killed DbgView left DBWIN_BUFFER owned so OutputDebugString
+  blocked every caller (blttest "hung" in OpenAdapter10_2); GDI screenshots of a blt-model exclusive-
+  fullscreen app show DWM's black desktop; fg.ps1 now keeps raising the app's largest window (Superposition
+  opens a console first).

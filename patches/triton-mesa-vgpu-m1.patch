@@ -65,16 +65,17 @@ index f012201..582dd86 100644
          ID3D11DeviceContext1_Flush(p->pCtx1);
      /* Tear down the present kernel context before the device goes away, under
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
-index bc4e182..af764d8 100644
+index bc4e182..32ea5c2 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
 +++ b/src/virtio/neptune/triton/tritonDxgi.c
-@@ -22,6 +22,13 @@
+@@ -22,6 +22,14 @@
  
  #include "tritonBlitShaders.h"
  
 +#ifdef VGPU_DXVK_INPROC
 +void vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT nrects); /* vgpu_triton_backend.c */
 +D3DKMT_HANDLE vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync);
++BOOL vgpuBlobScanout(void);
 +void vgpuPresentStats(UINT flags, BOOL windowed, const LARGE_INTEGER *t0, const LARGE_INTEGER *t1);
 +void vgpuPresentTailStats(BOOL windowed, const LARGE_INTEGER *t1, const LARGE_INTEGER *t2, const LARGE_INTEGER *t3);
 +#endif
@@ -82,7 +83,7 @@ index bc4e182..af764d8 100644
  /* Lazily create the GPU-done fence (rationale: the present-fence block in
   * triton.h).  Caller holds presentLock.  Returns TRUE if fencing is
   * available; FALSE => unfenced (bare-Flush) present. */
-@@ -65,6 +72,15 @@ tritonPresentEnsureFenceLocked(PTRITON_DEVICE pD)
+@@ -65,6 +73,15 @@ tritonPresentEnsureFenceLocked(PTRITON_DEVICE pD)
     return TRUE;
  }
  
@@ -98,7 +99,15 @@ index bc4e182..af764d8 100644
  /* Pop a reusable auto-reset event for one GPU-done wait (caller holds
   * presentLock).  Every concurrent waiter takes its own event, for the reason
   * given with the pool in triton.h.  The KMD signals it (via npt_event's
-@@ -621,7 +637,58 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -616,12 +633,65 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+     * submits), composited surfaces block until the GPU finishes (DWM's
+     * sampling cannot be ordered any other way).  See
+     * tritonPresentFlushAndGate. */
+-   if (src->pPresentCompanion) {
++   /* vgpu: a primary's companion only matters for blob scanout; the framebuffer copy reads
++    * pResource directly */
++   if (src->pPresentCompanion && (!src->IsPresentable || vgpuBlobScanout())) {
+       tritonPresentLock(pD);
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -157,7 +166,7 @@ index bc4e182..af764d8 100644
  
     /* DXGIDDICB_PRESENT (MSDN):
      *   hSrcAllocation  the rendered back buffer to present (a flip-primary
-@@ -631,11 +698,24 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
+@@ -631,11 +701,24 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
      *   pDXGIContext    runtime cookie threaded through unchanged. */
     DXGIDDICB_PRESENT cb;
     memset(&cb, 0, sizeof(cb));
@@ -183,7 +192,15 @@ index bc4e182..af764d8 100644
     InterlockedDecrement(&pD->presentInFlight);
     return hr;
  }
-@@ -1335,15 +1415,79 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
+@@ -1330,20 +1413,86 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
+     * the shared dmabuf.  Arm always -- the KMD's flip gate is keyed on the
+     * token the arm submits; wait only for composited (non-primary)
+     * surfaces. */
+-   if (src->pPresentCompanion) {
++   /* vgpu: a primary's companion only matters for blob scanout; the framebuffer copy reads
++    * pResource directly */
++   if (src->pPresentCompanion && (!src->IsPresentable || vgpuBlobScanout())) {
+       tritonPresentLock(pD);
        tritonResourceSyncPresentCompanion(pD, src);
        tritonPresentUnlock(pD);
     }
@@ -327,21 +344,22 @@ index c658197..a2dd84b 100644
      if (!npt_d3d12_ecl_gate_arm(q->pDrainFence, v, &kmdToken)) {
          static LONG armFail;
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
-index e47217f..f92e319 100644
+index e47217f..4825957 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
 +++ b/src/virtio/neptune/triton/tritonResource.c
-@@ -15,6 +15,10 @@
+@@ -15,6 +15,11 @@
  
  #include "virtio/virtio-gpu/wddm_hw.h"   /* VIOGPU resource / shared-allocation ABI */
  
 +#ifdef VGPU_DXVK_INPROC
 +void vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r); /* vgpu_triton_backend.c */
++BOOL vgpuBlobScanout(void);                                          /* vgpu_triton_backend.c */
 +#endif
 +
  /* tritonQuery.c; the DDI table in tritonDDI.c carries the same prototype. */
  void APIENTRY tritonCheckFormatSupport(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT *);
  
-@@ -206,6 +210,15 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -206,6 +211,15 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      r->pResource        = NULL;
      r->pPresentCompanion = NULL;
      r->pViewList        = NULL;
@@ -357,7 +375,7 @@ index e47217f..f92e319 100644
      /* A resource is a display primary only when the runtime supplies
       * pPrimaryDesc (d3d10umddi.h: "If pPrimaryDesc absent, blt/copy style
       * is implied when used with Present").  BIND_PRESENT alone marks any
-@@ -242,10 +255,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+@@ -242,10 +256,22 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
      const BOOL exportableShape = pArgs->MipLevels <= 1 &&
                                   pArgs->ArraySize <= 1 &&
                                   pArgs->SampleDesc.Count <= 1;
@@ -380,7 +398,41 @@ index e47217f..f92e319 100644
  
  
      /* Top-level dimensions come from the mip-0 entry of pMipInfoList. */
-@@ -520,6 +545,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
+@@ -323,7 +349,33 @@ tritonCreateResource(D3D10DDI_HDEVICE hDevice,
+             ID3D11Resource_Release(r->pResource);
+             r->pResource = NULL;
+             tritonSetCreateError(pD, E_FAIL);
++            return;
++        }
++#ifdef VGPU_DXVK_INPROC
++        /* vgpu: the app must not render into the pitch-linear primary itself: NVIDIA cannot use
++         * linear colour targets in every configuration (Unigine Heaven/Superposition in exclusive
++         * fullscreen hung the host GPU channel on their first frame, no host error).  With the
++         * framebuffer-copy scanout nothing reads the primary's dma-buf, so the app renders into
++         * optimal private storage and the linear primary only keeps the KM allocation (flips,
++         * blob scanout through the present companion sync). */
++        if (!vgpuBlobScanout()) {
++            D3D11_USAGE pu;
++            UINT pcpu, pbind, pmisc;
++            tritonTranslateUsage(pArgs, &pu, &pcpu, &pbind, &pmisc);
++            D3D11_TEXTURE2D_DESC pd = d;
++            pd.BindFlags = pbind | D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++            pd.MiscFlags = pmisc & ~(UINT)D3D11_RESOURCE_MISC_SHARED;
++            ID3D11Texture2D *priv = NULL;
++            HRESULT prh = ID3D11Device1_CreateTexture2D(pD->pDev1, &pd, NULL, &priv);
++            if (SUCCEEDED(prh) && priv) {
++                r->pPresentCompanion = r->pResource;
++                r->pResource = (ID3D11Resource *)priv;
++            } else {
++                TR_LOG("present: private primary storage failed hr=0x%08lx; rendering into the "
++                       "linear primary", prh);
++            }
+         }
++#endif
+         return;
+     }
+ 
+@@ -520,6 +572,9 @@ tritonDestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
          ID3D11Resource_Release(r->pResource);
          r->pResource = NULL;
      }
@@ -887,7 +939,7 @@ index 3355409..df6de3b 100644
              pImageFormatInfo, renderer_handle_type, &local_info);
           if (!pImageFormatInfo) {
 diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
-index fd5d1c7..6b288d2 100644
+index fd5d1c7..186b190 100644
 --- a/src/virtio/vulkan/vn_queue.c
 +++ b/src/virtio/vulkan/vn_queue.c
 @@ -1009,6 +1009,50 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
@@ -949,7 +1001,79 @@ index fd5d1c7..6b288d2 100644
           vn_queue_submission_cleanup(submit);
           return vn_error(instance, result);
        }
-@@ -1694,6 +1739,13 @@ vn_CreateFence(VkDevice device,
+@@ -1097,6 +1142,60 @@ vn_queue_submit(struct vn_queue_submission *submit)
+    return VK_SUCCESS;
+ }
+ 
++#ifdef _WIN32
++/* vgpu debug: VN_VGPU_TRACE_SUBMIT=1 logs every queue submit's semaphore waits/signals, host-side
++ * semaphore signals and waits to OutputDebugString (find the submission whose wait never resolves). */
++static FILE *vn_vgpu_trace_file;
++
++/* VN_VGPU_TRACE_SUBMIT=<file path> appends to that file, any other value uses OutputDebugString */
++static int
++vn_vgpu_trace_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("VN_VGPU_TRACE_SUBMIT");
++      on = e != NULL;
++      if (e && strchr(e, '\\'))
++         vn_vgpu_trace_file = fopen(e, "a");
++   }
++   return on;
++}
++
++static void
++vn_vgpu_trace(const char *fmt, ...)
++{
++   char buf[1024];
++   va_list ap;
++   va_start(ap, fmt);
++   int n = snprintf(buf, 40, "%lu %lu ", GetTickCount(), GetCurrentThreadId());
++   vsnprintf(buf + n, sizeof(buf) - n - 2, fmt, ap);
++   va_end(ap);
++   strcat(buf, "\n");
++   if (vn_vgpu_trace_file) {
++      fputs(buf, vn_vgpu_trace_file); /* one fputs per line: the CRT stream lock keeps lines whole */
++      fflush(vn_vgpu_trace_file);
++   } else {
++      OutputDebugStringA(buf);
++   }
++}
++
++static void
++vn_vgpu_trace_submit2(VkQueue q, uint32_t n, const VkSubmitInfo2 *s, VkFence f)
++{
++   for (uint32_t i = 0; i < n; i++) {
++      char w[400] = "", g[400] = "";
++      for (uint32_t j = 0; j < s[i].waitSemaphoreInfoCount && strlen(w) < 340; j++)
++         snprintf(w + strlen(w), sizeof(w) - strlen(w), " %p:%llu", (void *)s[i].pWaitSemaphoreInfos[j].semaphore,
++                  (unsigned long long)s[i].pWaitSemaphoreInfos[j].value);
++      for (uint32_t j = 0; j < s[i].signalSemaphoreInfoCount && strlen(g) < 340; j++)
++         snprintf(g + strlen(g), sizeof(g) - strlen(g), " %p:%llu", (void *)s[i].pSignalSemaphoreInfos[j].semaphore,
++                  (unsigned long long)s[i].pSignalSemaphoreInfos[j].value);
++      vn_vgpu_trace("vnsub q=%p [%u/%u] cmds=%u wait{%s } signal{%s } fence=%p pnext=%d", (void *)q, i, n,
++                    s[i].commandBufferInfoCount, w, g, (void *)f, s[i].pNext ? ((const VkBaseInStructure *)s[i].pNext)->sType : 0);
++   }
++}
++#endif
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vn_QueueSubmit(VkQueue queue,
+                uint32_t submitCount,
+@@ -1265,6 +1364,10 @@ vn_QueueSubmit2(VkQueue _queue,
+ 
+    vn_tls_set_async_pipeline_create();
+    vn_wsi_flush(queue);
++#ifdef _WIN32
++   if (vn_vgpu_trace_on())
++      vn_vgpu_trace_submit2(_queue, submitCount, pSubmits, fence);
++#endif
+ 
+    if (dev->has_sync2) {
+       struct vn_queue_submission submit = {
+@@ -1694,6 +1797,13 @@ vn_CreateFence(VkDevice device,
        goto out_payloads_fini;
  
     *pFence = vn_fence_to_handle(fence);
@@ -963,7 +1087,7 @@ index fd5d1c7..6b288d2 100644
     vn_async_vkCreateFence(dev->primary_ring, device, pCreateInfo, NULL,
                            pFence);
  
-@@ -2321,8 +2373,25 @@ vn_CreateSemaphore(VkDevice device,
+@@ -2321,8 +2431,25 @@ vn_CreateSemaphore(VkDevice device,
     }
  
     VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
@@ -989,6 +1113,29 @@ index fd5d1c7..6b288d2 100644
  
     *pSemaphore = sem_handle;
  
+@@ -2472,6 +2599,10 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
+    struct vn_device *dev = vn_device_from_handle(device);
+    struct vn_semaphore *sem =
+       vn_semaphore_from_handle(pSignalInfo->semaphore);
++#ifdef _WIN32
++   if (vn_vgpu_trace_on())
++      vn_vgpu_trace("vnsignal %p:%llu", (void *)pSignalInfo->semaphore, (unsigned long long)pSignalInfo->value);
++#endif
+ 
+    vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
+ 
+@@ -2542,6 +2673,11 @@ vn_WaitSemaphores(VkDevice device,
+ 
+    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+    VkResult result = VK_NOT_READY;
++#ifdef _WIN32
++   if (vn_vgpu_trace_on() && timeout > 1000000)
++      vn_vgpu_trace("vnwait n=%u first %p:%llu timeout=%llu", pWaitInfo->semaphoreCount, (void *)pWaitInfo->pSemaphores[0],
++                    (unsigned long long)pWaitInfo->pValues[0], (unsigned long long)timeout);
++#endif
+    if (pWaitInfo->semaphoreCount > 1 &&
+        !(pWaitInfo->flags & VK_SEMAPHORE_WAIT_ANY_BIT)) {
+       uint32_t semaphore_count = pWaitInfo->semaphoreCount;
 diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
 index dbee43f..5d1acab 100644
 --- a/src/virtio/vulkan/vn_renderer.h

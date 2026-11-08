@@ -1,7 +1,7 @@
 /*
  * blttest - windowed blt-model D3D11 swapchain (DXGI_SWAP_EFFECT_DISCARD) that clears to a
  * solid colour every frame; tests the classic redirected (blt) present path through DWM.
- * Usage: blttest [seconds [sync_interval [fullscreen [draw]]]]   (default 30 s, interval 1, windowed)
+ * Usage: blttest [seconds [sync_interval [fullscreen [draw [buffers]]]]]   (default 30 s, interval 1, windowed)
  * fullscreen=1 switches the swapchain to exclusive fullscreen at the desktop mode; draw=1 also draws
  * a triangle with a vertex/pixel shader into the back buffer every frame, draw=2 through an sRGB
  * render-target view of the (UNORM) back buffer.
@@ -50,6 +50,8 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     int fullscreen = sp2 ? atoi(sp2 + 1) : 0;
     const char *sp3 = sp2 ? strchr(sp2 + 1, ' ') : NULL;
     int draw = sp3 ? atoi(sp3 + 1) : 0;
+    const char *sp4 = sp3 ? strchr(sp3 + 1, ' ') : NULL;
+    UINT buffers = sp4 ? (UINT)atoi(sp4 + 1) : 1; /* >1: rotated flip chain in fullscreen (Unigine uses 2) */
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
@@ -60,7 +62,7 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                               200, 200, 640, 400, NULL, NULL, inst, NULL);
 
     DXGI_SWAP_CHAIN_DESC sd = { 0 };
-    sd.BufferCount = 1;
+    sd.BufferCount = buffers ? buffers : 1;
     sd.BufferDesc.Width = 0;
     sd.BufferDesc.Height = 0;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;

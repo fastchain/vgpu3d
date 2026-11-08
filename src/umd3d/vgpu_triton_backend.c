@@ -674,6 +674,13 @@ vgpu_blob_scanout(void)
    return mode;
 }
 
+/* For tritonResource.c / tritonDxgi.c: whether scanout primaries must hold the frame themselves. */
+BOOL
+vgpuBlobScanout(void)
+{
+   return vgpu_blob_scanout();
+}
+
 static UINT vgpu_stats_every(void);
 
 /* Every vgpu_stats_every() presents: average share of the frame that was updated and the time
@@ -779,6 +786,16 @@ vgpu_fb_worker(void *arg)
       }
       LARGE_INTEGER ready, done;
       QueryPerformanceCounter(&ready);
+      {
+         /* the first frames' centre pixel tells a black-screen report apart: app vs. copy path */
+         static LONG logged;
+         const LONG nf = InterlockedIncrement(&logged);
+         if (nf <= 4) {
+            const UINT32 *c = (const UINT32 *)(vgpu_fb.ptr[job.slot] + (SIZE_T)(vgpu_fb.height / 2) * vgpu_fb.pitch[job.slot] +
+                                               (SIZE_T)(vgpu_fb.width / 2) * 4);
+            TR_LOG("vgpu: fb async frame %ld fence %llu centre=0x%08x", nf, (unsigned long long)job.value, *c);
+         }
+      }
 
       VIOGPU_ESCAPE esc;
       memset(&esc, 0, sizeof(esc));
@@ -886,7 +903,7 @@ vgpu_fb_async_setup(PTRITON_DEVICE pD, const D3D11_TEXTURE2D_DESC *sd)
    if (!vgpu_fb.thread)
       goto fail;
    SetThreadPriority(vgpu_fb.thread, THREAD_PRIORITY_ABOVE_NORMAL);
-   TR_LOG("vgpu: fb presents asynchronous (%u slots, %ux%u)", VGPU_FB_RING, sd->Width, sd->Height);
+   TR_LOG("vgpu: fb presents asynchronous (%u slots, %ux%u fmt=%u)", VGPU_FB_RING, sd->Width, sd->Height, (UINT)sd->Format);
    return true;
 
 fail:

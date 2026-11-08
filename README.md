@@ -101,6 +101,7 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 | **GravityMark 1.89**, 3840×2160 exclusive fullscreen | D3D12 / Vulkan / OpenGL / D3D11 | 12587 / 5539 / 5295 / 4767 (75 / 33 / 32 / 29 fps) |
 | **Unigine Superposition 1.1**, 1080p | Direct3D 11 / OpenGL | 69.8 / 56.4 fps |
 | **Unigine Heaven 4.0** (5K desktop) | Direct3D 11 / OpenGL | 82–88 / 67.4 fps |
+| **Unigine Heaven 4.0**, exclusive fullscreen | Direct3D 11, 3840×2160 / 1920×1080 | 72.0 / 187.2 fps |
 | **Unigine Valley 1.0** (5K desktop) | OpenGL | 67.0 fps |
 | **FurMark 2**, 1080p preset | Vulkan / OpenGL | 7882 (130.9 fps) / 7258 |
 | **PassMark 11.1** 3D | DX9 / DX10 / DX11 / DX12 | 37 / 198 / 54 / 27 |
@@ -268,8 +269,6 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
   Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
-- Exclusive fullscreen works (GravityMark in every API), but Unigine Heaven and Superposition (D3D11) fail
-  in exclusive fullscreen; windowed and borderless work.
 - Superposition (D3D11) shows black patches in some scenes (OpenGL is fine).
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.
