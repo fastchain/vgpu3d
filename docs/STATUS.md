@@ -615,7 +615,7 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   fullscreen app show DWM's black desktop; fg.ps1 now keeps raising the app's largest window (Superposition
   opens a console first).
 
-### Superposition D3D11 black patches: narrowed, still open (2026-11-08)
+### Superposition D3D11 black patches: narrowed (2026-11-08; closed below, not a driver bug)
 - What it is: D3D11 renders sun-shadowed areas pure black and the whole image greyer -- the indirect /
   environment lighting is missing. Superposition's OpenGL renderer (Zink, same Venus) shows the warm
   bounce light and dim (not black) shadows at the same moments. Measured as the share of near-black
