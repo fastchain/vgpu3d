@@ -347,7 +347,8 @@ class CtrlQueue : public VioGpuQueue
     {
         return scan_id < ARRAYSIZE(m_ScanoutRes) ? m_ScanoutRes[scan_id] : 0;
     }
-    void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick = TRUE);
+    void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick = TRUE,
+                  void (*complete_cb)(void *, void *, void *) = NULL, void *complete_ctx = NULL);
     void ResFlush(UINT res_id, GPU_RECT rect) {
 		ResFlush(res_id, rect.width, rect.height, rect.x, rect.y);
 	}

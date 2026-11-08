@@ -790,7 +790,8 @@ void CtrlQueue::DestroyCtx(UINT ctx_id, void (*complete_cb)(void *, void *, void
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick)
+void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, BOOLEAN kick,
+                         void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     PAGED_CODE();
 
@@ -810,6 +811,8 @@ void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y, B
     cmd->r.height = height;
     cmd->r.x = x;
     cmd->r.y = y;
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
 
     QueueBuffer(vbuf, kick);
 

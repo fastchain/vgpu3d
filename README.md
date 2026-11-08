@@ -14,7 +14,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
 ![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
-![Release](https://img.shields.io/badge/release-1.0.26312.27465-brightgreen)
+![Release](https://img.shields.io/badge/release-1.0.26312.28657-brightgreen)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
 </div>

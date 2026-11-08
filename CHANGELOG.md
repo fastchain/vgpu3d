@@ -1,10 +1,14 @@
 # Changelog
 
-## 1.0.26312.27465 (2026-11-08)
+## 1.0.26312.28657 (2026-11-09)
 
-Installer: `vgpu3d-setup-1.0.26312.27465.exe`. From this release on, releases are named by the full driver version.
+Installer: `vgpu3d-setup-1.0.26312.28657.exe`. From this release on, releases are named by the full driver version.
 
 ### Fixed
+- **Tearing during fast motion.** Each frame is copied into the guest framebuffer and the host copies it out when it
+  processes the transfer, which could be after the next frame had started overwriting the same memory: the host
+  then showed a frame that was part old, part new. In a GravityMark run up to ~3% of presents hit this. The driver
+  now waits for the host to finish the previous frame before overwriting it (on average well under 1 ms).
 - **3DMark Steel Nomad (D3D12)** no longer fails with `DXGI_ERROR_DEVICE_REMOVED`. Shareable textures in formats
   the host GPU cannot lay out linearly (e.g. block-compressed) made the host reject the image
   (`VK_ERROR_FORMAT_NOT_SUPPORTED`) and vkd3d-proton removed the device; such images are now created optimal and

@@ -225,6 +225,11 @@ class VioGpuVidPN
 
     VioGpuObj *m_pFrameBuf;
     BOOLEAN m_FbNeedsFull = TRUE; // vgpu: framebuffer (re)created, no full frame received yet
+    // vgpu: signalled when the host completed the last framebuffer RESOURCE_FLUSH (and so the
+    // TRANSFER_TO_HOST_2D queued before it); the next present waits for it before overwriting
+    // the framebuffer, or the host would read a half-updated frame (tearing).
+    KEVENT m_FbFlushDone;
+    static void FbFlushComplete(void *ctx, void *data_buf, void *resp_buf);
 
     PHYSICAL_ADDRESS m_sourceAddress = {0};
     VioGpuAllocation *m_sourceRes = NULL;

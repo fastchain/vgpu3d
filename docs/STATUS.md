@@ -722,3 +722,18 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   and sent DWM into a crash loop (0xc00001ad, "display not active"), so only a real failure falls back now.
 - Steel Nomad DX12 demo at 4K: 2295 points (22.96 fps), user-watched run; the earlier scripted run gave 2271.
   SystemInfo still shows "GPU: not available" (PCI-ID based; virtio-gpu 1AF4:1050).
+
+### Tearing in the viewer (2026-11-09)
+- Symptom (user, virt-manager): with much motion parts of the picture "break", as if part of the frame came late.
+- Cause: PresentToFrameBuffer copied each frame into the single 2D framebuffer and queued TRANSFER_TO_HOST_2D +
+  RESOURCE_FLUSH without waiting. The host reads guest memory only when it runs the transfer, so the next
+  present could overwrite the framebuffer while the host still had to read the previous frame; the host copy
+  then mixed two frames.
+- Measured with a counter of presents that find the previous flush still pending (debug build, GravityMark
+  Vulkan 1080p window on a 4K desktop): 0-19 per 600 presents, i.e. up to ~3% torn-frame candidates.
+- Fix: RESOURCE_FLUSH carries a completion callback that signals m_FbFlushDone; the next present waits for it
+  (200 ms cap; queue teardown fires pending callbacks) before copying. QEMU runs control commands in order and
+  copies 2D transfers synchronously, so a completed flush means the transfer before it has read the memory.
+  Average wait 0-0.5 ms per present.
+- Not fixable in the guest: SPICE lossy video streaming in busy regions (blocky areas); SETUP.md 9 lists the
+  host-side `<streaming mode='off'/>` option.

@@ -337,6 +337,7 @@ webdeploy folder; they're no longer needed.
 | Guest has no Vulkan; QEMU log: `failed to initialize venus renderer` | `seccomp_sandbox = 0` missing (2.3), or virglrenderer built without Venus |
 | Adapter shows Code 39 after a reinstall | the boot-loop guard tripped (`VgpuBootGuard` ≠ 0 under `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D`); re-run the installer, which resets it |
 | Adapter shows Code 43, or falls back to Basic Display | test signing off, package not signed (re-run `install.ps1`), or `blob`/`venus` globals missing |
+| Blocky or smeared areas during fast motion (not a clean split line) | SPICE switches busy areas to lossy video streaming. Host-side choice: `<streaming mode='off'/>` inside the SPICE `<graphics>` element trades bandwidth/CPU for a clean picture |
 | Black viewer from the first frame | SPICE `gl=on` on NVIDIA: use the egl-headless setup (4.5) |
 | QEMU log: `vrend_renderer_transfer_iov … Illegal resource` | a resource without guest backing (old driver builds); update the driver |
 | High CPU load, GPU mostly idle (host `nvtop`) | expected with this design: D3D/GL → Vulkan translation in the guest, Venus decode on one host thread per app, and the CPU display copy. Give the VM more cores; lower resolution helps most |

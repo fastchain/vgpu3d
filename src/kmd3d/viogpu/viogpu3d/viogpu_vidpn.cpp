@@ -36,6 +36,7 @@ VioGpuVidPN::VioGpuVidPN(VioGpuAdapter *adapter)
 
     m_pAdapter = adapter;
     m_pDxgkInterface = adapter->GetDxgkInterface();
+    KeInitializeEvent(&m_FbFlushDone, NotificationEvent, TRUE);
 
     RtlZeroMemory(m_CurrentModes, sizeof(m_CurrentModes));
     RtlZeroMemory(&m_SystemDisplayInfo, sizeof(m_SystemDisplayInfo));
@@ -1943,6 +1944,24 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
 
     const BYTE *pSrc = VIOGPU_UM_PTR_AS(const BYTE *, pReq->Pixels);
     BYTE *pBox = pDst + (SIZE_T)y * dstPitch + (SIZE_T)x * 4;
+
+    // The host copies the framebuffer when it runs TRANSFER_TO_HOST_2D, which can be well after
+    // the previous present returned.  Overwriting the framebuffer before that mixed two frames
+    // in the host's copy (tearing, worst with much motion), so wait for the previous flush.  A
+    // stuck host costs at most the timeout per frame; teardown completes pending callbacks.
+    LARGE_INTEGER wait;
+    wait.QuadPart = -200LL * 10000; // 200 ms
+    LARGE_INTEGER tw = KeQueryPerformanceCounter(NULL);
+    const BOOLEAN flushPending = KeReadStateEvent(&m_FbFlushDone) == 0;
+    if (KeWaitForSingleObject(&m_FbFlushDone, Executive, KernelMode, FALSE, &wait) == STATUS_TIMEOUT)
+    {
+        static LONG s_timeouts;
+        if (InterlockedIncrement(&s_timeouts) <= 5)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("vgpu: fb present: previous flush not completed after 200 ms\n"));
+        }
+    }
+    KeClearEvent(&m_FbFlushDone);
     LARGE_INTEGER freq, t0 = KeQueryPerformanceCounter(&freq);
     __try
     {
@@ -1974,15 +1993,17 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
         DbgPrint(TRACE_LEVEL_INFORMATION, ("<--> %s scanning out framebuffer res_id=%u %ux%u\n", __FUNCTION__, resid, fbWidth, fbHeight));
         m_pAdapter->ctrlQueue.SetScanout(0, resid, fbWidth, fbHeight, 0, 0);
     }
-    m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y, FALSE);
+    m_pAdapter->ctrlQueue.ResFlush(resid, width, height, x, y, FALSE, FbFlushComplete, this);
     LARGE_INTEGER tq = KeQueryPerformanceCounter(NULL);
     m_pAdapter->ctrlQueue.FlushKick();
 
     // vgpu: every 600 presents, average copy vs command-queue time and MB/s of the copy
     {
-        static LONGLONG s_copy, s_cmd, s_kick, s_bytes;
-        static ULONG s_n;
+        static LONGLONG s_wait, s_copy, s_cmd, s_kick, s_bytes;
+        static ULONG s_n, s_pending;
+        s_pending += flushPending ? 1 : 0;
         LARGE_INTEGER t2 = KeQueryPerformanceCounter(NULL);
+        s_wait += t0.QuadPart - tw.QuadPart;
         s_copy += t1.QuadPart - t0.QuadPart;
         s_cmd += tq.QuadPart - t1.QuadPart;
         s_kick += t2.QuadPart - tq.QuadPart;
@@ -1991,9 +2012,12 @@ NTSTATUS VioGpuVidPN::PresentToFrameBuffer(_Inout_ VIOGPU_FB_PRESENT_REQ *pReq)
         {
             const LONGLONG us_copy = s_copy * 1000000 / freq.QuadPart, us_cmd = s_cmd * 1000000 / freq.QuadPart,
                            us_kick = s_kick * 1000000 / freq.QuadPart;
-            DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: fb kmd avg us copy=%lld queue=%lld kick=%lld, copy %lld MB/s\n",
-                                           us_copy / s_n, us_cmd / s_n, us_kick / s_n, us_copy ? s_bytes / us_copy : 0));
-            s_copy = s_cmd = s_kick = s_bytes = 0;
+            DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: fb kmd avg us wait=%lld copy=%lld queue=%lld kick=%lld, copy %lld MB/s, "
+                                           "previous flush pending %lu/%lu\n",
+                                           s_wait * 1000000 / freq.QuadPart / s_n, us_copy / s_n, us_cmd / s_n,
+                                           us_kick / s_n, us_copy ? s_bytes / us_copy : 0, s_pending, s_n));
+            s_wait = s_copy = s_cmd = s_kick = s_bytes = 0;
+            s_pending = 0;
             s_n = 0;
         }
     }
@@ -2640,6 +2664,15 @@ PAGED_CODE_SEG_END
 // on the DPC side).
 #pragma code_seg(push)
 #pragma code_seg()
+
+// Non-paged: runs in the response DPC (or queue teardown) for the framebuffer RESOURCE_FLUSH.
+void VioGpuVidPN::FbFlushComplete(void *ctx, void *data_buf, void *resp_buf)
+{
+    UNREFERENCED_PARAMETER(data_buf);
+    UNREFERENCED_PARAMETER(resp_buf);
+    KeSetEvent(&((VioGpuVidPN *)ctx)->m_FbFlushDone, IO_NO_INCREMENT, FALSE);
+}
+
 
 // Scan out an armed flip once the render it depends on has retired on the host
 // GPU.  Returns TRUE if a scanout was emitted (or explicitly cleared).
