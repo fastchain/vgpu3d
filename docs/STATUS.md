@@ -529,3 +529,21 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
 - First release-build (`package_kmd3d.sh release`) smoke round: d3d12test, d3d9test (64/32), vkcompute2,
   dsbtest (64/32), blttest pass.
 - README rewritten for the release (use cases, API table, benchmarks, host and guest steps).
+
+### Release build without debug overhead (2026-11-08)
+- Kernel driver: trace.h hard-codes `DBG 1` (no WPP), so `/DDBG=0` never removed anything and the INF's
+  DebugLevel=4 (= TRACE_LEVEL_INFORMATION, not "warnings") kept ~65 prints live, several per frame or per
+  paging operation (BuildPagingBuffer fill/discard/residency, blt present, scanout flush, ring full).
+  Release (NDEBUG) now caps the compiled-in level at ERROR, so the rest is compiled out (viogpu3d.sys
+  204800 -> 171520 bytes), and `package_kmd3d.sh release` sets the packaged INF to DebugLevel=2.
+- Venus and Zink were debugoptimized with asserts (and NIR validation after every pass in Zink).
+  `VGPU_RELEASE=1 build_triton_venus.sh / build_gl.sh [32]` build NDEBUG variants in out/*-build-rel ->
+  out/*-rel; the release package uses those. Debug packages are unchanged.
+- DXVK: default log level none (was info, which wrote <app>_d3d11.log/_dxgi.log into app folders);
+  DXVK_LOG_LEVEL turns it back on.
+- Release smoke round passes (d3d12test, d3d9test 64/32, vkcompute2, dsbtest 64/32, blttest; no DXVK
+  log files). The before/after benchmark is still open: since ~12:50 GravityMark fails in every API with
+  host "vkr: failed to look up object N of type 8" (VkDeviceMemory) on vkBind*Memory2 and aborts on the
+  fatal ring, with the debug package too and after a guest reboot. The host had 119 of 125 GB RAM in use
+  (108 GB anonymous, processes outside the container), so host allocations failing is the likely cause;
+  re-run the comparison once host memory is back.

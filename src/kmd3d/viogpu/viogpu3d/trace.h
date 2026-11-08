@@ -26,8 +26,15 @@
     void DebugPrintFuncSerial(const char *format, ...);
     void DebugPrintFuncKdPrint(const char *format, ...);
 #define DbgExpandArguments(...) __VA_ARGS__
+// Release builds (NDEBUG, build_kmd3d.sh release) keep only errors: the level test is a constant,
+// so warning/info/verbose prints are compiled out instead of trapping into the debug-print path.
+#ifdef NDEBUG
+#define VIOGPU_TRACE_MAX TRACE_LEVEL_ERROR
+#else
+#define VIOGPU_TRACE_MAX TRACE_LEVEL_RESERVED9
+#endif
 #define DbgPrint(Level, MSG) \
-    if (Level <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG);
+    if ((Level) <= VIOGPU_TRACE_MAX && (Level) <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG);
 #define VioGpuDbgBreak()\
     if (KD_DEBUGGER_ENABLED && !KD_DEBUGGER_NOT_PRESENT && bBreakAlways) DbgBreakPoint();
 

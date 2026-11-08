@@ -344,6 +344,10 @@ webdeploy folder; they're no longer needed.
 **Logs:**
 - Host QEMU/virgl: `/var/log/libvirt/qemu/<domain>.log`.
 - Guest kernel and UMD debug output: DbgView (Sysinternals) with "Capture Kernel". The KMD log level is
-  `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters\DebugLevel` (4 = warnings; higher floods
-  DbgView and can fill RAM).
+  `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters\DebugLevel`: 2 = errors, 3 = warnings,
+  4 = information (entry/exit), 5 = verbose (floods DbgView and can fill RAM). Release packages install 2
+  and compile everything above errors out, so higher values only take effect with a debug build
+  (`build/package_kmd3d.sh` without `release`, which installs 4).
+- DXVK (D3D10/11) writes no log unless `DXVK_LOG_LEVEL` is set (`info`, `warn`, ...); the files
+  `<app>_d3d11.log` / `<app>_dxgi.log` then appear next to the app, or under `DXVK_LOG_PATH`.
 - `VGPU_STATS_EVERY=<n>` (environment variable) makes the D3D11 UMD log present/copy timings every n frames.

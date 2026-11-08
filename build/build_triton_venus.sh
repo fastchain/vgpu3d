@@ -2,6 +2,7 @@
 # Cross-build the Venus Vulkan ICD with the D3DKMT (WDDM) backend from osy/virtio-win-mesa "neptune"
 # (upstream/triton/mesa) using MinGW-w64.  Output: out/triton-venus/vulkan_virtio.dll (+ .debug.dll)
 # usage: build_triton_venus.sh [32]   -- "32" builds the WOW64 ICD out/triton-venus32/vulkan_virtio32.dll
+# VGPU_RELEASE=1: release build (NDEBUG) in out/triton-venus[32]-build-rel -> out/triton-venus[32]-rel
 # MinGW lacks the WDK DDI headers: they are staged from our NuGet WDK into out/winddk (Mesa's
 # include/winddk convention) plus vgpu_mingw_ddk.h for missing SAL annotations.
 # Source fixes for MinGW in the tree: pid_t guard (vn_common.h), "static inline" (wddm_hw.h).
@@ -11,6 +12,8 @@ XF=$R/build/mesa/mingw64.ini; T=x86_64-w64-mingw32; DLL=vulkan_virtio
 if [ "${1:-64}" = 32 ]; then
   B=$R/out/triton-venus32-build; P=$R/out/triton-venus32; XF=$R/build/mesa/mingw32.ini; T=i686-w64-mingw32; DLL=vulkan_virtio32
 fi
+BT=debugoptimized; NDBG=false
+if [ "${VGPU_RELEASE:-0}" = 1 ]; then B=$B-rel; P=$P-rel; BT=release; NDBG=true; fi
 I=$R/toolchain/wdk/c/Include/10.0.26100.0
 mkdir -p $W
 for h in d3d10TokenizedProgramFormat.hpp d3d11TokenizedProgramFormat.hpp d3d12TokenizedProgramFormat.hpp \
@@ -26,11 +29,11 @@ if [ -f $B/build.ninja ] && ! grep -q vgpu_mesa_assert $B/meson-info/intro-build
   meson configure $B "-Dc_args=$CARGS" >/dev/null
 fi
 if [ ! -f $B/build.ninja ]; then
-  meson setup $B $M --cross-file $XF --buildtype=debugoptimized \
+  meson setup $B $M --cross-file $XF --buildtype=$BT \
     -Dvulkan-drivers=virtio -Dgallium-drivers= -Dplatforms=windows -Dllvm=disabled -Dopengl=false \
     -Dgles1=disabled -Dgles2=disabled -Degl=disabled -Dglx=disabled -Dzstd=disabled -Dbuild-tests=false \
     -Dvideo-codecs= -Dspirv-tools=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvulkan-layers= \
-    -Dtools= -Ddefault_library=static -Db_ndebug=false -Dc_link_args=-static -Dcpp_link_args=-static \
+    -Dtools= -Ddefault_library=static -Db_ndebug=$NDBG -Dc_link_args=-static -Dcpp_link_args=-static \
     "-Dc_args=$CARGS" "-Dcpp_args=-I$W"
 fi
 ninja -C $B src/virtio/vulkan/vulkan_virtio.dll

@@ -27,6 +27,10 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
 
 - `build/package_kmd3d.sh` builds the kernel driver and both UMDs and produces `out/vgpu3d-m1.zip`.
   It **fails if a binary wasn't rebuilt**, so never work around that check.
+- `build/package_kmd3d.sh release` is the release package: NDEBUG kernel driver with only error prints
+  compiled in, INF `DebugLevel=2`, and NDEBUG Venus/Zink from `VGPU_RELEASE=1` builds (`out/*-rel`).
+  Without `release` you get the debug package (asserts, INF `DebugLevel=4` = information traces), which
+  is the one to use while debugging. DXVK logs only when `DXVK_LOG_LEVEL` is set.
 - `build/build_installer.sh [--package]` wraps the staged package into the NSIS installer
   `out/vgpu3d-setup-<version>.exe` (needs `makensis`). It refreshes `install.ps1`/`uninstall3d.ps1` in the
   package, so script fixes need no full rebuild. Test it with `/S` over SSH; the GUI needs the `vgpu-run` task.

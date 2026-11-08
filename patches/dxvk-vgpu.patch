@@ -134,6 +134,21 @@ index 0eaf992b..c8d3052d 100644
  };
  
  /**
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 5158cd7e..ec26710d 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -159,7 +159,9 @@ namespace dxvk {
+         return pair.second;
+     }
+     
+-    return LogLevel::Info;
++    // vgpu: DXVK runs inside the WDDM driver for every D3D10/11 app, so don't
++    // drop <app>_d3d11.log files into app folders unless DXVK_LOG_LEVEL asks.
++    return LogLevel::None;
+   }
+   
+ }
 diff --git a/src/util/util_singleton.h b/src/util/util_singleton.h
 index ee5fe56d..b16f7ecd 100644
 --- a/src/util/util_singleton.h
