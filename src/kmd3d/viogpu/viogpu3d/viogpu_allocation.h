@@ -181,12 +181,6 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // fully resident; the caller then takes the virgl path.
     BOOLEAN CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UINT count, INT dx, INT dy);
 
-    // vgpu: asynchronous blt present (VIOGPU_CMD_CPU_BLT): copy rects from a
-    // 32 bpp frame in `process`'s address space (srcW x srcH, srcPitch) into
-    // this guest-backed TYPE_3D allocation; dst rect r reads src at r + (dx,
-    // dy).  swizzle converts RGBA8 to BGRA8.  PASSIVE only (attaches).
-    BOOLEAN CpuBltFromProcess(PEPROCESS process, const BYTE *src, ULONG srcPitch, ULONG srcW, ULONG srcH,
-                              BOOLEAN swizzle, const RECT *rects, UINT count, INT dx, INT dy);
 
     void FlushToScreen(UINT scan_id);
 

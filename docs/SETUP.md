@@ -20,7 +20,7 @@ with no per-app setup.
 | Direct3D 10 / 11 (FL 11_1) | yes | yes | Triton DDI layer + DXVK → Venus |
 | OpenGL 4.6 | yes | yes | Mesa Zink (GL on Vulkan) → Venus |
 | Direct3D 12 | yes | yes | Triton D3D12 DDI layer + vkd3d-proton → Venus (new, see §8) |
-| Direct3D 9 | **no** | **no** | not implemented yet |
+| Direct3D 9 | yes | yes | Windows' D3D9On12 on our D3D12 driver (automatic) |
 | Desktop (DWM) | GPU composited | – | D3D11 on the host GPU |
 
 The guest reports the host GPU by name, for example `Virtio-GPU Venus (NVIDIA GeForce RTX 4090)`.
@@ -288,11 +288,14 @@ webdeploy folder; they're no longer needed.
 
 ## 8. Known limitations
 
-- **No Direct3D 9.** Apps and benchmarks that need it fail (e.g. PassMark's DirectX 9 test).
-- **Direct3D 12 is new.** Each ExecuteCommandLists waits for its GPU work before returning (no kernel
-  gate token yet), which costs CPU/GPU overlap. Tested: a clear/readback/present test, GravityMark
+- **Direct3D 9 runs through Windows' D3D9On12** (D3D9 on our D3D12 driver), chosen automatically because the
+  driver has no native D3D9 UMD.
+- **Direct3D 12 is new.** Each ExecuteCommandLists waits for its GPU work before returning; a kernel-side gate
+  stalled behind itself (GravityMark D3D12 133 -> 17 fps), so the CPU wait stays. Tested: a clear/readback/present test, GravityMark
   D3D12, PassMark DirectX 12.
-- **No OpenCL.** GPU-compute tests that need it (PassMark GPU Compute, Geekbench) don't run.
+- **No OpenCL.** GPU-compute tests that need it (PassMark GPU Compute, Geekbench) don't run. Do **not** install
+  Microsoft's "OpenCL, OpenGL and Vulkan Compatibility Pack": its Dozen Vulkan driver calls D3D12, our D3D12
+  driver calls Vulkan, and every Vulkan app (and DWM after a reboot) deadlocks.
 - **Exclusive-fullscreen Unigine Heaven (D3D11)** hangs: its GPU work never completes and the host
   rejects a submission (`vkQueueSubmit2 resulted in CS error`). Windowed and borderless work.
 - **Superposition (D3D11)** shows black patches on lit geometry in some scenes; OpenGL renders the

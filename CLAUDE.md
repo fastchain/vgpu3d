@@ -77,6 +77,7 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
   - `tools/windows/bench3.ps1` (FurMark 2, GravityMark)
   - `tools/fusion-bench/bench.sh` (Autodesk Fusion via MCP)
 - Known issues to keep in mind:
-  - DX9 and OpenCL are not implemented; DX12 is new (vkd3d-proton, CPU-waited queue gate).
+  - DX9 comes from Windows' D3D9On12 on our D3D12; OpenCL is not available (never install the MS
+    Compatibility Pack: Dozen <-> our D3D12 deadlocks Vulkan). DX12 is vkd3d-proton with a CPU-waited queue gate.
   - Exclusive-fullscreen Heaven D3D11 hangs (host `CS error`); Superposition D3D11 shows black patches.
   - Fullscreen tests need the app in the foreground: run `C:\vgpu\fg.ps1 -Name <process>` beside it.

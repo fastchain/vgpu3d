@@ -2859,12 +2859,6 @@ D3DDDI_RATIONAL VioGpuVidPN::GetActiveRefreshRate() const
         rate.Numerator = 60;
         rate.Denominator = 1;
     }
-    // vgpu experiment: HKLM\SOFTWARE\vgpu VsyncHz overrides the vsync cadence
-    if (m_VsyncOverrideHz != 0)
-    {
-        rate.Numerator = m_VsyncOverrideHz;
-        rate.Denominator = 1;
-    }
     return rate;
 }
 
@@ -2887,19 +2881,6 @@ void VioGpuVidPN::FlipThread(void *ctx)
     // restarted after ReleasePostDisplayOwnership, and the previous run
     // cancelled it on exit).
     vidpn->m_vsyncTimerPeriod100ns = 0;
-    {
-        // vgpu experiment knob (PASSIVE here): HKLM\SOFTWARE\vgpu VsyncHz (REG_DWORD, 24..240)
-        RTL_QUERY_REGISTRY_TABLE q[2] = {};
-        ULONG hz = 0, def = 0;
-        q[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
-        q[0].Name = (PWSTR)L"VsyncHz";
-        q[0].EntryContext = &hz;
-        q[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
-        q[0].DefaultData = &def;
-        q[0].DefaultLength = sizeof(def);
-        RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, L"\\Registry\\Machine\\SOFTWARE\\vgpu", q, NULL, NULL);
-        vidpn->m_VsyncOverrideHz = (hz >= 24 && hz <= 240) ? hz : 0;
-    }
 
     for (;;)
     {

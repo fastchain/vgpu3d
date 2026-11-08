@@ -225,7 +225,6 @@ class VioGpuVidPN
 
     VioGpuObj *m_pFrameBuf;
     BOOLEAN m_FbNeedsFull = TRUE; // vgpu: framebuffer (re)created, no full frame received yet
-    ULONG m_VsyncOverrideHz = 0;  // vgpu experiment: HKLM\SOFTWARE\vgpu VsyncHz
 
     PHYSICAL_ADDRESS m_sourceAddress = {0};
     VioGpuAllocation *m_sourceRes = NULL;

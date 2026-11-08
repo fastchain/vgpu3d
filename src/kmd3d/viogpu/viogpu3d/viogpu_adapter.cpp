@@ -473,8 +473,6 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     KeInitializeSpinLock(&m_GateLock);
     InitializeListHead(&m_GateList);
     InitializeListHead(&m_PresentWaitList);
-    InitializeListHead(&m_BltJobs);
-    KeInitializeSpinLock(&m_BltJobLock);
     InitializeListHead(&m_MFenceDeferList);
     // Parked-gate deadline scan.  Started here and cancelled in the
     // destructor; an empty-list pass is a spinlock acquire + list-head check
@@ -1375,11 +1373,21 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
     UINT size = pEscape->PrivateDriverDataSize;
     if (size < sizeof(VIOGPU_ESCAPE))
     {
+        // Name the sender: something in the guest sends 32-byte escapes.
+        // The first ULONG is VIOGPU_ESCAPE.Type when the caller is ours.
+        ULONG firstWord = 0;
+        if (pVioGpuEscape != NULL && size >= sizeof(ULONG))
+        {
+            firstWord = *(const ULONG *)pVioGpuEscape;
+        }
         DbgPrint(TRACE_LEVEL_ERROR,
-                 ("%s buffer too small %d, should be at least %zu\n",
+                 ("%s buffer too small %d, should be at least %zu (pid %p, first word 0x%x, flags 0x%x)\n",
                   __FUNCTION__,
                   size,
-                  sizeof(VIOGPU_ESCAPE)));
+                  sizeof(VIOGPU_ESCAPE),
+                  PsGetCurrentProcessId(),
+                  firstWord,
+                  pEscape->Flags.Value));
         return STATUS_INVALID_BUFFER_SIZE;
     }
 
@@ -1497,51 +1505,6 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 pVioGpuEscape->PciInfo.Bus = m_PciBus;
                 pVioGpuEscape->PciInfo.Dev = m_PciDev;
                 pVioGpuEscape->PciInfo.Func = m_PciFunc;
-                break;
-            }
-        case VIOGPU_BLT_ASYNC:
-            {
-                size = sizeof(VIOGPU_BLT_ASYNC_REQ);
-                if (pVioGpuEscape->DataLength < size)
-                {
-                    return STATUS_INVALID_BUFFER_SIZE;
-                }
-                const VIOGPU_BLT_ASYNC_REQ *req = &pVioGpuEscape->BltAsync;
-                if (req->Pixels == 0 || req->Width == 0 || req->Height == 0 || req->Width > 16384 ||
-                    req->Height > 16384 || req->Pitch < req->Width * 4)
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-                BLT_JOB *job = new (NonPagedPoolNx) BLT_JOB;
-                if (job == NULL)
-                {
-                    return STATUS_NO_MEMORY;
-                }
-                RtlZeroMemory(job, sizeof(*job));
-                job->Tid = PsGetCurrentThreadId();
-                job->Process = PsGetCurrentProcess();
-                ObReferenceObject(job->Process);
-                job->Pixels = VIOGPU_UM_PTR_AS(const BYTE *, req->Pixels);
-                job->Pitch = req->Pitch;
-                job->Width = req->Width;
-                job->Height = req->Height;
-                job->Swizzle = req->Swizzle;
-                job->Token = PresentTokenSubmit();
-                pVioGpuEscape->BltAsync.Token = job->Token;
-                BltJobStage(job);
-                status = STATUS_SUCCESS;
-                break;
-            }
-        case VIOGPU_BLT_READY:
-            {
-                size = sizeof(VIOGPU_BLT_ASYNC_REQ);
-                if (pVioGpuEscape->DataLength < size || pVioGpuEscape->BltAsync.Token == 0)
-                {
-                    return STATUS_INVALID_PARAMETER;
-                }
-                PresentTokenRetire(pVioGpuEscape->BltAsync.Token);
-                PresentWaitSweep();
-                status = STATUS_SUCCESS;
                 break;
             }
         case VIOGPU_FB_PRESENT:
@@ -2027,93 +1990,6 @@ void VioGpuAdapter::GateFenceCb(void *ctx, void *, void *)
     {
         delete g;
     }
-}
-
-// ---- asynchronous blt presents (see BLT_JOB in viogpu_adapter.h) ----
-
-void VioGpuAdapter::BltJobStage(BLT_JOB *job)
-{
-    BLT_JOB *stale = NULL;
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&m_BltJobLock, &oldIrql);
-    for (LIST_ENTRY *e = m_BltJobs.Flink; e != &m_BltJobs; e = e->Flink)
-    {
-        BLT_JOB *j = CONTAINING_RECORD(e, BLT_JOB, Entry);
-        if (j->Id == 0 && j->Tid == job->Tid)
-        {
-            RemoveEntryList(&j->Entry);
-            stale = j;
-            break;
-        }
-    }
-    job->Id = 0;
-    InsertTailList(&m_BltJobs, &job->Entry);
-    KeReleaseSpinLock(&m_BltJobLock, oldIrql);
-    if (stale)
-    {
-        BltJobFree(stale);
-    }
-}
-
-VioGpuAdapter::BLT_JOB *VioGpuAdapter::BltJobTakeStaged(HANDLE tid)
-{
-    BLT_JOB *found = NULL;
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&m_BltJobLock, &oldIrql);
-    for (LIST_ENTRY *e = m_BltJobs.Flink; e != &m_BltJobs; e = e->Flink)
-    {
-        BLT_JOB *j = CONTAINING_RECORD(e, BLT_JOB, Entry);
-        if (j->Id == 0 && j->Tid == tid)
-        {
-            RemoveEntryList(&j->Entry);
-            found = j;
-            break;
-        }
-    }
-    KeReleaseSpinLock(&m_BltJobLock, oldIrql);
-    return found;
-}
-
-ULONGLONG VioGpuAdapter::BltJobPark(BLT_JOB *job)
-{
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&m_BltJobLock, &oldIrql);
-    job->Id = m_NextBltJobId++;
-    InsertTailList(&m_BltJobs, &job->Entry);
-    KeReleaseSpinLock(&m_BltJobLock, oldIrql);
-    return job->Id;
-}
-
-VioGpuAdapter::BLT_JOB *VioGpuAdapter::BltJobTake(ULONGLONG id)
-{
-    BLT_JOB *found = NULL;
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&m_BltJobLock, &oldIrql);
-    for (LIST_ENTRY *e = m_BltJobs.Flink; e != &m_BltJobs; e = e->Flink)
-    {
-        BLT_JOB *j = CONTAINING_RECORD(e, BLT_JOB, Entry);
-        if (j->Id == id)
-        {
-            RemoveEntryList(&j->Entry);
-            found = j;
-            break;
-        }
-    }
-    KeReleaseSpinLock(&m_BltJobLock, oldIrql);
-    return found;
-}
-
-void VioGpuAdapter::BltJobFree(BLT_JOB *job)
-{
-    if (job->Dst)
-    {
-        job->Dst->Release();
-    }
-    if (job->Process)
-    {
-        ObDereferenceObject(job->Process);
-    }
-    delete job;
 }
 
 // ---- packet-gated presents (see the block comment in viogpu_adapter.h) ----

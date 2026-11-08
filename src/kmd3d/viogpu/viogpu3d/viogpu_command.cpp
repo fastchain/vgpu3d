@@ -417,43 +417,6 @@ void VioGpuCommand::Run()
                     return;
                 }
 
-            case VIOGPU_CMD_CPU_BLT:
-                {
-                    // Asynchronous blt present: copy the staged readback into
-                    // the destination now that the preceding PRESENT_WAIT let
-                    // the packet run (KMD-authored body, VioGpuDevice::Present).
-                    if (!m_KmdAuthored || cmdHdr->size < sizeof(ULONGLONG))
-                    {
-                        DbgPrint(TRACE_LEVEL_ERROR, ("%s fence_id=%d bad CPU_BLT; ignored\n", __FUNCTION__, m_FenceId));
-                        break;
-                    }
-                    ULONGLONG jobId;
-                    RtlCopyMemory(&jobId, cmdBody, sizeof(jobId));
-                    VioGpuAdapter::BLT_JOB *job = m_pAdapter->BltJobTake(jobId);
-                    if (job != NULL)
-                    {
-                        LARGE_INTEGER bf, b0 = KeQueryPerformanceCounter(&bf);
-                        if (!job->Dst->CpuBltFromProcess(job->Process, job->Pixels, job->Pitch, job->Width, job->Height,
-                                                         job->Swizzle != 0, job->Rects, job->RectCount, job->Dx, job->Dy))
-                        {
-                            DbgPrint(TRACE_LEVEL_WARNING, ("%s fence_id=%d CPU_BLT copy failed\n", __FUNCTION__, m_FenceId));
-                        }
-                        {
-                            static LONG s_logged;
-                            LARGE_INTEGER b1 = KeQueryPerformanceCounter(NULL);
-                            if (InterlockedIncrement(&s_logged) <= 20)
-                                DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: CPU_BLT job=%llu %ux%u took %lld us\n", jobId, job->Width,
-                                                               job->Height, (b1.QuadPart - b0.QuadPart) * 1000000 / bf.QuadPart));
-                        }
-                        VioGpuAdapter::BltJobFree(job);
-                    }
-                    else
-                    {
-                        DbgPrint(TRACE_LEVEL_WARNING, ("vgpu: CPU_BLT job=%llu not found\n", jobId));
-                    }
-                    break;
-                }
-
             case VIOGPU_CMD_PRESENT_WAIT:
                 {
                     // Packet-gated flip present: park this packet's DMA

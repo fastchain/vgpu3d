@@ -480,3 +480,30 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   token in-process). Host caps advertise DXIL, so SM 6.x shaders are accepted.
   Results: d3d12test clear/readback (64- and 32-bit) and flip-model present pass; GravityMark D3D12
   22313 (133.6 fps, renders correctly); PassMark DirectX 12: 27.
+
+### Task list round (2026-11-08)
+- Re-measured on the current driver: GravityMark DX11 10369 (62.1 fps, was 6574 before the pipelined
+  present), Superposition OpenGL avg 56.4 fps (DX11 69.8).
+- CPU-only (Microsoft Basic Display / WARP): GravityMark refuses to start ("no Direct3D11/12 devices",
+  no GL 3+ context) and Heaven aborts with out-of-memory, so no CPU-only benchmark numbers exist; Fusion's
+  1.4 fps stays the only one. The rollback also removed the ~27 old vgpu3d driver packages.
+- Superposition DX11 black patches: also with BltPipeline=0, with DXVK descriptor buffer/heap and graphics
+  pipeline libraries off, and with forced compute/UAV barriers -- none of those is the cause. Needs a frame
+  capture.
+- D3D12 hang and GravityMark GL exit: d3d12test 5/5 clean; GravityMark GL exit hung in 3 of 11 runs after
+  the loader-lock fix (not caught with a debugger yet).
+- D3D12 queue gate: a UMD-fired kernel gate (worker thread firing a VIOGPU gate token at the drain value)
+  made the parked GATE packet stall the work it waits for -- 107 gates hit the 1.2 s deadline, GravityMark
+  D3D12 133 -> 17 fps. Reverted to the CPU wait (GravityMark D3D12 20471 / 122.5 fps).
+- Kernel-side async blt present removed (UMD ring, BLT_ASYNC/BLT_READY escapes, CPU_BLT, BLT_JOB); the
+  numbers stay reserved in the ABI.  VsyncHz experiment knob removed.
+- Direct3D 9: works with no driver code -- Windows routes D3D9 to D3D9On12 on our D3D12 driver (no D3D9
+  UMD).  d3d9test 64/32-bit passes (clear/readback/present); PassMark DirectX 9: 37.
+- OpenCL: blocked.  Microsoft's Compatibility Pack (OpenCLOn12) registers Dozen as a Vulkan driver; Vulkan
+  loader -> Dozen -> D3D12 -> our UMD -> DXVK/vkd3d -> Vulkan loader -> Dozen deadlocks every Vulkan app
+  (VK_LOADER_DRIVERS_DISABLE did not stop it).  The pack was removed again.  A native route would be
+  Mesa rusticl on Zink (Rust/LLVM/libclc cross toolchain).
+- Fullscreen Heaven: fullscreen blttest drawing triangles (also through an sRGB RTV) works, and Heaven
+  windowed at 5120x2160 works -- so not linear primaries, sRGB views or memory size.  Next: the Vulkan
+  validation layer in the guest.
+- The KMD now logs pid and first word of short escapes ("buffer too small") to name the sender.

@@ -619,32 +619,6 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     void PresentWaitSweep(void);
     LIST_ENTRY m_PresentWaitList; // guarded by m_PresentTokenLock
 
-    // vgpu: asynchronous blt presents (VIOGPU_BLT_ASYNC / VIOGPU_CMD_CPU_BLT).
-    // The escape stages a job for the calling thread; the blt Present on that
-    // thread takes it, parks it under an id and emits PRESENT_WAIT + CPU_BLT;
-    // VioGpuCommand::Run takes it by id and copies once the GPU is done.
-    struct BLT_JOB
-    {
-        LIST_ENTRY Entry;
-        ULONGLONG Id;          // 0 while staged (keyed by Tid)
-        HANDLE Tid;
-        ULONGLONG Token;       // retired by VIOGPU_BLT_READY when the readback is done
-        PEPROCESS Process;     // referenced; the pixels live in its address space
-        const BYTE *Pixels;    // user VA of the frame origin
-        ULONG Pitch, Width, Height, Swizzle;
-        VioGpuAllocation *Dst; // referenced once parked
-        INT Dx, Dy;            // dst (x, y) reads src (x + Dx, y + Dy)
-        UINT RectCount;
-        RECT Rects[8];         // dst sub-rects (bounding box when more)
-    };
-    void BltJobStage(BLT_JOB *job);               // replaces a stale staged job of the thread
-    BLT_JOB *BltJobTakeStaged(HANDLE tid);
-    ULONGLONG BltJobPark(BLT_JOB *job);           // returns the id for the CPU_BLT body
-    BLT_JOB *BltJobTake(ULONGLONG id);
-    static void BltJobFree(BLT_JOB *job);
-    LIST_ENTRY m_BltJobs;   // staged and parked jobs, guarded by m_BltJobLock
-    KSPIN_LOCK m_BltJobLock;
-    ULONGLONG m_NextBltJobId = 1;
 
     // Per-escape completion context, carried through SubmitCommand to
     // PresentFenceCb.  Allocated from a nonpaged lookaside list: fixed-size,
