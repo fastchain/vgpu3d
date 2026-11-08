@@ -646,3 +646,20 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   default.
 - Real fix: device-local (not host-visible) buffers in clvk with staging copies for map/read/write/
   fill/copy-host-ptr -- a larger change to clvk's buffer paths, not done yet.
+
+### clvk: device-local buffers (2026-11-08)
+- clvk now gives API buffers a device-local twin that every GPU use binds, while host commands keep
+  using the host-visible memory; cvk_command::execute syncs the two around each command (GPU commands
+  upload host-newer buffers and leave the device copy newer; host commands download device-newer buffers
+  and leave the host copy newer when they write). Internal buffers and USE_HOST_PTR buffers are not
+  mirrored. Config buffer_device_mirror (CLVK_BUFFER_DEVICE_MIRROR=0 restores the old behaviour).
+- NVIDIA compute units come from an SM-count table by marketing name (VK_NV_shader_sm_builtins does not
+  reach the guest; Venus embeds the host GPU name), fallback 32; CLVK_MAX_COMPUTE_UNITS overrides.
+- clpeak, RTX 4090: global memory 10-12 -> ~590-690 GB/s, fp32 3.7 -> 62-68 TFLOPS, fp16 up to 67 TFLOPS,
+  int 1.9 -> 22-24 TIOPS. Host transfers stay at 12-16 GB/s (system memory).
+- cltest now also checks WriteBuffer, map read/write, FillBuffer, CopyBuffer between kernels and kernels
+  on sub-buffers; all pass with and without the mirror.
+- Known costs: host access syncs whole buffers (a small ReadBuffer of a huge buffer downloads all of it;
+  CopyBuffer between mirrored buffers goes through the host). Event profiling is still unavailable
+  (clvk needs CLOCK_MONOTONIC calibrated timestamps; a QueryPerformanceCounter variant made clpeak's
+  device-timed bandwidth inconsistent and was reverted).

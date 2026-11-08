@@ -17,6 +17,8 @@ typedef void *cl_platform_id, *cl_device_id, *cl_context, *cl_command_queue, *cl
 #define CL_DEVICE_NAME 0x102B
 #define CL_MEM_READ_WRITE 1
 #define CL_MEM_COPY_HOST_PTR (1 << 5)
+#define CL_MAP_READ 1
+#define CL_MAP_WRITE 2
 
 #define FN(r, n, a) typedef r(__stdcall *P_##n) a; static P_##n p_##n;
 FN(cl_int, clGetPlatformIDs, (cl_uint, cl_platform_id *, cl_uint *))
@@ -33,6 +35,12 @@ FN(cl_int, clSetKernelArg, (cl_kernel, cl_uint, size_t, const void *))
 FN(cl_int, clEnqueueNDRangeKernel, (cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, void *, void *))
 FN(cl_int, clEnqueueReadBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, void *, cl_uint, void *, void *))
 FN(cl_int, clFinish, (cl_command_queue))
+FN(cl_int, clEnqueueWriteBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void *, cl_uint, void *, void *))
+FN(void *, clEnqueueMapBuffer, (cl_command_queue, cl_mem, cl_uint, unsigned long long, size_t, size_t, cl_uint, void *, void *, cl_int *))
+FN(cl_int, clEnqueueUnmapMemObject, (cl_command_queue, cl_mem, void *, cl_uint, void *, void *))
+FN(cl_int, clEnqueueFillBuffer, (cl_command_queue, cl_mem, const void *, size_t, size_t, size_t, cl_uint, void *, void *))
+FN(cl_int, clEnqueueCopyBuffer, (cl_command_queue, cl_mem, cl_mem, size_t, size_t, size_t, cl_uint, void *, void *))
+FN(cl_mem, clCreateSubBuffer, (cl_mem, unsigned long long, cl_uint, const void *, cl_int *))
 
 int main(int argc, char **argv)
 {
@@ -47,6 +55,8 @@ int main(int argc, char **argv)
     L(clGetPlatformIDs); L(clGetPlatformInfo); L(clGetDeviceIDs); L(clGetDeviceInfo); L(clCreateContext);
     L(clCreateCommandQueue); L(clCreateBuffer); L(clCreateProgramWithSource); L(clBuildProgram); L(clCreateKernel);
     L(clSetKernelArg); L(clEnqueueNDRangeKernel); L(clEnqueueReadBuffer); L(clFinish);
+    L(clEnqueueWriteBuffer); L(clEnqueueMapBuffer); L(clEnqueueUnmapMemObject); L(clEnqueueFillBuffer);
+    L(clEnqueueCopyBuffer); L(clCreateSubBuffer);
     cl_platform_id plats[8];
     cl_uint np = 0;
     cl_int err = p_clGetPlatformIDs(8, plats, &np);
@@ -103,5 +113,64 @@ int main(int argc, char **argv)
     for (int i = 0; i < N; i++)
         if (c[i] != 3.0f * i) { bad++; }
     printf("[%s] vector add of %d floats: %d mismatches (enqueue err %d)\n", bad ? "FAIL" : "PASS", N, bad, err);
-    return bad ? 1 : 0;
+    int fails = bad != 0;
+
+    /* host <-> device consistency paths (device-local buffer mirrors keep two copies in sync) */
+#define CHECK_C(name, expr)                                                                  \
+    do {                                                                                     \
+        p_clEnqueueReadBuffer(q, mc, 1, 0, sizeof c, c, 0, NULL, NULL);                      \
+        int nbad = 0;                                                                        \
+        for (int i = 0; i < N; i++)                                                          \
+            if (c[i] != (expr)) nbad++;                                                      \
+        printf("[%s] %s: %d mismatches\n", nbad ? "FAIL" : "PASS", name, nbad);             \
+        fails += nbad != 0;                                                                  \
+    } while (0)
+    /* 1: rewrite an input with WriteBuffer, run again */
+    for (int i = 0; i < N; i++) b[i] = 5.0f;
+    p_clEnqueueWriteBuffer(q, mb, 1, 0, sizeof b, b, 0, NULL, NULL);
+    p_clEnqueueNDRangeKernel(q, k, 1, NULL, &gs, NULL, 0, NULL, NULL);
+    CHECK_C("WriteBuffer -> kernel -> ReadBuffer", (float)i + 5.0f);
+    /* 2: modify an input through a map */
+    cl_int merr;
+    float *pa = (float *)p_clEnqueueMapBuffer(q, ma, 1, CL_MAP_READ | CL_MAP_WRITE, 0, sizeof a, 0, NULL, NULL, &merr);
+    if (pa) {
+        int mbad = 0;
+        for (int i = 0; i < N; i++) { if (pa[i] != (float)i) mbad++; pa[i] = 2.0f; }
+        p_clEnqueueUnmapMemObject(q, ma, pa, 0, NULL, NULL);
+        printf("[%s] MapBuffer read of an input: %d mismatches\n", mbad ? "FAIL" : "PASS", mbad);
+        fails += mbad != 0;
+    } else {
+        printf("[FAIL] clEnqueueMapBuffer %d\n", merr); fails++;
+    }
+    p_clEnqueueNDRangeKernel(q, k, 1, NULL, &gs, NULL, 0, NULL, NULL);
+    CHECK_C("Map write -> kernel", 7.0f);
+    /* 3: fill an input */
+    float one = 1.0f;
+    p_clEnqueueFillBuffer(q, ma, &one, sizeof one, 0, sizeof a, 0, NULL, NULL);
+    p_clEnqueueNDRangeKernel(q, k, 1, NULL, &gs, NULL, 0, NULL, NULL);
+    CHECK_C("FillBuffer -> kernel", 6.0f);
+    /* 4: kernel output copied into an input, chained kernel */
+    p_clEnqueueCopyBuffer(q, mc, ma, 0, 0, sizeof a, 0, NULL, NULL); /* a = 6 */
+    p_clEnqueueNDRangeKernel(q, k, 1, NULL, &gs, NULL, 0, NULL, NULL);
+    CHECK_C("kernel -> CopyBuffer -> kernel", 11.0f);
+    /* 5: kernel on sub-buffers (second half of each buffer) */
+    struct { size_t origin, size; } half = { sizeof a / 2, sizeof a / 2 };
+    cl_mem sa = p_clCreateSubBuffer(ma, CL_MEM_READ_WRITE, 0x1220 /* CL_BUFFER_CREATE_TYPE_REGION */, &half, &merr);
+    cl_mem sb = p_clCreateSubBuffer(mb, CL_MEM_READ_WRITE, 0x1220, &half, &merr);
+    cl_mem sc = p_clCreateSubBuffer(mc, CL_MEM_READ_WRITE, 0x1220, &half, &merr);
+    if (sa && sb && sc) {
+        p_clSetKernelArg(k, 0, sizeof sa, &sa);
+        p_clSetKernelArg(k, 1, sizeof sb, &sb);
+        p_clSetKernelArg(k, 2, sizeof sc, &sc);
+        size_t hs = N / 2;
+        for (int i = 0; i < N; i++) b[i] = 100.0f;
+        p_clEnqueueWriteBuffer(q, mb, 1, 0, sizeof b, b, 0, NULL, NULL);
+        p_clEnqueueNDRangeKernel(q, k, 1, NULL, &hs, NULL, 0, NULL, NULL);
+        CHECK_C("sub-buffer kernel (second half only)", i < N / 2 ? 11.0f : 106.0f);
+    } else {
+        printf("[FAIL] clCreateSubBuffer %d\n", merr); fails++;
+    }
+    p_clFinish(q);
+    printf("[%s] consistency checks\n", fails ? "FAIL" : "PASS");
+    return fails ? 1 : 0;
 }

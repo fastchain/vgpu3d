@@ -1,8 +1,21 @@
+diff --git a/src/api.cpp b/src/api.cpp
+index 755c4f6..97863d0 100644
+--- a/src/api.cpp
++++ b/src/api.cpp
+@@ -1872,6 +1872,8 @@ static cl_mem CLVK_API_CALL cvk_create_buffer_with_properties(
+     if (*errcode_ret != CL_SUCCESS) {
+         return nullptr;
+     } else {
++        // vgpu: kernels use a device-local twin when one can be made
++        buffer->enable_device_mirror();
+         return buffer.release();
+     }
+ }
 diff --git a/src/config.def b/src/config.def
-index a1665b3..ae24566 100644
+index a1665b3..4433edf 100644
 --- a/src/config.def
 +++ b/src/config.def
-@@ -132,6 +132,13 @@ OPTION(uint32_t, percentage_of_available_memory_reported, 100u)
+@@ -132,6 +132,17 @@ OPTION(uint32_t, percentage_of_available_memory_reported, 100u)
  // Specify the maximum allowed memory allocation size in megabytes.
  OPTION(uint32_t, max_mem_alloc_size_mb, 1024u)
  
@@ -12,6 +25,10 @@ index a1665b3..ae24566 100644
 +// Windows (vgpu) the BAR type is hidden, and unhiding it (VN_VGPU_ALLOW_UNCACHED=1) made the
 +// first kernel never complete.
 +OPTION(bool, buffer_prefer_device_local, false)
++
++// Give API buffers a device-local twin that kernels use, kept in sync with the host-visible
++// memory by copies at command execution (see cvk_buffer::enable_device_mirror).
++OPTION(bool, buffer_device_mirror, true)
 +
  
  ////////////////////////////////////////////////////////////
@@ -45,6 +62,436 @@ index b388761..529617d 100644
          ret.memory_coherent = memory_index_is_coherent(ret.memory_type_index);
  
          return ret;
+diff --git a/src/device_properties.cpp b/src/device_properties.cpp
+index ad1e1b1..f470e10 100644
+--- a/src/device_properties.cpp
++++ b/src/device_properties.cpp
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ #include <cstring>
++#include <string>
+ 
+ #include "config.hpp"
+ #include "device_properties.hpp"
+@@ -231,8 +232,54 @@ static bool isllvmpipeDevice(const uint32_t vendorID) {
+     return vendorID == 0x10005;
+ }
+ 
++// SM counts of recent NVIDIA GPUs by marketing name (more specific names first). Vulkan has no
++// portable SM count and VK_NV_shader_sm_builtins does not reach the guest through Venus, so the
++// name -- which Venus embeds as "Virtio-GPU Venus (NVIDIA GeForce RTX 4090)" -- is used.
++static uint32_t nvidia_sm_count(const char* name) {
++    static const struct {
++        const char* model;
++        uint32_t sms;
++    } table[] = {
++        {"RTX 5090", 170},       {"RTX 5080", 84},        {"RTX 5070 Ti", 70},
++        {"RTX 5070", 48},        {"RTX 5060 Ti", 36},     {"RTX 5060", 30},
++        {"RTX 4090", 128},       {"RTX 4080 SUPER", 80},  {"RTX 4080", 76},
++        {"RTX 4070 Ti SUPER", 66}, {"RTX 4070 Ti", 60},   {"RTX 4070 SUPER", 56},
++        {"RTX 4070", 46},        {"RTX 4060 Ti", 34},     {"RTX 4060", 24},
++        {"RTX 3090 Ti", 84},     {"RTX 3090", 82},        {"RTX 3080 Ti", 80},
++        {"RTX 3080", 68},        {"RTX 3070 Ti", 48},     {"RTX 3070", 46},
++        {"RTX 3060 Ti", 38},     {"RTX 3060", 28},        {"RTX 3050", 20},
++        {"RTX 2080 Ti", 68},     {"RTX 2080 SUPER", 48},  {"RTX 2080", 46},
++        {"RTX 2070 SUPER", 40},  {"RTX 2070", 36},        {"RTX 2060 SUPER", 34},
++        {"RTX 2060", 30},
++    };
++    std::string upper(name);
++    for (auto& c : upper) {
++        c = toupper(static_cast<unsigned char>(c));
++    }
++    for (auto& entry : table) {
++        std::string model(entry.model);
++        for (auto& c : model) {
++            c = toupper(static_cast<unsigned char>(c));
++        }
++        auto pos = upper.find(model);
++        // "RTX 4070" must not match "RTX 4070 Ti": the next character ends the model name
++        if (pos != std::string::npos) {
++            char next = upper[pos + model.size()];
++            if (next == '\0' || next == ')' ||
++                (next == ' ' && upper.compare(pos + model.size(), 3, " TI") != 0 &&
++                 upper.compare(pos + model.size(), 6, " SUPER") != 0)) {
++                return entry.sms;
++            }
++        }
++    }
++    return 32; // unknown discrete NVIDIA GPU: closer than 1 for work sizing
++}
++
+ struct cvk_device_properties_nvidia : public cvk_device_properties_virtual {
++    cvk_device_properties_nvidia(const char* name)
++        : m_compute_units(nvidia_sm_count(name)) {}
+     std::string vendor() const override final { return "NVIDIA Corporation"; }
++    uint32_t max_compute_units() const override final { return m_compute_units; }
+     std::set<std::string> clspv_native_builtins() const override final {
+         return std::set<std::string>({
+             "acos",        "acosh",    "acospi",      "asin",
+@@ -252,6 +299,9 @@ struct cvk_device_properties_nvidia : public cvk_device_properties_virtual {
+         return "-hack-clamp-width -hack-convert-to-float "
+                "-hack-fmul-flush-to-zero=32";
+     }
++
++private:
++    const uint32_t m_compute_units;
+ };
+ 
+ static bool isNVIDIADevice(const uint32_t vendorID) {
+@@ -317,7 +367,7 @@ std::unique_ptr<cvk_device_properties> create_cvk_device_properties(
+     } else if (isSwiftShaderDevice(name, vendorID, deviceID)) {
+         RETURN(cvk_device_properties_swiftshader);
+     } else if (isNVIDIADevice(vendorID)) {
+-        RETURN(cvk_device_properties_nvidia);
++        RETURN(cvk_device_properties_nvidia, name);
+     } else if (isllvmpipeDevice(vendorID)) {
+         RETURN(cvk_device_properties_llvmpipe);
+     } else if (isPowerVRDevice(name, vendorID)) {
+diff --git a/src/memory.cpp b/src/memory.cpp
+index 6f32abe..3a6fe5b 100644
+--- a/src/memory.cpp
++++ b/src/memory.cpp
+@@ -151,6 +151,119 @@ bool cvk_buffer::init() {
+     return true;
+ }
+ 
++bool cvk_buffer::enable_device_mirror() {
++    if (!config.buffer_device_mirror() || m_parent != nullptr ||
++        has_flags(CL_MEM_USE_HOST_PTR)) {
++        return false;
++    }
++    auto device = m_context->device();
++    auto vkdev = device->vulkan_device();
++    const VkBufferCreateInfo createInfo = {
++        VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, m_size,
++        prepare_usage_flags(), VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
++    VkBuffer buffer;
++    if (vkCreateBuffer(vkdev, &createInfo, nullptr, &buffer) != VK_SUCCESS) {
++        return false;
++    }
++    VkMemoryRequirements memreqs;
++    vkGetBufferMemoryRequirements(vkdev, buffer, &memreqs);
++    // typed: an int flags expression would bind the (count, list) overload
++    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
++    const VkMemoryPropertyFlags avoid = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++    uint32_t type = device->memory_type_index_for_resource(
++        memreqs.memoryTypeBits, required, avoid);
++    if (type == VK_MAX_MEMORY_TYPES) {
++        vkDestroyBuffer(vkdev, buffer, nullptr);
++        return false;
++    }
++    auto memory = std::make_unique<cvk_memory_allocation>(
++        vkdev, memreqs.size, type, true, false);
++    if (memory->allocate(device->uses_physical_addressing()) != VK_SUCCESS ||
++        vkBindBufferMemory(vkdev, buffer, memory->vulkan_memory(), 0) !=
++            VK_SUCCESS) {
++        vkDestroyBuffer(vkdev, buffer, nullptr);
++        return false;
++    }
++    m_mirror_buffer = buffer;
++    m_mirror_memory = std::move(memory);
++    m_mirror_state = has_flags(CL_MEM_COPY_HOST_PTR) ? mirror_state::host_newer
++                                                     : mirror_state::in_sync;
++    cvk_debug_fn("buffer %p: device mirror of %zu bytes (memory type %u)", this,
++                 m_size, type);
++    return true;
++}
++
++bool cvk_buffer::mirror_copy(cvk_command_queue* queue, bool to_device) {
++    cvk_command_buffer cmd(queue);
++    if (!cmd.begin()) {
++        return false;
++    }
++    {
++        cvk_command_pool_lock_holder lock(queue);
++        const VkMemoryBarrier before = {
++            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
++            VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
++            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
++        vkCmdPipelineBarrier(cmd,
++                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
++                                 VK_PIPELINE_STAGE_HOST_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0,
++                             nullptr, 0, nullptr);
++        const VkBufferCopy region = {0, 0, m_size};
++        vkCmdCopyBuffer(cmd, to_device ? m_buffer : m_mirror_buffer,
++                        to_device ? m_mirror_buffer : m_buffer, 1, &region);
++        const VkMemoryBarrier after = {
++            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
++            VK_ACCESS_TRANSFER_WRITE_BIT,
++            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
++                VK_ACCESS_HOST_READ_BIT};
++        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
++                                 VK_PIPELINE_STAGE_HOST_BIT,
++                             0, 1, &after, 0, nullptr, 0, nullptr);
++        if (!cmd.end()) {
++            return false;
++        }
++    }
++    return cmd.submit_and_wait();
++}
++
++bool cvk_buffer::sync_mirror_to_device(cvk_command_queue* queue) {
++    std::lock_guard<std::mutex> lock(m_mirror_lock);
++    if (m_mirror_state != mirror_state::host_newer) {
++        return true;
++    }
++    m_memory->flush(0, m_size);
++    if (!mirror_copy(queue, true)) {
++        return false;
++    }
++    m_mirror_state = mirror_state::in_sync;
++    return true;
++}
++
++bool cvk_buffer::sync_mirror_to_host(cvk_command_queue* queue) {
++    std::lock_guard<std::mutex> lock(m_mirror_lock);
++    if (m_mirror_state != mirror_state::device_newer) {
++        return true;
++    }
++    if (!mirror_copy(queue, false)) {
++        return false;
++    }
++    m_memory->invalidate(0, m_size);
++    m_mirror_state = mirror_state::in_sync;
++    return true;
++}
++
++void cvk_buffer::mark_mirror_host_written() {
++    std::lock_guard<std::mutex> lock(m_mirror_lock);
++    m_mirror_state = mirror_state::host_newer;
++}
++
++void cvk_buffer::mark_mirror_device_written() {
++    std::lock_guard<std::mutex> lock(m_mirror_lock);
++    m_mirror_state = mirror_state::device_newer;
++}
++
+ cvk_mem* cvk_buffer::create_subbuffer(cl_mem_flags flags, size_t origin,
+                                       size_t size) {
+     std::vector<cl_mem_properties> properties;
+diff --git a/src/memory.hpp b/src/memory.hpp
+index d60f587..f6dfa31 100644
+--- a/src/memory.hpp
++++ b/src/memory.hpp
+@@ -372,6 +372,7 @@ struct cvk_buffer : public cvk_mem {
+ 
+     virtual ~cvk_buffer() {
+         auto vkdev = m_context->device()->vulkan_device();
++        vkDestroyBuffer(vkdev, m_mirror_buffer, nullptr);
+         vkDestroyBuffer(vkdev, m_buffer, nullptr);
+     }
+ 
+@@ -403,9 +404,27 @@ struct cvk_buffer : public cvk_mem {
+         return usage_flags;
+     }
+ 
++    // Device mirror (vgpu): API buffers can get a device-local twin that every GPU use binds,
++    // while host commands keep working on the host-visible memory; the queue keeps the two in
++    // sync at command execution (cvk_command::execute).  Under Venus the host-visible memory is
++    // guest system RAM, which kernels would otherwise read over PCIe.
++    bool enable_device_mirror();
++    bool sync_mirror_to_device(cvk_command_queue* queue);
++    bool sync_mirror_to_host(cvk_command_queue* queue);
++    void mark_mirror_host_written();
++    void mark_mirror_device_written();
++    cvk_buffer* mirror_root() {
++        if (m_parent == nullptr) {
++            return this;
++        }
++        cvk_mem* parent = m_parent;
++        return static_cast<cvk_buffer*>(parent);
++    }
++    bool has_device_mirror() const { return m_mirror_buffer != VK_NULL_HANDLE; }
++
+     VkBuffer vulkan_buffer() const {
+         if (m_parent == nullptr) {
+-            return m_buffer;
++            return m_mirror_buffer != VK_NULL_HANDLE ? m_mirror_buffer : m_buffer;
+         } else {
+             const cvk_mem *parent = m_parent;
+             return static_cast<const cvk_buffer*>(parent)->vulkan_buffer();
+@@ -497,10 +516,22 @@ struct cvk_buffer : public cvk_mem {
+ 
+ private:
+     bool init();
++    bool mirror_copy(cvk_command_queue* queue, bool to_device);
+ 
+     VkBuffer m_buffer;
+     std::unordered_map<void*, cvk_buffer_mapping> m_mappings;
+     std::mutex m_mappings_lock;
++
++    enum class mirror_state
++    {
++        in_sync,
++        host_newer,
++        device_newer,
++    };
++    VkBuffer m_mirror_buffer = VK_NULL_HANDLE;
++    std::unique_ptr<cvk_memory_allocation> m_mirror_memory;
++    mirror_state m_mirror_state = mirror_state::in_sync;
++    std::mutex m_mirror_lock;
+ };
+ 
+ using cvk_buffer_holder = refcounted_holder<cvk_buffer>;
+diff --git a/src/queue.cpp b/src/queue.cpp
+index f2416ef..21319d8 100644
+--- a/src/queue.cpp
++++ b/src/queue.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ // Copyright 2018 The clvk authors.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+@@ -571,6 +572,77 @@ void cvk_command_pool::free_command_buffer(VkCommandBuffer buf) {
+     vkFreeCommandBuffers(m_device->vulkan_device(), m_command_pool, 1, &buf);
+ }
+ 
++bool cvk_command::sync_buffer_mirrors(bool before) {
++    std::vector<cvk_buffer*> buffers;
++    const auto mems = memory_objects();
++    for (size_t i = 0; i < mems.size(); i++) {
++        cvk_mem* mem = mems[i];
++        if (mem != nullptr && mem->is_image_type()) {
++            // a CL_MEM_OBJECT_IMAGE1D_BUFFER reads and writes its buffer
++            mem = static_cast<cvk_image*>(mem)->buffer();
++        }
++        if (mem == nullptr || !mem->is_buffer_type()) {
++            continue;
++        }
++        auto* root = static_cast<cvk_buffer*>(mem)->mirror_root();
++        if (!root->has_device_mirror()) {
++            continue;
++        }
++        // copies read their first object and write the last one
++        if (!before && !is_gpu_command() &&
++            (m_type == CL_COMMAND_COPY_BUFFER ||
++             m_type == CL_COMMAND_COPY_BUFFER_RECT) &&
++            i + 1 < mems.size()) {
++            continue;
++        }
++        if (std::find(buffers.begin(), buffers.end(), root) == buffers.end()) {
++            buffers.push_back(root);
++        }
++    }
++    if (buffers.empty()) {
++        return true;
++    }
++
++    if (is_gpu_command()) {
++        for (auto* buffer : buffers) {
++            if (before) {
++                if (!buffer->sync_mirror_to_device(m_queue)) {
++                    return false;
++                }
++            } else {
++                buffer->mark_mirror_device_written();
++            }
++        }
++        return true;
++    }
++
++    bool host_writes = false;
++    switch (m_type) {
++    case CL_COMMAND_WRITE_BUFFER:
++    case CL_COMMAND_WRITE_BUFFER_RECT:
++    case CL_COMMAND_FILL_BUFFER:
++    case CL_COMMAND_COPY_BUFFER:
++    case CL_COMMAND_COPY_BUFFER_RECT:
++    case CL_COMMAND_UNMAP_MEM_OBJECT:
++    case CL_COMMAND_WRITE_IMAGE:
++    case CL_COMMAND_FILL_IMAGE:
++        host_writes = true;
++        break;
++    default:
++        break;
++    }
++    for (auto* buffer : buffers) {
++        if (before) {
++            if (!buffer->sync_mirror_to_host(m_queue)) {
++                return false;
++            }
++        } else if (host_writes) {
++            buffer->mark_mirror_host_written();
++        }
++    }
++    return true;
++}
++
+ bool cvk_command_buffer::begin() {
+ #ifdef CLVK_UNIT_TESTING_ENABLED
+     if (config.force_cvk_command_buffer_begin_error()) {
+diff --git a/src/queue.hpp b/src/queue.hpp
+index b28d269..d56d8cf 100644
+--- a/src/queue.hpp
++++ b/src/queue.hpp
+@@ -454,7 +454,14 @@ struct cvk_command {
+             set_event_status(CL_RUNNING);
+             TRACE_BEGIN_CMD(m_type, "queue", (uintptr_t) & (*m_queue),
+                             "command", (uintptr_t)this);
+-            status = do_action();
++            if (!sync_buffer_mirrors(true)) {
++                status = CL_OUT_OF_RESOURCES;
++            } else {
++                status = do_action();
++                if (status == CL_COMPLETE) {
++                    sync_buffer_mirrors(false);
++                }
++            }
+             TRACE_END();
+         }
+ 
+@@ -485,10 +492,16 @@ struct cvk_command {
+         return false;
+     }
+ 
+-    virtual const std::vector<cvk_mem*> memory_objects() const {
+-        CVK_ASSERT(false && "Should never be called");
+-        return {};
+-    }
++    // vgpu: an empty default (no assert): cvk_command::sync_buffer_mirrors asks every command
++    virtual const std::vector<cvk_mem*> memory_objects() const { return {}; }
++
++    // Commands executed on the GPU (batchable commands and batches) as opposed to host commands.
++    virtual bool is_gpu_command() const { return false; }
++
++    // Keep device-mirrored buffers (cvk_buffer::enable_device_mirror) coherent: GPU commands
++    // upload host-newer buffers before and leave the device copy newer after; host commands
++    // download device-newer buffers before and leave the host copy newer after writing.
++    CHECK_RETURN bool sync_buffer_mirrors(bool before);
+ 
+     virtual void set_event_status(cl_int status) {
+         m_event->set_status(status);
+@@ -701,6 +714,8 @@ private:
+ };
+ 
+ struct cvk_command_batchable : public cvk_command {
++    bool is_gpu_command() const override { return true; }
++
+     cvk_command_batchable(cl_command_type type, cvk_command_queue* queue)
+         : cvk_command(type, queue), m_query_pool(VK_NULL_HANDLE) {}
+ 
+@@ -931,6 +946,18 @@ struct cvk_command_batch : public cvk_command {
+         }
+     }
+ 
++    bool is_gpu_command() const override final { return true; }
++
++    const std::vector<cvk_mem*> memory_objects() const override final {
++        std::vector<cvk_mem*> ret;
++        for (auto& cmd : m_commands) {
++            for (auto* mem : cmd->memory_objects()) {
++                ret.push_back(mem);
++            }
++        }
++        return ret;
++    }
++
+ private:
+     CHECK_RETURN cl_int do_action() override final;
+ 
 diff --git a/src/utils.cpp b/src/utils.cpp
 index e4787e2..e595cfe 100644
 --- a/src/utils.cpp
