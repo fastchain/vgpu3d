@@ -630,8 +630,7 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   BltPipeline). DXVK's NVIDIA-keyed workarounds are off under Venus's driver ID, but the host driver
   (615.78) is past their version limits except renderPassResolveFormatBug (MSAA only).
 - Launch-time console commands (render_ssao/ssgi/shadows 0) are overridden by the preset, so per-effect
-  bisection needs another route. Next: a RenderDoc capture of one frame to find the pass or texture
-  that comes out zero.
+  bisection needs another route. RenderDoc follow-up below.
 
 ### clvk memory bandwidth (2026-11-08)
 - Why clpeak sees 10-12 GB/s: clvk allocates every buffer from a host-visible memory type and prefers
@@ -663,3 +662,29 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   CopyBuffer between mirrored buffers goes through the host). Event profiling is still unavailable
   (clvk needs CLOCK_MONOTONIC calibrated timestamps; a QueryPerformanceCounter variant made clpeak's
   device-timed bandwidth inconsistent and was reverted).
+
+### Superposition D3D11 black patches: RenderDoc and DXVK tracing (2026-11-08)
+- A RenderDoc capture replayed on vgpu and on WARP gives the same lighting render targets (diff ~0), and
+  the live frame matches the replay. So the app's own commands, run on the captured state, produce the
+  dark frame: no per-frame shader or translation bug in DXVK/Venus.
+- Checked app → GPU channels, none wrong:
+  - Every DEFAULT/IMMUTABLE texture created with initial data reads back identical (DXVK
+    `VGPU_VERIFY_INIT=1`, 512+ textures).
+  - The app never maps anything for reading. Its only queries are event and pipeline-statistics (no
+    occlusion). It never calls CheckFormatSupport, and no texture creation fails.
+  - The black 64x64 RGBA16F probe cubes (and the 4x4 ones) are created from all-zero app data and
+    never written afterwards: placeholders, not lost uploads.
+  - State carried across frames (previous HDR colour, AO, normals, GI history, exposure) is sane at
+    frame start, with no NaN/Inf. No UAV buffers exist.
+  - The zero 4x4 depth cube is fine: Unigine uses reversed-Z and clears to 0.
+- Not the vendor path: `dxgi.customVendorId=1002` / `hideNvidiaGpu` ("Renderer: Unknown") still shows the
+  patches.
+- src/umd/readbacktest passes for render→staging copies of cube/2D mip chains (fmt 10/28/2), polled
+  readback (event query, Map DO_NOT_WAIT) and depth cube clears.
+- Still open. What's left is the app choosing a different light/probe setup under D3D11 than under GL.
+  Without a native-Windows reference it is unclear whether the scene is wrong at all; the GL path could be
+  the one that differs. DXVK diagnostics stay in the tree (off by default):
+  - `VGPU_TRACE_MAP=1` logs Map READ, cube creation, cube copies/updates/depth clears, query result
+    summaries, CheckFormatSupport answers and rejected texture descriptions.
+  - `VGPU_VERIFY_INIT=1` checks initial uploads.
+  - Both log through the DXVK logger, so set `DXVK_LOG_LEVEL=warn` and `DXVK_LOG_PATH`.

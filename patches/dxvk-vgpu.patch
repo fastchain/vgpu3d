@@ -22,6 +22,365 @@ index d406ba0b..23249cc9 100644
  EXPORTS  
      D3D11CoreCreateDevice @18
      D3D11CreateDevice @22
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index 487bcf58..50fe257f 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -6,6 +6,35 @@
+ 
+ namespace dxvk {
+ 
++  // vgpu: VGPU_TRACE_MAP=1 logs copies and updates whose destination is a cube texture
++  static void VgpuTraceCubeWrite(const char* op, ID3D11Resource* pDst, UINT DstSub, ID3D11Resource* pSrc,
++                                 UINT SrcSub, const void* pData, UINT RowPitch) {
++    static const bool s_trace = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++    if (likely(!s_trace) || !pDst)
++      return;
++    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++    pDst->GetType(&dim);
++    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
++      return;
++    auto d = GetCommonTexture(pDst)->Desc();
++    if (!(d->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
++      return;
++    char msg[320];
++    if (pSrc) {
++      D3D11_RESOURCE_DIMENSION sdim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++      pSrc->GetType(&sdim);
++      const D3D11_COMMON_TEXTURE_DESC* sd = sdim != D3D11_RESOURCE_DIMENSION_BUFFER ? GetCommonTexture(pSrc)->Desc() : nullptr;
++      snprintf(msg, sizeof(msg), "vgpu-cubew %s dst %p %ux%u fmt %u sub %u <- src %p dim %u %ux%u fmt %u usage %u misc 0x%x sub %u",
++        op, pDst, d->Width, d->Height, d->Format, DstSub, pSrc, sdim, sd ? sd->Width : 0, sd ? sd->Height : 0,
++        sd ? sd->Format : 0, sd ? sd->Usage : 0, sd ? sd->MiscFlags : 0, SrcSub);
++    } else {
++      const uint32_t* w = reinterpret_cast<const uint32_t*>(pData);
++      snprintf(msg, sizeof(msg), "vgpu-cubew %s dst %p %ux%u fmt %u sub %u <- data %p pitch %u first %08x %08x",
++        op, pDst, d->Width, d->Height, d->Format, DstSub, pData, RowPitch, w ? w[0] : 0, w ? w[1] : 0);
++    }
++    Logger::warn(msg);
++  }
++
+   template<typename ContextType>
+   D3D11CommonContext<ContextType>::D3D11CommonContext(
+           D3D11Device*            pParent,
+@@ -279,6 +308,7 @@ namespace dxvk {
+           UINT                              SrcSubresource,
+     const D3D11_BOX*                        pSrcBox,
+           UINT                              CopyFlags) {
++    VgpuTraceCubeWrite("CopySubresourceRegion", pDstResource, DstSubresource, pSrcResource, SrcSubresource, nullptr, 0);
+     D3D10DeviceLock lock = LockContext();
+ 
+     if (!pDstResource || !pSrcResource)
+@@ -355,6 +385,7 @@ namespace dxvk {
+ 
+     if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
+       return;
++    VgpuTraceCubeWrite("CopyResource", pDstResource, 0, pSrcResource, 0, nullptr, 0);
+ 
+     D3D11_RESOURCE_DIMENSION dstResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+     D3D11_RESOURCE_DIMENSION srcResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+@@ -677,6 +708,28 @@ namespace dxvk {
+     if (!dsv)
+       return;
+ 
++    { // vgpu: VGPU_TRACE_MAP=1 logs depth clears of cube textures
++      static const bool s_trace = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++      if (unlikely(s_trace)) {
++        Com<ID3D11Resource> res;
++        dsv->GetResource(&res);
++        D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++        res->GetType(&dim);
++        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++          auto d = GetCommonTexture(res.ptr())->Desc();
++          if (d->MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) {
++            D3D11_DEPTH_STENCIL_VIEW_DESC vd;
++            dsv->GetDesc(&vd);
++            char msg[256];
++            snprintf(msg, sizeof(msg), "vgpu-cubeclear %p %ux%u arr %u fmt %u view dim %u slices %u+%u flags 0x%x depth %f",
++              res.ptr(), d->Width, d->Height, d->ArraySize, d->Format, vd.ViewDimension, vd.Texture2DArray.FirstArraySlice,
++              vd.Texture2DArray.ArraySize, ClearFlags, Depth);
++            Logger::warn(msg);
++          }
++        }
++      }
++    }
++
+     // Figure out which aspects to clear based on
+     // the image view properties and clear flags.
+     VkImageAspectFlags aspectMask = 0;
+@@ -5778,6 +5831,7 @@ namespace dxvk {
+ 
+     if (!pDstResource)
+       return;
++    VgpuTraceCubeWrite("UpdateSubresource", pDstResource, DstSubresource, nullptr, 0, pSrcData, SrcRowPitch);
+ 
+     // We need a different code path for buffers
+     D3D11_RESOURCE_DIMENSION resourceType;
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index 2120f718..6f0f1593 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -91,7 +91,31 @@ namespace dxvk {
+     // Get query status directly from the query object
+     auto query = static_cast<D3D11Query*>(pAsync);
+     HRESULT hr = query->GetData(pData, GetDataFlags);
+-    
++
++    // vgpu: VGPU_TRACE_MAP=1 also summarizes query results per type (how many came back zero)
++    static const bool s_traceQuery = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++    if (unlikely(s_traceQuery)) {
++      static std::atomic<uint32_t> s_calls[32], s_ok[32], s_zero[32];
++      D3D11_QUERY_DESC qd;
++      query->GetDesc(&qd);
++      uint32_t k = std::min(uint32_t(qd.Query), 31u);
++      uint64_t v = 0;
++      if (hr == S_OK && pData)
++        std::memcpy(&v, pData, std::min<UINT>(DataSize, 8));
++      uint32_t c = ++s_calls[k];
++      if (hr == S_OK) {
++        uint32_t n = ++s_ok[k];
++        if (!v)
++          ++s_zero[k];
++        if (n <= 5 || n % 500 == 0) {
++          char msg[160];
++          snprintf(msg, sizeof(msg), "vgpu-query type %u: %u calls, %u results, %u zero (this %llu, flags 0x%x, size %u)",
++            k, c, n, s_zero[k].load(), (unsigned long long)v, GetDataFlags, DataSize);
++          Logger::warn(msg);
++        }
++      }
++    }
++
+     // If we're likely going to spin on the asynchronous object,
+     // flush the context so that we're keeping the GPU busy.
+     if (hr == S_FALSE) {
+@@ -297,14 +321,35 @@ namespace dxvk {
+     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+     pResource->GetType(&resourceDim);
+ 
++    HRESULT hr;
+     if (likely(resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER)) {
+-      return MapBuffer(
++      hr = MapBuffer(
+         static_cast<D3D11Buffer*>(pResource),
+         MapType, MapFlags, pMappedResource);
+     } else {
+-      return MapImage(GetCommonTexture(pResource),
++      hr = MapImage(GetCommonTexture(pResource),
+         Subresource, MapType, MapFlags, pMappedResource);
+     }
++
++    // vgpu: VGPU_TRACE_MAP=1 logs CPU readbacks (Map READ*) with their first bytes
++    static const bool s_traceMap = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++    if (unlikely(s_traceMap) && (MapType == D3D11_MAP_READ || MapType == D3D11_MAP_READ_WRITE)) {
++      char msg[512];
++      const uint32_t* w = (SUCCEEDED(hr) && pMappedResource && pMappedResource->pData)
++        ? reinterpret_cast<const uint32_t*>(pMappedResource->pData) : nullptr;
++      uint32_t width = 0, height = 0, fmt = 0, size = 0;
++      if (resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER) {
++        size = static_cast<D3D11Buffer*>(pResource)->Desc()->ByteWidth;
++      } else {
++        auto d = GetCommonTexture(pResource)->Desc();
++        width = d->Width; height = d->Height; fmt = d->Format;
++      }
++      snprintf(msg, sizeof(msg), "vgpu-map %p dim %u sub %u type %u flags 0x%x hr 0x%08x %ux%u fmt %u size %u data %08x %08x %08x %08x",
++        pResource, resourceDim, Subresource, MapType, MapFlags, (uint32_t)hr, width, height, fmt, size,
++        w ? w[0] : 0, w ? w[1] : 0, w ? w[2] : 0, w ? w[3] : 0);
++      Logger::warn(msg);
++    }
++    return hr;
+   }
+   
+   
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 97df7a07..569318b1 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -34,6 +34,94 @@
+ #include "../util/util_shared_res.h"
+ 
+ namespace dxvk {
++
++  // vgpu: VGPU_VERIFY_INIT=1 reads every DEFAULT/IMMUTABLE 2D/3D texture created with initial data back
++  // through a staging copy and logs subresources whose GPU contents differ from the app's data.
++  static void VgpuVerifyInitData(
++          D3D11Device*                  pDevice,
++          ID3D11Resource*               pTexture,
++    const D3D11_COMMON_TEXTURE_DESC&    desc,
++          D3D11_RESOURCE_DIMENSION      dim,
++          DXGI_VK_FORMAT_MODE           mode,
++    const D3D11_SUBRESOURCE_DATA*       pInitialData) {
++    static const bool s_verify = env::getEnvVar("VGPU_VERIFY_INIT") == "1";
++    static uint32_t s_checked = 0, s_bad = 0;
++    if (likely(!s_verify) || !pInitialData || desc.SampleDesc.Count > 1
++     || (desc.Usage != D3D11_USAGE_DEFAULT && desc.Usage != D3D11_USAGE_IMMUTABLE))
++      return;
++
++    Com<ID3D11Resource> staging;
++    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
++      D3D11_TEXTURE2D_DESC sd = { desc.Width, desc.Height, desc.MipLevels, desc.ArraySize, desc.Format,
++        { 1, 0 }, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
++      Com<ID3D11Texture2D> t;
++      if (FAILED(pDevice->CreateTexture2D(&sd, nullptr, &t)))
++        return;
++      staging = t.ptr();
++    } else {
++      D3D11_TEXTURE3D_DESC sd = { desc.Width, desc.Height, desc.Depth, desc.MipLevels, desc.Format,
++        D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
++      Com<ID3D11Texture3D> t;
++      if (FAILED(pDevice->CreateTexture3D(&sd, nullptr, &t)))
++        return;
++      staging = t.ptr();
++    }
++
++    Com<ID3D11DeviceContext> ctx;
++    pDevice->GetImmediateContext(&ctx);
++    ctx->CopyResource(staging.ptr(), pTexture);
++
++    auto fmt = lookupFormatInfo(pDevice->LookupPackedFormat(desc.Format, mode).Format);
++    uint32_t bad = 0;
++    for (uint32_t a = 0; a < desc.ArraySize; a++) {
++      for (uint32_t m = 0; m < desc.MipLevels; m++) {
++        uint32_t sub = m + a * desc.MipLevels;
++        const D3D11_SUBRESOURCE_DATA& src = pInitialData[sub];
++        uint32_t w = std::max(desc.Width >> m, 1u), h = std::max(desc.Height >> m, 1u), d = std::max(desc.Depth >> m, 1u);
++        uint32_t rows = (h + fmt->blockSize.height - 1) / fmt->blockSize.height;
++        size_t rowBytes = size_t((w + fmt->blockSize.width - 1) / fmt->blockSize.width) * fmt->elementSize;
++        D3D11_MAPPED_SUBRESOURCE map;
++        if (!src.pSysMem || FAILED(ctx->Map(staging.ptr(), sub, D3D11_MAP_READ, 0, &map)))
++          continue;
++        size_t diff = 0, firstDiff = ~size_t(0);
++        bool srcZero = true, gpuZero = true;
++        for (uint32_t z = 0; z < d; z++) {
++          for (uint32_t y = 0; y < rows; y++) {
++            auto a8 = reinterpret_cast<const uint8_t*>(src.pSysMem) + size_t(z) * src.SysMemSlicePitch + size_t(y) * src.SysMemPitch;
++            auto b8 = reinterpret_cast<const uint8_t*>(map.pData) + size_t(z) * map.DepthPitch + size_t(y) * map.RowPitch;
++            for (size_t x = 0; x < rowBytes; x++) {
++              srcZero &= !a8[x];
++              gpuZero &= !b8[x];
++              if (a8[x] != b8[x]) {
++                if (!diff)
++                  firstDiff = (size_t(z) * rows + y) * rowBytes + x;
++                diff++;
++              }
++            }
++          }
++        }
++        ctx->Unmap(staging.ptr(), sub);
++        if (diff) {
++          bad++;
++          if (s_bad < 200) {
++            char msg[320];
++            snprintf(msg, sizeof(msg), "vgpu-verify MISMATCH %p dim %u %ux%ux%u fmt %u sub %u (mip %u slice %u) bind 0x%x misc 0x%x: %zu bytes differ, first at %zu, app %s gpu %s",
++              pTexture, dim, w, h, d, desc.Format, sub, m, a, desc.BindFlags, desc.MiscFlags, diff, firstDiff,
++              srcZero ? "zero" : "data", gpuZero ? "zero" : "data");
++            Logger::warn(msg);
++          }
++        }
++      }
++    }
++    s_checked++;
++    if (bad)
++      s_bad++;
++    if (bad || (s_checked % 256) == 0) {
++      char msg[128];
++      snprintf(msg, sizeof(msg), "vgpu-verify %u textures checked, %u with mismatches", s_checked, s_bad);
++      Logger::warn(msg);
++    }
++  }
+   
+   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
+ 
+@@ -234,8 +322,18 @@ namespace dxvk {
+      && !m_deviceFeatures.GetTiledResourcesTier())
+       return E_INVALIDARG;
+ 
+-    if (FAILED(hr))
++    if (FAILED(hr)) {
++      // vgpu: VGPU_TRACE_MAP=1 logs rejected texture descriptions
++      static const bool s_trace = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++      if (unlikely(s_trace)) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "vgpu-createfail 2D hr 0x%08x %ux%u mips %u arr %u fmt %u usage %u bind 0x%x cpu 0x%x misc 0x%x",
++          (uint32_t)hr, pDesc->Width, pDesc->Height, pDesc->MipLevels, pDesc->ArraySize, pDesc->Format, pDesc->Usage,
++          pDesc->BindFlags, pDesc->CPUAccessFlags, pDesc->MiscFlags);
++        Logger::warn(msg);
++      }
+       return hr;
++    }
+     
+     if (!ppTexture2D)
+       return S_FALSE;
+@@ -243,6 +341,26 @@ namespace dxvk {
+     try {
+       Com<D3D11Texture2D> texture = new D3D11Texture2D(this, &desc, nullptr, nullptr);
+       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
++      VgpuVerifyInitData(this, texture.ptr(), desc, D3D11_RESOURCE_DIMENSION_TEXTURE2D,
++        texture->GetCommonTexture()->GetFormatMode(), pInitialData);
++
++      // vgpu: VGPU_TRACE_MAP=1 also logs cube textures created with initial data (OR of subresource 0)
++      static const bool s_traceMap = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++      if (unlikely(s_traceMap) && (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
++        uint32_t acc = 0, first = 0;
++        if (pInitialData && pInitialData->pSysMem) {
++          auto w = reinterpret_cast<const uint32_t*>(pInitialData->pSysMem);
++          size_t n = size_t(pInitialData->SysMemPitch) * desc.Height / 4;
++          first = w[0];
++          for (size_t i = 0; i < n; i++)
++            acc |= (i & 1) ? (w[i] & 0xffffu) : w[i];  // skip alpha of RGBA16F
++        }
++        char msg[256];
++        snprintf(msg, sizeof(msg), "vgpu-cube %p %ux%u mips %u fmt %u bind 0x%x init %p first %08x or %08x",
++          texture.ptr(), desc.Width, desc.Height, desc.MipLevels, desc.Format, desc.BindFlags,
++          pInitialData ? pInitialData->pSysMem : nullptr, first, acc);
++        Logger::warn(msg);
++      }
+       *ppTexture2D = texture.ref();
+       return S_OK;
+     } catch (const DxvkError& e) {
+@@ -317,8 +435,17 @@ namespace dxvk {
+     
+     HRESULT hr = D3D11CommonTexture::NormalizeTextureProperties(&desc);
+ 
+-    if (FAILED(hr))
++    if (FAILED(hr)) {
++      static const bool s_trace = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++      if (unlikely(s_trace)) {
++        char msg[256];
++        snprintf(msg, sizeof(msg), "vgpu-createfail 3D hr 0x%08x %ux%ux%u mips %u fmt %u usage %u bind 0x%x misc 0x%x",
++          (uint32_t)hr, pDesc->Width, pDesc->Height, pDesc->Depth, pDesc->MipLevels, pDesc->Format, pDesc->Usage,
++          pDesc->BindFlags, pDesc->MiscFlags);
++        Logger::warn(msg);
++      }
+       return hr;
++    }
+ 
+     if ((desc.MiscFlags & D3D11_RESOURCE_MISC_TILED)
+      && (m_deviceFeatures.GetTiledResourcesTier() < D3D11_TILED_RESOURCES_TIER_3))
+@@ -330,6 +457,8 @@ namespace dxvk {
+     try {
+       Com<D3D11Texture3D> texture = new D3D11Texture3D(this, &desc, nullptr);
+       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
++      VgpuVerifyInitData(this, texture.ptr(), desc, D3D11_RESOURCE_DIMENSION_TEXTURE3D,
++        texture->GetCommonTexture()->GetFormatMode(), pInitialData);
+       *ppTexture3D = texture.ref();
+       return S_OK;
+     } catch (const DxvkError& e) {
+@@ -1655,7 +1784,15 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE D3D11Device::CheckFormatSupport(
+           DXGI_FORMAT Format,
+           UINT*       pFormatSupport) {
+-    return GetFormatSupportFlags(Format, pFormatSupport, nullptr);
++    HRESULT hr = GetFormatSupportFlags(Format, pFormatSupport, nullptr);
++    // vgpu: VGPU_TRACE_MAP=1 logs format support answers
++    static const bool s_trace = env::getEnvVar("VGPU_TRACE_MAP") == "1";
++    if (unlikely(s_trace)) {
++      char msg[128];
++      snprintf(msg, sizeof(msg), "vgpu-fmtsupport fmt %u hr 0x%08x flags 0x%08x", Format, (uint32_t)hr, pFormatSupport ? *pFormatSupport : 0);
++      Logger::warn(msg);
++    }
++    return hr;
+   }
+   
+   
 diff --git a/src/d3d11/d3d11_interop.cpp b/src/d3d11/d3d11_interop.cpp
 index 04fef383..8d6d9e64 100644
 --- a/src/d3d11/d3d11_interop.cpp
