@@ -89,6 +89,16 @@ Step 'Installing driver package'
 # Re-arm the kernel driver's boot-loop guard: a leftover nonzero VgpuBootGuard makes DriverEntry refuse to load (Code 39).
 $svc = 'HKLM:\SYSTEM\CurrentControlSet\Services\viogpu3d'
 if (Test-Path $svc) { Set-ItemProperty $svc VgpuBootGuard 0 -Type DWord }
+# Stage first, then remove every other package of this driver: Windows keeps the highest DriverVer, so
+# installing an older (or differently built) package over a newer one would silently change nothing,
+# and each install would leave another copy in the DriverStore.
+$out = pnputil /add-driver $inf | Out-String
+if ($LASTEXITCODE -ne 0) { Write-Host $out; Fail "pnputil /add-driver failed ($LASTEXITCODE)." }
+$mine = if ($out -match 'Published Name:\s+(oem\d+\.inf)') { $matches[1] } else { $null }
+$leaf = [regex]::Escape((Split-Path $inf -Leaf))
+$old = (pnputil /enum-drivers | Out-String) -split "`r?`n`r?`n" | ? { $_ -match "Original Name:\s+$leaf" } |
+       % { if ($_ -match 'Published Name:\s+(oem\d+\.inf)') { $matches[1] } } | ? { $_ -ne $mine }
+foreach ($o in $old) { Write-Host "  removing older package $o"; pnputil /delete-driver $o /uninstall /force | Out-Null }
 pnputil /add-driver $inf /install
 $rc = $LASTEXITCODE
 # 259 (ERROR_NO_MORE_ITEMS): package staged but no device took it (already current, or a better-ranked driver).

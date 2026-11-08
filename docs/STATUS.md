@@ -547,3 +547,32 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   fatal ring, with the debug package too and after a guest reboot. The host had 119 of 125 GB RAM in use
   (108 GB anonymous, processes outside the container), so host allocations failing is the likely cause;
   re-run the comparison once host memory is back.
+
+### Benchmark round, fullscreen, OpenCL probe (2026-11-08)
+- tools/windows/fg.ps1 sent a synthetic Alt key (keybd_event) to lift the foreground lock. GravityMark then
+  rendered with its window never shown and reported inflated scores (D3D11 37644, D3D12 27973): presents
+  were not composited. fg.ps1 now uses no input (foreground lock timeout 0 + AttachThreadInput +
+  SwitchToThisWindow). Any earlier benchmark or fullscreen result taken through fg.ps1 is suspect.
+- Release vs debug package, GravityMark 1.89 1920x1080 window on a 3840x2160 desktop, screenshot-checked,
+  two runs each (mean): D3D12 25105 vs 24696, Vulkan 17249 vs 17862, OpenGL 12684 vs 13105, D3D11 11516 vs
+  11860. Debug varied up to 7.6% between its own runs, so the difference is noise; GravityMark is not
+  limited by the debug prints/asserts. All APIs are well above the older README numbers (host RAM was
+  nearly full earlier in the day, see the release-build notes).
+- Exclusive fullscreen 3840x2160: GravityMark works in every API (D3D12 12587 / Vulkan 5539 / OpenGL 5295 /
+  D3D11 4767; D3D11 28.9 fps also with FbAsync=1). blttest draw in fullscreen works 32- and 64-bit (63 fps).
+  Unigine fails: Heaven D3D11 (32-bit) aborts after host "vkQueueSubmit2 resulted in CS error" with
+  FbAsync=1 and hangs with FbAsync=0 -- the main thread waits in vgpuFbPresent's staging Map
+  (vgpu_triton_backend.c:1022), dxvk-queue waits on a Venus fence that never signals, right after
+  "present-fence: armed"; same at 1920x1080 (mode change). Superposition D3D11 (64-bit) also hits the CS
+  error. The Khronos validation layer (SDK 1.4.363, registered under HKLM\SOFTWARE\Khronos\Vulkan\
+  ExplicitLayers because the loader ignores VK_LAYER_PATH in elevated processes) reported nothing in one
+  Superposition run, but that run may not have reached exclusive fullscreen. Open.
+- GravityMark OpenGL exit: 6/6 clean exits after the u_queue ExitProcess fix (was 3/11 hangs).
+- install.ps1 now stages the package, removes every other vgpu3d.inf package, then installs: Windows keeps
+  the highest DriverVer, so installing an older build over a newer one silently changed nothing (and each
+  install left another copy in the DriverStore; the VM had 6). Downgrade tested.
+- OpenCL option 1 (OpenCLOn12 without Dozen): mesa-dist-win 26.2.6 openclon12.dll enumerates our adapter
+  ("OpenCLOn12: vgpu VirtIO GPU 3D (WDDM)") but is a Debug build (MSVCP140D/ucrtbased) and crashes in
+  clCreateContext on a null mutex -- also on the WARP device, so it is that binary, not our D3D12. Building
+  OpenCLOn12 needs MSVC. Moving to option 2 (clvk). build/build_opencl_loader.sh cross-builds the Khronos
+  ICD loader (OpenCL.dll, 64/32-bit); cltest now checks every step and takes CLTEST_DEVICE=<n>.

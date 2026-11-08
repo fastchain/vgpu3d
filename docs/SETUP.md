@@ -316,8 +316,9 @@ webdeploy folder; they're no longer needed.
 - **No OpenCL.** GPU-compute tests that need it (PassMark GPU Compute, Geekbench) don't run. Do **not** install
   Microsoft's "OpenCL, OpenGL and Vulkan Compatibility Pack": its Dozen Vulkan driver calls D3D12, our D3D12
   driver calls Vulkan, and every Vulkan app (and DWM after a reboot) deadlocks.
-- **Exclusive-fullscreen Unigine Heaven (D3D11)** hangs: its GPU work never completes and the host
-  rejects a submission (`vkQueueSubmit2 resulted in CS error`). Windowed and borderless work.
+- **Exclusive fullscreen in Unigine (D3D11)**: Heaven hangs (its staging Map never completes) and Superposition
+  makes the host reject a submission (`vkQueueSubmit2 resulted in CS error`). GravityMark works in exclusive
+  fullscreen in all four APIs, and so does blttest (32/64-bit). Windowed and borderless Unigine work.
 - **Superposition (D3D11)** shows black patches on lit geometry in some scenes; OpenGL renders the
   same scenes correctly.
 - **Driver updates crash GPU-using apps**, including Explorer and DWM, while the adapter restarts.

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 
@@ -63,12 +64,18 @@ int main(int argc, char **argv)
             p_clGetDeviceInfo(devs[j], CL_DEVICE_NAME, sizeof dn, dn, NULL);
             printf("[INFO]   device %u: %s\n", j, dn);
         }
+        /* CLTEST_DEVICE=<n> picks device n of the first platform instead of the first GPU */
+        const char *pick = getenv("CLTEST_DEVICE");
+        if (!gpu && pick && i == 0 && (cl_uint)atoi(pick) < nd)
+            gpu = devs[atoi(pick)];
         if (!gpu && p_clGetDeviceIDs(plats[i], CL_DEVICE_TYPE_GPU, 1, &gpu, &nd) != 0)
             gpu = NULL;
     }
     if (!gpu) { printf("[FAIL] no GPU device\n"); return 1; }
     cl_context ctx = p_clCreateContext(NULL, 1, &gpu, NULL, NULL, &err);
+    if (!ctx) { printf("[FAIL] clCreateContext %d\n", err); return 1; }
     cl_command_queue q = p_clCreateCommandQueue(ctx, gpu, 0, &err);
+    if (!q) { printf("[FAIL] clCreateCommandQueue %d\n", err); return 1; }
     enum { N = 1 << 20 };
     static float a[N], b[N], c[N];
     for (int i = 0; i < N; i++) { a[i] = (float)i; b[i] = 2.0f * i; }
@@ -77,10 +84,14 @@ int main(int argc, char **argv)
     cl_mem mc = p_clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof c, NULL, &err);
     const char *src = "__kernel void add(__global const float *a, __global const float *b, __global float *c)"
                       "{ size_t i = get_global_id(0); c[i] = a[i] + b[i]; }";
+    if (!ma || !mb || !mc) { printf("[FAIL] clCreateBuffer %d\n", err); return 1; }
     cl_program prog = p_clCreateProgramWithSource(ctx, 1, &src, NULL, &err);
+    if (!prog) { printf("[FAIL] clCreateProgramWithSource %d\n", err); return 1; }
     err = p_clBuildProgram(prog, 1, &gpu, "", NULL, NULL);
     if (err) { printf("[FAIL] clBuildProgram %d\n", err); return 1; }
     cl_kernel k = p_clCreateKernel(prog, "add", &err);
+    if (!k) { printf("[FAIL] clCreateKernel %d\n", err); return 1; }
+    printf("[PASS] context, queue, buffers, program build, kernel\n");
     p_clSetKernelArg(k, 0, sizeof ma, &ma);
     p_clSetKernelArg(k, 1, sizeof mb, &mb);
     p_clSetKernelArg(k, 2, sizeof mc, &mc);

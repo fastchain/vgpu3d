@@ -92,10 +92,11 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 
 | Benchmark | API | Result |
 |---|---|---|
-| **GravityMark 1.89** | Direct3D 12 | **22313** (133.6 fps) |
-| | Vulkan | 11230 |
-| | OpenGL | 11064 (66.2 fps) |
-| | Direct3D 11 | 10369 (62.1 fps) |
+| **GravityMark 1.89**, 1920×1080 window (release build, mean of 2 runs) | Direct3D 12 | **25105** (~150 fps) |
+| | Vulkan | 17249 (~103 fps) |
+| | OpenGL | 12684 (~76 fps) |
+| | Direct3D 11 | 11516 (~69 fps) |
+| **GravityMark 1.89**, 3840×2160 exclusive fullscreen | D3D12 / Vulkan / OpenGL / D3D11 | 12587 / 5539 / 5295 / 4767 (75 / 33 / 32 / 29 fps) |
 | **Unigine Superposition 1.1**, 1080p | Direct3D 11 / OpenGL | 69.8 / 56.4 fps |
 | **Unigine Heaven 4.0** (5K desktop) | Direct3D 11 / OpenGL | 82–88 / 67.4 fps |
 | **Unigine Valley 1.0** (5K desktop) | OpenGL | 67.0 fps |
@@ -262,7 +263,8 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
 - **No OpenCL.** Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility Pack*: its Dozen
   driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
-- Exclusive-fullscreen Unigine Heaven (D3D11) hangs; windowed and borderless work.
+- Exclusive fullscreen works (GravityMark in every API), but Unigine Heaven and Superposition (D3D11) fail
+  in exclusive fullscreen; windowed and borderless work.
 - Superposition (D3D11) shows black patches in some scenes (OpenGL is fine).
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.
