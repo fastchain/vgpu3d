@@ -507,3 +507,25 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   windowed at 5120x2160 works -- so not linear primaries, sRGB views or memory size.  Next: the Vulkan
   validation layer in the guest.
 - The KMD now logs pid and first word of short escapes ("buffer too small") to name the sender.
+
+### Release round: installer and README (2026-11-08)
+- Windows installer: `build/build_installer.sh` wraps the staged package in an NSIS installer
+  (`src/installer/vgpu3d.nsi`) -> `out/vgpu3d-setup-<version>.exe`, ~20 MB. It checks Windows 11 x64 and
+  the virtio-gpu PCI device, unpacks to Program Files, runs install.ps1 (64-bit PowerShell via sysnative),
+  registers an Apps & features uninstaller (uninstall3d.ps1 -RemoveCert), and handles test signing with a
+  reboot plus a RunOnce resume. install.ps1 exit codes: 0 / 1 error / 3 test signing just enabled /
+  3010 reboot needed (pnputil 3010, or the adapter left at Code 14 while pnputil returned 0; pnputil 259
+  "no device updated" counts as success).
+  Tested in the VM: silent install over an existing install, uninstall (all packages + certificate
+  removed, Basic Display), fresh reinstall (new certificate), GUI run with reboot, upgrade.
+- Code 39 after uninstall + reinstall: uninstalling within 45 s of an adapter start left
+  VgpuBootGuard=1 in the service key, so the next DriverEntry refused to load (0xC0000365). install.ps1
+  now resets the guard before pnputil; the KMD also clears it in its unload path (not observed to run
+  when the adapter falls back to Basic Display, so the installer reset is the effective fix).
+- OpenGL exit hang (dsbtest reliably, GravityMark GL 3/11): the earlier u_queue loader-lock change waited
+  for worker threads to leave the queue code, but at ExitProcess they are already terminated, so
+  DLL_PROCESS_DETACH spun in Sleep(1) forever. It now also stops when all killed threads' handles are
+  signaled. dsbtest 64/32-bit exits cleanly 5/5 (hung every run before). GravityMark GL not re-run yet.
+- First release-build (`package_kmd3d.sh release`) smoke round: d3d12test, d3d9test (64/32), vkcompute2,
+  dsbtest (64/32), blttest pass.
+- README rewritten for the release (use cases, API table, benchmarks, host and guest steps).

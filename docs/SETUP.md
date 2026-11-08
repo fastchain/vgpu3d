@@ -210,8 +210,27 @@ sudo tail -f /var/log/libvirt/qemu/WIN11_3D.log
 
 ## 5. Installing the driver in the guest
 
+### 5.1 Installer (recommended)
+
+`build/build_installer.sh` produces `out/vgpu3d-setup-<version>.exe` (NSIS, about 20 MB).
+
+1. Copy it into the guest. Save your work: the adapter restarts and GPU-using apps may close.
+2. Run it (UAC prompt). Setup checks for 64-bit Windows 11 and a virtio-gpu adapter (PCI 1AF4:1050),
+   unpacks the package to `C:\Program Files\vgpu3d` and runs the bundled `install.ps1` (below).
+3. If test signing was off, setup turns it on and asks for a reboot; a `RunOnce` entry finishes the
+   installation in a console window at the next logon. Secure Boot must not be enforced.
+4. If the finish page asks for a reboot (the adapter shows Code 14, typically when switching from Basic
+   Display), reboot.
+
+Silent: `vgpu3d-setup-<version>.exe /S`. Exit code 0 = installed, 3010 = reboot needed, 1 = failed.
+Uninstall from *Settings → Apps* (or `"C:\Program Files\vgpu3d\uninstall.exe" /S`): removes every
+`vgpu3d.inf` package, the `CN=vgpu test signing` certificate and the files. Test signing stays on
+(`bcdedit /set testsigning off`).
+
+### 5.2 Manual install from the zip
+
 1. **Test signing, one time.** In an elevated PowerShell: `bcdedit /set testsigning on`, then reboot.
-   (`install.ps1` checks this and enables it for you if Secure Boot allows.)
+   (`install.ps1` checks this and enables it for you if Secure Boot allows; it then exits with code 3.)
 2. Copy the package zip into the guest and unpack it, for example to `C:\vgpu\m1`.
 3. Run the installer from an elevated PowerShell:
    ```powershell
@@ -222,16 +241,17 @@ sudo tail -f /var/log/libvirt/qemu/WIN11_3D.log
    - creates a self-signed code-signing certificate and trusts it (Root + TrustedPublisher);
    - signs `viogpu3d.sys`;
    - builds `vgpu3d.cat` with the bundled `Inf2Cat.exe` and signs it;
+   - resets the kernel driver's boot-loop guard (`VgpuBootGuard`);
    - installs the package with `pnputil /add-driver … /install`.
 4. The screen flickers while the adapter restarts. Device Manager → Display adapters should show
-   **vgpu VirtIO GPU 3D (WDDM)** with status OK. No reboot is needed.
+   **vgpu VirtIO GPU 3D (WDDM)** with status OK. Usually no reboot is needed.
 
-**Updating:** run `install.ps1` from the new package. A driver update restarts the adapter. Every app
-that holds a GPU device crashes at that moment, including Explorer, the Start menu and DWM; Windows
-restarts them on its own. **Close your work first** (known issue, section 8).
+**Updating:** run the new installer (or `install.ps1` from the new package). A driver update restarts the
+adapter. Every app that holds a GPU device crashes at that moment, including Explorer, the Start menu and
+DWM; Windows restarts them on its own. **Close your work first** (known issue, section 8).
 
-**Removing:** `tools/windows/vgpu3d-rollback.ps1` deletes all `vgpu3d.inf` packages, and the adapter
-falls back to Microsoft Basic Display Adapter.
+**Removing:** uninstall from Apps, or run `uninstall3d.ps1 [-RemoveCert]` from the package (same as
+`tools/windows/vgpu3d-rollback.ps1`). The adapter falls back to Microsoft Basic Display Adapter.
 
 ### What gets installed
 All files go to the driver's DriverStore folder (`C:\Windows\System32\DriverStore\FileRepository\vgpu3d.inf_amd64_*`):
@@ -313,6 +333,7 @@ webdeploy folder; they're no longer needed.
 | Symptom | Likely cause / fix |
 |---|---|
 | Guest has no Vulkan; QEMU log: `failed to initialize venus renderer` | `seccomp_sandbox = 0` missing (2.3), or virglrenderer built without Venus |
+| Adapter shows Code 39 after a reinstall | the boot-loop guard tripped (`VgpuBootGuard` ≠ 0 under `HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D`); re-run the installer, which resets it |
 | Adapter shows Code 43, or falls back to Basic Display | test signing off, package not signed (re-run `install.ps1`), or `blob`/`venus` globals missing |
 | Black viewer from the first frame | SPICE `gl=on` on NVIDIA: use the egl-headless setup (4.5) |
 | QEMU log: `vrend_renderer_transfer_iov … Illegal resource` | a resource without guest backing (old driver builds); update the driver |

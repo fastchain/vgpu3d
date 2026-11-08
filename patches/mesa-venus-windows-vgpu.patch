@@ -140,7 +140,7 @@ index 100753a..31c8a7c 100644
        *count = ARRAY_SIZE(zink_driconf);
        return zink_driconf;
 diff --git a/src/util/u_queue.c b/src/util/u_queue.c
-index 13659c7..65fd1e0 100644
+index 13659c7..9f254a6 100644
 --- a/src/util/u_queue.c
 +++ b/src/util/u_queue.c
 @@ -34,6 +34,11 @@
@@ -164,7 +164,7 @@ index 13659c7..65fd1e0 100644
     mtx_unlock(&queue->lock);
     return 0;
  }
-@@ -489,6 +496,21 @@ fail_lock:
+@@ -489,6 +496,35 @@ fail_lock:
     return false;
  }
  
@@ -181,12 +181,26 @@ index 13659c7..65fd1e0 100644
 +      *(const RTL_CRITICAL_SECTION *const *)(peb + (sizeof(void *) == 8 ? 0x110 : 0xa0));
 +   return lock && lock->OwningThread == (HANDLE)(uintptr_t)GetCurrentThreadId();
 +}
++
++/* At process exit (DLL_PROCESS_DETACH from ExitProcess) the other threads
++ * were terminated before they could leave the queue code: their handles are
++ * signaled, and exited_threads never catches up.
++ */
++static bool
++threads_terminated(struct util_queue *queue, unsigned first, unsigned end)
++{
++   for (unsigned i = first; i < end; i++) {
++      if (WaitForSingleObject(queue->threads[i].handle, 0) != WAIT_OBJECT_0)
++         return false;
++   }
++   return true;
++}
 +#endif
 +
  static void
  util_queue_kill_threads_locked(struct util_queue *queue,
                                 unsigned keep_num_threads)
-@@ -501,12 +523,34 @@ util_queue_kill_threads_locked(struct util_queue *queue,
+@@ -501,12 +537,35 @@ util_queue_kill_threads_locked(struct util_queue *queue,
     }
  
     unsigned old_num_threads = queue->num_threads;
@@ -207,7 +221,8 @@ index 13659c7..65fd1e0 100644
 +    */
 +   if (keep_num_threads < old_num_threads && loader_lock_held()) {
 +      const unsigned killed = old_num_threads - keep_num_threads;
-+      while (queue->exited_threads - exited_before < killed) {
++      while (queue->exited_threads - exited_before < killed &&
++             !threads_terminated(queue, keep_num_threads, old_num_threads)) {
 +         mtx_unlock(&queue->lock);
 +         Sleep(1);
 +         mtx_lock(&queue->lock);

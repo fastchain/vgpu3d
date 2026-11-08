@@ -27,6 +27,9 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
 
 - `build/package_kmd3d.sh` builds the kernel driver and both UMDs and produces `out/vgpu3d-m1.zip`.
   It **fails if a binary wasn't rebuilt**, so never work around that check.
+- `build/build_installer.sh [--package]` wraps the staged package into the NSIS installer
+  `out/vgpu3d-setup-<version>.exe` (needs `makensis`). It refreshes `install.ps1`/`uninstall3d.ps1` in the
+  package, so script fixes need no full rebuild. Test it with `/S` over SSH; the GUI needs the `vgpu-run` task.
 - Third-party builds take an optional `32` argument for the WOW64 variant:
   `build_triton_venus.sh`, `build_dxvk.sh`, `build_vkd3d.sh`, `build_umd.sh`, `build_gl.sh`.
 - After a container or session restart, apt packages may be gone. Check
@@ -79,5 +82,7 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
 - Known issues to keep in mind:
   - DX9 comes from Windows' D3D9On12 on our D3D12; OpenCL is not available (never install the MS
     Compatibility Pack: Dozen <-> our D3D12 deadlocks Vulkan). DX12 is vkd3d-proton with a CPU-waited queue gate.
+  - A nonzero `VgpuBootGuard` in the VioGpu3D service key makes DriverEntry refuse to load (Code 39,
+    0xC0000365); install.ps1 resets it.
   - Exclusive-fullscreen Heaven D3D11 hangs (host `CS error`); Superposition D3D11 shows black patches.
   - Fullscreen tests need the app in the foreground: run `C:\vgpu\fg.ps1 -Name <process>` beside it.

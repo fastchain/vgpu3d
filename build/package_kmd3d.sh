@@ -32,6 +32,7 @@ cp $R/src/kmd3d-inf/vgpu3d.inf $P/
 sed -i "s#^DriverVer=.*#DriverVer=$(date -u -d yesterday +%m/%d/%Y),1.0.$(date -u +%y%j).$(( $(date -u +%s) % 86400 / 2 ))#" $P/vgpu3d.inf
 cp $R/toolchain/wdk/c/bin/10.0.26100.0/x86/Inf2Cat.exe $R/toolchain/wdk/c/bin/10.0.26100.0/x86/Microsoft.UniversalStore.HardwareWorkflow.*.dll $R/toolchain/wdk/c/bin/10.0.26100.0/x86/WindowsProtectedFiles.xml $P/tools/
 cp $R/tools/windows/install.ps1 $P/install.ps1
+cp $R/tools/windows/uninstall3d.ps1 $P/
 sed -i "s/'vgpu.sys'/'viogpu3d.sys'/; s/'vgpu.inf'/'vgpu3d.inf'/; s/'vgpu.cat'/'vgpu3d.cat'/" $P/install.ps1
 ( cd $P/.. && python3 -I -c "
 import zipfile, os

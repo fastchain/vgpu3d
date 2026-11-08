@@ -210,6 +210,12 @@ static void VgpuGuardStop(void)
         ObDereferenceObject(g_GuardThread);
         g_GuardThread = NULL;
     }
+    /* A clean unload (driver update/uninstall, adapter disable) is not a crash loop: without this, an
+     * uninstall within VGPU_GUARD_OK_SECONDS of a start left 1 behind and the next install refused to load. */
+    if (g_GuardKey[0])
+    {
+        VgpuGuardWrite(0);
+    }
 }
 /* end vgpu guard */
 

@@ -9,6 +9,9 @@
   4. Installs the driver package with pnputil.
 
   Re-run after "bcdedit /set testsigning on" + reboot if step 1 asks for it.
+
+  Exit codes (used by the vgpu3d-setup.exe installer): 0 installed, 1 error,
+  3 test signing was just enabled (reboot, then run again), 3010 installed but a reboot is required.
 #>
 [CmdletBinding()]
 param(
@@ -43,7 +46,7 @@ if (-not $testsigning) {
   }
   bcdedit /set testsigning on | Out-Null
   Write-Host 'Test signing enabled. REBOOT, then run this script again.' -ForegroundColor Yellow
-  exit 0
+  exit 3
 }
 
 # --- 2. certificate ------------------------------------------------------------------
@@ -83,8 +86,19 @@ if ($SkipInstall) { Write-Host 'Package signed (install skipped).' -ForegroundCo
 
 # --- 4. install ----------------------------------------------------------------------
 Step 'Installing driver package'
+# Re-arm the kernel driver's boot-loop guard: a leftover nonzero VgpuBootGuard makes DriverEntry refuse to load (Code 39).
+$svc = 'HKLM:\SYSTEM\CurrentControlSet\Services\viogpu3d'
+if (Test-Path $svc) { Set-ItemProperty $svc VgpuBootGuard 0 -Type DWord }
 pnputil /add-driver $inf /install
+$rc = $LASTEXITCODE
+# 259 (ERROR_NO_MORE_ITEMS): package staged but no device took it (already current, or a better-ranked driver).
+if ($rc -eq 259) { Write-Host '  package staged; no device was updated' -ForegroundColor Yellow; $rc = 0 }
+if ($rc -ne 0 -and $rc -ne 3010) { Fail "pnputil failed ($rc)." }
+# Switching from Microsoft Basic Display leaves the adapter at Code 14 (needs restart) while pnputil returns 0.
+Start-Sleep 3
+if (Get-PnpDevice -PresentOnly -EA SilentlyContinue | ? { $_.InstanceId -like 'PCI\VEN_1AF4&DEV_1050*' -and $_.Problem -eq 'CM_PROB_NEED_RESTART' }) { $rc = 3010 }
 Write-Host ''
 Write-Host 'If the virtio-gpu adapter still shows the old driver, open Device Manager > Display adapters,' -ForegroundColor Yellow
 Write-Host 'Update driver > Browse my computer > Let me pick > Have Disk, and choose this vgpu.inf.' -ForegroundColor Yellow
-Write-Host 'Then run:  .\vgputest.exe -v' -ForegroundColor Green
+if ($rc -eq 3010) { Write-Host 'Reboot required to finish the installation.' -ForegroundColor Yellow }
+exit $rc
