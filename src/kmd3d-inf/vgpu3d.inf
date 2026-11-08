@@ -35,6 +35,7 @@ vkd3d32_d3d12core.dll = 1,,
 vulkan_virtio32.dll = 1,,
 virtio_icd32.json = 1,,
 libgallium_wgl32.dll = 1,,
+clvk.dll = 1,,
 vgpusrv.exe = 1,,
 viogpuap.exe = 1,,
 
@@ -62,6 +63,7 @@ vkd3d32_d3d12core.dll,,,0
 vulkan_virtio32.dll,,,0
 virtio_icd32.json,,,0
 libgallium_wgl32.dll,,,0
+clvk.dll,,,0
 vgpusrv.exe,,,0
 viogpuap.exe,,,0
 
@@ -123,6 +125,8 @@ HKR,, OpenGLFlags,       %REG_DWORD%, 1
 HKR,, OpenGLDriverNameWow, %REG_MULTI_SZ%, %13%\libgallium_wgl32.dll
 HKR,, OpenGLVersionWow,  %REG_DWORD%, 1
 HKR,, OpenGLFlagsWow,    %REG_DWORD%, 1
+; OpenCL 3.0: clvk (OpenCL on Vulkan, clspv built in) on Venus; the Khronos OpenCL.dll loader finds it here.
+HKR,, OpenCLDriverName,  %REG_MULTI_SZ%, %13%\clvk.dll
 HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",EnablePreemption,%REG_DWORD%,0
 HKLM,"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",TdrDebugMode,%REG_DWORD%,1
 

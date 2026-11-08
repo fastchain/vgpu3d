@@ -265,6 +265,7 @@ All files go to the driver's DriverStore folder (`C:\Windows\System32\DriverStor
 | `vgpu_d3d11_32.dll`, `dxvk32_d3d11.dll`, `dxvk32_dxgi.dll` | 32-bit (WOW64) D3D10/11 |
 | `vulkan_virtio32.dll`, `virtio_icd32.json` | 32-bit Vulkan ICD |
 | `libgallium_wgl32.dll` | 32-bit OpenGL ICD |
+| `clvk.dll` | 64-bit OpenCL 3.0 ICD (clvk + clspv) |
 | `vgpusrv.exe`, `viogpuap.exe` | resolution helper service (Triton) |
 
 The INF registers them through `UserModeDriverName[Wow]`, `VulkanDriverName[Wow]` and
@@ -313,9 +314,11 @@ webdeploy folder; they're no longer needed.
 - **Direct3D 12 is new.** Each ExecuteCommandLists waits for its GPU work before returning; a kernel-side gate
   stalled behind itself (GravityMark D3D12 133 -> 17 fps), so the CPU wait stays. Tested: a clear/readback/present test, GravityMark
   D3D12, PassMark DirectX 12.
-- **No OpenCL.** GPU-compute tests that need it (PassMark GPU Compute, Geekbench) don't run. Do **not** install
-  Microsoft's "OpenCL, OpenGL and Vulkan Compatibility Pack": its Dozen Vulkan driver calls D3D12, our D3D12
-  driver calls Vulkan, and every Vulkan app (and DWM after a reboot) deadlocks.
+- **OpenCL 3.0 comes from clvk** (OpenCL on Vulkan, `clvk.dll` in the DriverStore, registered through the
+  adapter's `OpenCLDriverName`); the installer puts the Khronos loader (`OpenCL.dll` 3.1) into System32 when
+  none or an older one is there. 64-bit only for now. Do **not** install Microsoft's "OpenCL, OpenGL and
+  Vulkan Compatibility Pack": its Dozen Vulkan driver calls D3D12, our D3D12 driver calls Vulkan, and every
+  Vulkan app (and DWM after a reboot) deadlocks.
 - **Exclusive fullscreen in Unigine (D3D11)**: Heaven hangs (its staging Map never completes) and Superposition
   makes the host reject a submission (`vkQueueSubmit2 resulted in CS error`). GravityMark works in exclusive
   fullscreen in all four APIs, and so does blttest (32/64-bit). Windowed and borderless Unigine work.

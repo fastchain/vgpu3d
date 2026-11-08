@@ -580,3 +580,11 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   System32 DirectML.dll (1.15.6) on the vgpu adapter and runs an element-wise add of 65536 floats, 0
   mismatches. MinGW note: COM methods returning structs > 8 bytes (IDMLDispatchable::GetBindingProperties)
   pass the hidden result pointer in a different position than MSVC; dmltest calls that vtable slot directly.
+- OpenCL works (option 2, clvk): build/build_clvk.sh cross-builds clvk + clspv + LLVM with MinGW in two stages
+  (native clspv build for the LLVM/clang tablegens and libclc, ~4 min; Windows build ~6 min on 32 cores) ->
+  out/clvk/OpenCL.dll (102 MB, imports only system DLLs + vulkan-1). clspv's dllexport disables MinGW's
+  export-all, so the cl* entry points come from a .def generated from api.cpp.obj; one clvk source fix
+  (Windows.h case, patches/clvk-vgpu.patch). Vulkan import library from the guest's vulkan-1.dll (gendef).
+  The INF ships clvk.dll and sets OpenCLDriverName; the installer installs/upgrades the Khronos loader in
+  System32 (and removes it on uninstall only if it added it). cltest through the installed loader:
+  "clvk: Virtio-GPU Venus (NVIDIA GeForce RTX 4090)", vector add of 1M floats, 0 mismatches. 64-bit only.

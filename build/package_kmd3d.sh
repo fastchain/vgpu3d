@@ -41,6 +41,11 @@ cp $R/out/gl-win$VREL/libgallium_wgl.dll $P/
 cp $R/out/gl-win32$VREL/libgallium_wgl32.dll $P/
 # manifest-relative path: the loader cannot resolve Triton's bare "vulkan_virtio.dll" from the DriverStore (LoadLibrary error 87)
 cp $R/src/kmd3d-inf/virtio_icd.json $P/
+# OpenCL: clvk ICD (build_clvk.sh, ~100 MB with LLVM inside) + the Khronos loader the installer puts in System32
+[ -f $R/out/clvk/OpenCL.dll ] || $R/build/build_clvk.sh
+[ -f $R/out/opencl/OpenCL.dll ] || $R/build/build_opencl_loader.sh
+cp $R/out/clvk/OpenCL.dll $P/clvk.dll
+cp $R/out/opencl/OpenCL.dll $P/tools/OpenCL.dll
 cp $R/src/kmd3d-inf/vgpu3d.inf $P/
 sed -i "s#^DriverVer=.*#DriverVer=$(date -u -d yesterday +%m/%d/%Y),1.0.$(date -u +%y%j).$(( $(date -u +%s) % 86400 / 2 ))#" $P/vgpu3d.inf
 # release: kernel log level ERROR (the INF default 4 = INFORMATION is for debug builds)

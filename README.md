@@ -4,7 +4,7 @@
 
 ### Hardware 3D for Windows VMs on QEMU/KVM, on the GPU your host already has
 
-**Vulkan · Direct3D 9 / 10 / 11 / 12 · OpenGL 4.6** for Windows 11 guests over `virtio-gpu` (Venus).<br>
+**Vulkan · Direct3D 9 / 10 / 11 / 12 · OpenGL 4.6 · OpenCL 3.0** for Windows 11 guests over `virtio-gpu` (Venus).<br>
 No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop.
 
 ![Windows 11](https://img.shields.io/badge/guest-Windows%2011%20x64-0078D6?logo=windows11&logoColor=white)
@@ -12,6 +12,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.4-AC162C?logo=vulkan&logoColor=white)
 ![Direct3D](https://img.shields.io/badge/Direct3D-9%20%7C%2010%20%7C%2011%20%7C%2012-107C10)
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
+![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
@@ -49,7 +50,7 @@ while the GPU stays shared with the host and with other VMs.
 |---|---|
 | CAD and 3D tools in a Windows VM (Autodesk Fusion: **~60 fps instead of 1.4 fps** on CPU) | Competitive gaming at native-GPU frame rates: use GPU passthrough (VFIO) |
 | A smooth, GPU-composited Windows desktop on a Linux workstation | Games with kernel anti-cheat (they usually block VMs anyway) |
-| Lighter and older games, emulators, GPU-accelerated apps | OpenCL / GPU-compute workloads (not available) |
+| Lighter and older games, emulators, GPU-accelerated apps | CUDA workloads (NVIDIA-only, not possible here) |
 | Hosts with only one GPU, or consumer GPUs without SR-IOV | Production machines that need signed drivers and Secure Boot |
 | Several Windows VMs sharing one card | |
 
@@ -59,7 +60,7 @@ while the GPU stays shared with the host and with other VMs.
 |---|---|---|---|---|
 | Host keeps using the GPU | ✅ | ✅ | ❌ dedicated to the VM | ✅ |
 | Hardware needed | any Venus-capable Vulkan GPU | none | 2nd GPU + IOMMU | data-center GPU, licenses |
-| Windows 3D | Vulkan, D3D9–12, GL 4.6 | ❌ CPU only (WARP) | everything, native | everything, native |
+| Windows 3D / compute | Vulkan, D3D9–12, GL 4.6, OpenCL 3.0, DirectML | ❌ CPU only (WARP) | everything, native | everything, native |
 | VMs per GPU | many | – | one | many |
 | Speed | good; CPU-bound on light loads | very slow 3D | native | near native |
 
@@ -78,7 +79,8 @@ The guest sees one adapter, **"vgpu VirtIO GPU 3D (WDDM)"**, and reports the hos
 | **Direct3D 9** | ✅ | ✅ | Windows' **D3D9On12** on our D3D12 driver |
 | **OpenGL 4.6** | ✅ | ✅ | Mesa **Zink** (OpenGL on Vulkan) |
 | Desktop (DWM) | ✅ | – | GPU-composited through D3D11 |
-| OpenCL | ❌ | ❌ | not available |
+| **OpenCL 3.0** | ✅ | ❌ | **clvk** (OpenCL on Vulkan, clspv compiler built in) |
+| DirectML | ✅ | – | Windows' DirectML.dll on our D3D12 |
 
 **Tested engines and apps:** Unigine (Heaven, Valley, Superposition), Tellusim (GravityMark),
 FurMark 2, PassMark PerformanceTest, Autodesk Fusion, Steam client, plus the repository's own
@@ -260,8 +262,9 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
 ## ⚠️ Limitations
 
 - **Test-signed:** needs test signing, so Secure Boot must be off (not enforced).
-- **No OpenCL.** Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility Pack*: its Dozen
-  driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
+- **OpenCL is 64-bit only** (clvk). Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility
+  Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
+- **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
 - Exclusive fullscreen works (GravityMark in every API), but Unigine Heaven and Superposition (D3D11) fail
   in exclusive fullscreen; windowed and borderless work.
@@ -285,7 +288,8 @@ build/build_installer.sh --package # both in one go
 ```
 
 The individual builds are `build_kmd3d.sh`, `build_umd.sh [32]`, `build_dxvk.sh [32]`,
-`build_vkd3d.sh [32]`, `build_triton_venus.sh [32]` and `build_gl.sh [32]`.
+`build_vkd3d.sh [32]`, `build_triton_venus.sh [32]` and `build_gl.sh [32]`. OpenCL: `build_clvk.sh` (clvk with an
+LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (Khronos `OpenCL.dll`).
 
 | Path | Contents |
 |---|---|

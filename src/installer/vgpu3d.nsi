@@ -34,7 +34,7 @@ Var FinishText
 !define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
 !define MUI_WELCOMEPAGE_TITLE "${FULLNAME} ${VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "Hardware-accelerated Vulkan, Direct3D 9/10/11/12 and OpenGL for Windows 11 guests on QEMU/KVM virtio-gpu (Venus + virgl on the host).$\r$\n$\r$\nSetup will:$\r$\n  - enable test signing if needed (one reboot; Secure Boot must be off)$\r$\n  - create a local code-signing certificate and sign the driver$\r$\n  - install the driver for the virtio-gpu display adapter$\r$\n$\r$\nThe display adapter restarts during installation: apps that use the GPU may close. Save your work first."
+!define MUI_WELCOMEPAGE_TEXT "Hardware-accelerated Vulkan, Direct3D 9/10/11/12, OpenGL and OpenCL for Windows 11 guests on QEMU/KVM virtio-gpu (Venus + virgl on the host).$\r$\n$\r$\nSetup will:$\r$\n  - enable test signing if needed (one reboot; Secure Boot must be off)$\r$\n  - create a local code-signing certificate and sign the driver$\r$\n  - install the driver for the virtio-gpu display adapter$\r$\n$\r$\nThe display adapter restarts during installation: apps that use the GPU may close. Save your work first."
 !define MUI_FINISHPAGE_TITLE "${FULLNAME}"
 !define MUI_FINISHPAGE_TEXT "$FinishText"
 !define MUI_FINISHPAGE_TEXT_REBOOT "$FinishText$\r$\n$\r$\nReboot now?"
@@ -88,6 +88,32 @@ Section "Driver" SecDriver
   WriteRegDWORD HKLM "${UNINSTKEY}" "NoRepair" 1
   WriteRegDWORD HKLM "${UNINSTKEY}" "EstimatedSize" ${SIZEKB}
 
+  ; OpenCL: Windows ships no OpenCL.dll; install the Khronos loader (it finds clvk through the adapter's
+  ; OpenCLDriverName) when there is none or ours is newer
+  ${DisableX64FSRedirection}
+  StrCpy $1 "install"
+  ${If} ${FileExists} "$WINDIR\System32\OpenCL.dll"
+    GetDLLVersion "$WINDIR\System32\OpenCL.dll" $2 $3
+    GetDLLVersion "$INSTDIR\tools\OpenCL.dll" $4 $5
+    StrCpy $1 "keep"
+    ${If} $4 U> $2
+      StrCpy $1 "upgrade"
+    ${ElseIf} $4 == $2
+    ${AndIf} $5 U> $3
+      StrCpy $1 "upgrade"
+    ${EndIf}
+  ${EndIf}
+  ${If} $1 != "keep"
+    CopyFiles /SILENT "$INSTDIR\tools\OpenCL.dll" "$WINDIR\System32\OpenCL.dll"
+    DetailPrint "OpenCL loader: $1 System32\OpenCL.dll"
+    ${If} $1 == "install"
+      WriteRegDWORD HKLM "${UNINSTKEY}" "InstalledOpenCLLoader" 1
+    ${EndIf}
+  ${Else}
+    DetailPrint "OpenCL loader: keeping the existing System32\OpenCL.dll"
+  ${EndIf}
+  ${EnableX64FSRedirection}
+
   DetailPrint "Signing and installing the driver package..."
   nsExec::ExecToLog `${PS} -File "$INSTDIR\install.ps1" -PackageDir "$INSTDIR"`
   Pop $0
@@ -118,6 +144,13 @@ Section "Uninstall"
   nsExec::ExecToLog `${PS} -File "$INSTDIR\uninstall3d.ps1" -RemoveCert`
   Pop $0
   DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\RunOnce" "vgpu3d-setup"
+  ; remove the OpenCL loader only if this installer added it (no other vendor's OpenCL.dll was there)
+  ReadRegDWORD $0 HKLM "${UNINSTKEY}" "InstalledOpenCLLoader"
+  ${If} $0 == 1
+    ${DisableX64FSRedirection}
+    Delete /REBOOTOK "$WINDIR\System32\OpenCL.dll"
+    ${EnableX64FSRedirection}
+  ${EndIf}
   DeleteRegKey HKLM "${UNINSTKEY}"
   ; in-use DLLs (loaded by running apps) go at the next reboot
   RMDir /r /REBOOTOK "$INSTDIR"
