@@ -90,7 +90,8 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
     deadlocks Vulkan). DX12 is vkd3d-proton with a CPU-waited queue gate.
   - A nonzero `VgpuBootGuard` in the VioGpu3D service key makes DriverEntry refuse to load (Code 39,
     0xC0000365); install.ps1 resets it.
-  - Superposition D3D11 shows black patches.
+  - Superposition D3D11 renders darker, harder shadows than its OpenGL path. Investigated and closed as
+    not a driver bug (docs/STATUS.md); don't reopen without a native-Windows reference.
   - Fullscreen tests need the app in the foreground: run `C:\vgpu\fg.ps1 -Name <process>` beside it.
     A GDI screenshot shows only DWM's black desktop while a blt-model app owns exclusive fullscreen;
     the frames go through the framebuffer copy (check the "fb async frame ... centre=" log lines).

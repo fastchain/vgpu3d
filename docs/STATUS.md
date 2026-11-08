@@ -681,9 +681,9 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   patches.
 - src/umd/readbacktest passes for render→staging copies of cube/2D mip chains (fmt 10/28/2), polled
   readback (event query, Map DO_NOT_WAIT) and depth cube clears.
-- Still open. What's left is the app choosing a different light/probe setup under D3D11 than under GL.
-  Without a native-Windows reference it is unclear whether the scene is wrong at all; the GL path could be
-  the one that differs. DXVK diagnostics stay in the tree (off by default):
+- **Closed: not a driver bug.** The difference is the app's own D3D11 light/probe setup, which differs from
+  its GL path; our stack executes it faithfully (the WARP replay matches). DXVK diagnostics stay in the tree
+  (off by default):
   - `VGPU_TRACE_MAP=1` logs Map READ, cube creation, cube copies/updates/depth clears, query result
     summaries, CheckFormatSupport answers and rejected texture descriptions.
   - `VGPU_VERIFY_INIT=1` checks initial uploads.

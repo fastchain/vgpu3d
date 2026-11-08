@@ -319,8 +319,6 @@ webdeploy folder; they're no longer needed.
   none or an older one is there. 64-bit only for now. Do **not** install Microsoft's "OpenCL, OpenGL and
   Vulkan Compatibility Pack": its Dozen Vulkan driver calls D3D12, our D3D12 driver calls Vulkan, and every
   Vulkan app (and DWM after a reboot) deadlocks.
-- **Superposition (D3D11)** shows black patches on lit geometry in some scenes; OpenGL renders the
-  same scenes correctly.
 - **Driver updates crash GPU-using apps**, including Explorer and DWM, while the adapter restarts.
   Windows restarts the shell; save your work before updating.
 - **The desktop goes through a CPU framebuffer copy** (section 4.5), and so do old-style (blt-model)

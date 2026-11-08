@@ -269,7 +269,6 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
   Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
-- Superposition (D3D11) shows black patches in some scenes (OpenGL is fine).
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.
 
