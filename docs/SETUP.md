@@ -323,7 +323,10 @@ webdeploy folder; they're no longer needed.
   Windows restarts the shell; save your work before updating.
 - **The desktop goes through a CPU framebuffer copy** (section 4.5), and so do old-style (blt-model)
   D3D windows. Large resolutions cost CPU.
-- Video memory is reported as 256 MB to apps; that's an estimate, not a limit.
+- **Video memory** is reported as the host GPU's device-local memory (e.g. 24 GB on an RTX 4090). The installer
+  reads it through Vulkan (`tools\vgpuvram.exe`), stores it as `VideoMemoryMB` in the adapter's driver key and
+  restarts the adapter; the driver then reports it as dedicated video memory (DXGI, dxdiag, Task Manager). After
+  moving the VM to another host GPU, re-run `install.ps1 -VramOnly` from the package directory, elevated.
 
 ---
 
@@ -338,6 +341,7 @@ webdeploy folder; they're no longer needed.
 | QEMU log: `vrend_renderer_transfer_iov … Illegal resource` | a resource without guest backing (old driver builds); update the driver |
 | High CPU load, GPU mostly idle (host `nvtop`) | expected with this design: D3D/GL → Vulkan translation in the guest, Venus decode on one host thread per app, and the CPU display copy. Give the VM more cores; lower resolution helps most |
 | Explorer/Start menu crash once | happened during a driver update (8); Windows restarts it |
+| Apps or 3DMark warn about too little VRAM; dxdiag shows ~4 GB dedicated | `VideoMemoryMB` not set (installer ran without a working adapter): run `install.ps1 -VramOnly` elevated in the desktop session |
 | Specific app renders black/white | check `C:\Users\<you>\<App>\log` and the host log. GL apps: see dual-source blending (8) |
 
 **Logs:**

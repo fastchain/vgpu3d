@@ -702,3 +702,23 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
 - INF `HWCursor=1` (was 0). Confirmed by the user in virt-manager: the pointer is smooth, with the right
   shapes and hot spot. The pointer stress (876 moves over arrow/I-beam/hand/wait) and the D3D11/12/Vulkan
   tests pass.
+
+### Real video memory and 3DMark Steel Nomad (2026-11-08)
+- Dedicated video memory is the sum of all memory (non-aperture) segments. The only one was the host-visible
+  shmem window (4 GiB here), so DXGI reported 4 GB and the registry/WMI 0. 3DMark warned "not enough VRAM",
+  and Unigine printed 256 MB (from the empty registry fields).
+- The KMD now reads `VideoMemoryMB` from its driver key and adds a memory segment (base 0x10_0000_0000) sized
+  VRAM minus the shmem window. No allocation lists it in its segment sets, and page tables stay in system
+  memory, so it changes only the accounting. It also writes `HardwareInformation.MemorySize`/`qwMemorySize`.
+  install.ps1 measures the Venus device-local heap with `tools\vgpuvram.exe` in the desktop session (session 0
+  has no adapter) and restarts the adapter when the value changes. After a reboot-required install it
+  schedules `install.ps1 -VramOnly` via RunOnce. dxdiag: Dedicated 24564 MB on the RTX 4090.
+- Steel Nomad DX12 failed with DEVICE_REMOVED in CreateCommittedResource2. 3DMark logs the workload's
+  vkd3d-proton output to Documents\3DMark\3DMark.log, which showed "Unhandled VkResult -11" just before it.
+  vkd3d-proton now logs the caller of unhandled VkResults: it was vkd3d_create_image, i.e. vkCreateImage
+  returning VK_ERROR_FORMAT_NOT_SUPPORTED. The cause is Venus rewriting shareable optimal 2D images to the
+  LINEAR DRM modifier, which the host lacks for some formats/usages. Fix: on that error, retry the image as
+  optimal and not shareable. First attempt (an up-front format query) rejected some of DWM's shared surfaces
+  and sent DWM into a crash loop (0xc00001ad, "display not active"), so only a real failure falls back now.
+- Steel Nomad DX12 demo at 4K: 2295 points (22.96 fps), user-watched run; the earlier scripted run gave 2271.
+  SystemInfo still shows "GPU: not available" (PCI-ID based; virtio-gpu 1AF4:1050).

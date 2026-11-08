@@ -1,6 +1,6 @@
 ; vgpu3d-setup.exe: installer for the vgpu3d WDDM driver package (build/build_installer.sh).
 ; Wraps out/package-kmd3d/vgpu3d and drives install.ps1 (test signing, certificate, catalog, pnputil)
-; so the guest needs no manual steps.  makensis -DVERSION=x.y.z -DPKGDIR=<package> -DOUTFILE=<exe>
+; so the guest needs no manual steps.  makensis -DVERSION=w.x.y.z -DPKGDIR=<package> -DOUTFILE=<exe>
 Unicode true
 ManifestDPIAware true
 RequestExecutionLevel admin
@@ -21,7 +21,7 @@ Name "${FULLNAME}"
 OutFile "${OUTFILE}"
 InstallDir "$PROGRAMFILES64\vgpu3d"
 BrandingText "${NAME} ${VERSION}"
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${VERSION}"
 VIAddVersionKey "ProductName" "${FULLNAME}"
 VIAddVersionKey "FileDescription" "${FULLNAME} setup"
 VIAddVersionKey "FileVersion" "${VERSION}"

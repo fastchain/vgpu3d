@@ -104,6 +104,14 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     }
 
     static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
+    // The host GPU's local memory, reported as an extra memory segment
+    // (registry VideoMemoryMB, written by install.ps1 from the Venus device-
+    // local heap).  Nothing allocates from it; with the host-visible shmem
+    // window it makes dxgkrnl report the real dedicated video memory (DXGI,
+    // dxdiag, budgets) instead of just that window.  0 = not reported.
+    static const ULONGLONG VRAM_SEGMENT_BASE = 0x1000000000;
+    ULONGLONG m_VideoMemoryBytes = 0;
+    ULONGLONG VramSegmentSize() const;
   private:
     DEVICE_OBJECT *m_pPhysicalDevice;
     DXGKRNL_INTERFACE m_DxgkInterface;
@@ -855,6 +863,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN CheckHardware();
     NTSTATUS WriteRegistryString(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ PCSTR pszValue);
     NTSTATUS WriteRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ PDWORD pdwValue);
+    NTSTATUS WriteRegistryQWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ ULONGLONG qwValue);
     NTSTATUS ReadRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _Inout_ PDWORD pdwValue);
     NTSTATUS SetRegisterInfo(_In_ ULONG Id, _In_ DWORD MemSize);
     NTSTATUS GetRegisterInfo(void);

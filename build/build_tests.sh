@@ -11,8 +11,10 @@ $T-g++-posix -O2 -Wall -Wno-unknown-pragmas -I$R/out/dml-include -o $O/dmltest.e
   -static -ld3d12 -ldxgi -luuid
 $T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/vkprops.exe $R/src/umd/vkprops/vkprops.c \
   $R/out/vulkan-mingw/libvulkan-1.dll.a
+$T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/vgpuvram.exe $R/src/umd/vgpuvram/vgpuvram.c \
+  $R/out/vulkan-mingw/libvulkan-1.dll.a
 $T-gcc-posix -O2 -Wall -o $O/readbacktest.exe $R/src/umd/readbacktest/readbacktest.c -static -ld3d11 -ldxgi -luuid
 for T2 in x86_64 i686; do
   $T2-w64-mingw32-gcc-posix -O2 -Wall -mwindows -o $O/blttest_$T2.exe $R/src/umd/blttest/blttest.c -static -ld3d11 -ldxgi -luuid
 done
-ls -la $O/cltest.exe $O/dmltest.exe $O/vkprops.exe $O/readbacktest.exe $O/blttest_*.exe
+ls -la $O/cltest.exe $O/dmltest.exe $O/vkprops.exe $O/vgpuvram.exe $O/readbacktest.exe $O/blttest_*.exe

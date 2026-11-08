@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.0.26312.27465 (2026-11-08)
+
+Installer: `vgpu3d-setup-1.0.26312.27465.exe`. From this release on, releases are named by the full driver version.
+
+### Fixed
+- **3DMark Steel Nomad (D3D12)** no longer fails with `DXGI_ERROR_DEVICE_REMOVED`. Shareable textures in formats
+  the host GPU cannot lay out linearly (e.g. block-compressed) made the host reject the image
+  (`VK_ERROR_FORMAT_NOT_SUPPORTED`) and vkd3d-proton removed the device; such images are now created optimal and
+  not shareable. Steel Nomad DX12 demo: **2295 points (22.96 fps)** on an RTX 4090 host.
+
+### Added
+- **Real video memory size.** Windows, DXGI, dxdiag and Task Manager report the host GPU's memory (24 GB on an
+  RTX 4090) as dedicated video memory instead of the ~4 GB host-visible window, so apps budget correctly and
+  3DMark stops warning about VRAM. The installer measures it through Vulkan (`tools\vgpuvram.exe`) and stores it
+  as `VideoMemoryMB` in the adapter's registry key; `install.ps1 -VramOnly` refreshes it after a host GPU change.
+
+### Known limitations
+- As in 1.0.26312. 3DMark's SystemInfo still shows the GPU as "not available": it identifies cards by PCI ID, and
+  the adapter is a virtio-gpu device.
+
 ## 1.0.26312 (2026-11-08)
 
 First release. Installer: `vgpu3d-setup-1.0.26312.exe`, driver version 1.0.26312.24550.

@@ -7,6 +7,9 @@
   2. Creates a self-signed code-signing certificate and trusts it (Root + TrustedPublisher).
   3. Signs vgpu.sys, builds vgpu.cat with Inf2Cat, signs the catalog.
   4. Installs the driver package with pnputil.
+  5. Stores the host GPU's memory size (tools\vgpuvram.exe, Vulkan) as the adapter's VideoMemoryMB and
+     restarts the adapter, so Windows reports the real dedicated video memory.  -VramOnly runs just this
+     step (the installer schedules it for the next logon when the install needs a reboot).
 
   Re-run after "bcdedit /set testsigning on" + reboot if step 1 asks for it.
 
@@ -16,7 +19,8 @@
 [CmdletBinding()]
 param(
   [string]$PackageDir,
-  [switch]$SkipInstall
+  [switch]$SkipInstall,
+  [switch]$VramOnly
 )
 $ErrorActionPreference = 'Stop'
 if (-not $PackageDir) { $PackageDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -26,6 +30,32 @@ function Fail($m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Fail 'Run this script from an elevated (Administrator) PowerShell.'
 }
+
+# --- 5. host video memory ---------------------------------------------------------------
+# The kernel driver cannot see the host GPU's memory; Venus can.  Store the device-local heap size in the
+# adapter's driver key and restart the adapter once so the driver reports it as dedicated video memory.
+function Set-VideoMemory {
+  Step 'Reporting host video memory'
+  $dev = Get-PnpDevice -PresentOnly -EA SilentlyContinue | ? { $_.InstanceId -like 'PCI\VEN_1AF4&DEV_1050*' } | select -First 1
+  if (-not $dev -or $dev.Status -ne 'OK') { Write-Host '  adapter not running; skipped' -ForegroundColor Yellow; return }
+  $probe = Join-Path $PackageDir 'tools\vgpuvram.exe'
+  if (-not (Test-Path $probe)) { Write-Host '  tools\vgpuvram.exe missing; skipped' -ForegroundColor Yellow; return }
+  $mb = 0
+  for ($i = 0; $i -lt 5 -and $mb -eq 0; $i++) {
+    $o = & $probe 2>$null
+    if ($LASTEXITCODE -eq 0 -and "$o" -match '^\s*(\d+)') { $mb = [int]$matches[1] } else { Start-Sleep 2 }
+  }
+  if ($mb -le 0) { Write-Host '  no Venus device answered; skipped' -ForegroundColor Yellow; return }
+  $drv = (Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_Driver').Data
+  $key = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$drv"
+  $cur = (Get-ItemProperty $key -EA SilentlyContinue).VideoMemoryMB
+  Write-Host "  host GPU memory: $mb MiB"
+  if ($cur -eq $mb) { return }
+  Set-ItemProperty $key VideoMemoryMB $mb -Type DWord
+  Write-Host '  restarting the display adapter to apply it'
+  pnputil /restart-device "$($dev.InstanceId)" | Out-Null
+}
+if ($VramOnly) { Set-VideoMemory; exit 0 }
 
 $sys = Join-Path $PackageDir 'vgpu.sys'
 $inf = Join-Path $PackageDir 'vgpu.inf'
@@ -110,5 +140,12 @@ if (Get-PnpDevice -PresentOnly -EA SilentlyContinue | ? { $_.InstanceId -like 'P
 Write-Host ''
 Write-Host 'If the virtio-gpu adapter still shows the old driver, open Device Manager > Display adapters,' -ForegroundColor Yellow
 Write-Host 'Update driver > Browse my computer > Let me pick > Have Disk, and choose this vgpu.inf.' -ForegroundColor Yellow
-if ($rc -eq 3010) { Write-Host 'Reboot required to finish the installation.' -ForegroundColor Yellow }
+if ($rc -eq 3010) {
+  Write-Host 'Reboot required to finish the installation.' -ForegroundColor Yellow
+  $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  Set-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce' 'vgpu3d-vram' `
+    "`"$ps`" -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -PackageDir `"$PackageDir`" -VramOnly"
+} else {
+  Set-VideoMemory
+}
 exit $rc

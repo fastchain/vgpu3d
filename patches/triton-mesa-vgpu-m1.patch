@@ -696,10 +696,10 @@ index 4386d62..4623345 100644
     *pHandle = vn_renderer_bo_export_handle(dev->renderer, mem->base_bo, is_kmt);
     if (*pHandle == NULL)
 diff --git a/src/virtio/vulkan/vn_image.c b/src/virtio/vulkan/vn_image.c
-index 584ccb8..a7a9e94 100644
+index 584ccb8..27dd970 100644
 --- a/src/virtio/vulkan/vn_image.c
 +++ b/src/virtio/vulkan/vn_image.c
-@@ -558,6 +558,9 @@ struct vn_image_create_info {
+@@ -558,21 +558,67 @@ struct vn_image_create_info {
     VkImageStencilUsageCreateInfo stencil;
     VkImageDrmFormatModifierListCreateInfoEXT modifier_list;
     VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_explicit;
@@ -709,7 +709,10 @@ index 584ccb8..a7a9e94 100644
  };
  
  static const VkImageCreateInfo *
-@@ -567,12 +570,54 @@ vn_image_fix_create_info(
+ vn_image_fix_create_info(
+    const VkImageCreateInfo *create_info,
++   bool force_not_shareable,
+    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
     struct vn_image_create_info *local_info)
  {
     local_info->create = *create_info;
@@ -731,7 +734,7 @@ index 584ccb8..a7a9e94 100644
 +      const char *e = getenv("VN_VGPU_NO_LINEAR");
 +      no_linear = e && e[0] == '1';
 +   }
-+   const bool linear_ok = !no_linear &&
++   const bool linear_ok = !no_linear && !force_not_shareable &&
 +      create_info->imageType == VK_IMAGE_TYPE_2D &&
 +      create_info->samples == VK_SAMPLE_COUNT_1_BIT &&
 +      create_info->mipLevels == 1 && create_info->arrayLayers == 1 &&
@@ -764,19 +767,34 @@ index 584ccb8..a7a9e94 100644
           memcpy(&local_info->external, src, sizeof(local_info->external));
           local_info->external.handleTypes = renderer_handle_type;
           next = &local_info->external;
-@@ -687,12 +732,26 @@ vn_CreateImage(VkDevice device,
+@@ -686,13 +732,40 @@ vn_CreateImage(VkDevice device,
+ #endif
     } else {
        struct vn_image_create_info local_info;
++      const VkImageCreateInfo *orig_info = pCreateInfo;
        if (external_info &&
 -          external_info->handleTypes != renderer_handle_type) {
 +          (external_info->handleTypes != renderer_handle_type ||
 +           (DETECT_OS_WINDOWS &&
 +            pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL))) {
           pCreateInfo = vn_image_fix_create_info(
-             pCreateInfo, renderer_handle_type, &local_info);
+-            pCreateInfo, renderer_handle_type, &local_info);
++            pCreateInfo, false, renderer_handle_type, &local_info);
        }
  
        result = vn_image_create(dev, pCreateInfo, alloc, &img);
++      /* vgpu: the host has no linear layout for some formats/usages it was
++       * rewritten to (block-compressed textures, some storage usages) and
++       * fails with VK_ERROR_FORMAT_NOT_SUPPORTED, which vkd3d-proton turns
++       * into device removal (3DMark Steel Nomad).  Retry such an image as
++       * optimal and not shareable, like the multi-mip/MSAA case. */
++      if (DETECT_OS_WINDOWS && result == VK_ERROR_FORMAT_NOT_SUPPORTED &&
++          pCreateInfo == &local_info.create && !local_info.vgpu_not_shareable) {
++         pCreateInfo = vn_image_fix_create_info(orig_info, true,
++                                                renderer_handle_type,
++                                                &local_info);
++         result = vn_image_create(dev, pCreateInfo, alloc, &img);
++      }
 +      if (result == VK_SUCCESS && external_info &&
 +          pCreateInfo == &local_info.create) {
 +         img->vgpu_not_shareable = local_info.vgpu_not_shareable;

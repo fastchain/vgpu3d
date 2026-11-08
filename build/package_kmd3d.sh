@@ -46,6 +46,9 @@ cp $R/src/kmd3d-inf/virtio_icd.json $P/
 [ -f $R/out/opencl/OpenCL.dll ] || $R/build/build_opencl_loader.sh
 cp $R/out/clvk/OpenCL.dll $P/clvk.dll
 cp $R/out/opencl/OpenCL.dll $P/tools/OpenCL.dll
+# host VRAM probe for install.ps1 (VideoMemoryMB); built by build_tests.sh
+[ -f $R/out/tests64/vgpuvram.exe ] || $R/build/build_tests.sh
+cp $R/out/tests64/vgpuvram.exe $P/tools/
 cp $R/src/kmd3d-inf/vgpu3d.inf $P/
 sed -i "s#^DriverVer=.*#DriverVer=$(date -u -d yesterday +%m/%d/%Y),1.0.$(date -u +%y%j).$(( $(date -u +%s) % 86400 / 2 ))#" $P/vgpu3d.inf
 # release: kernel log level ERROR (the INF default 4 = INFORMATION is for debug builds)

@@ -10,7 +10,7 @@ R=/workspace/driver; P=$R/out/package-kmd3d/vgpu3d
 cp $R/tools/windows/install.ps1 $R/tools/windows/uninstall3d.ps1 $P/
 sed -i "s/'vgpu.sys'/'viogpu3d.sys'/; s/'vgpu.inf'/'vgpu3d.inf'/; s/'vgpu.cat'/'vgpu3d.cat'/" $P/install.ps1
 V=$(sed -n 's/^DriverVer=[^,]*,\([0-9.]*\).*/\1/p' $P/vgpu3d.inf | tr -d '\r')
-V=${V%.*}   # 1.0.YYDDD.N -> 1.0.YYDDD (VIProductVersion appends .0)
+# the full DriverVer (1.0.YYDDD.N) names the release, so two builds on one day stay distinct
 OUT=$R/out/vgpu3d-setup-$V.exe
 SIZEKB=$(du -sk $P | cut -f1)
 makensis -V2 -DVERSION=$V -DPKGDIR=$P -DOUTFILE=$OUT -DREADME=$R/README.md -DSIZEKB=$SIZEKB $R/src/installer/vgpu3d.nsi

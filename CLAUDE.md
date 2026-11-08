@@ -98,3 +98,8 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
   - Never kill DbgView while apps run: a dead DbgView that still owns DBWIN_BUFFER makes every
     OutputDebugString block (looks like a driver hang inside OpenAdapter/present).
   - Stuck GPU queue: `VN_VGPU_TRACE_SUBMIT=C:\vgpu\vn-trace.txt` logs every Venus submit's semaphores.
+  - 3DMark (Steam demo): the first launch shows a UAC prompt on the secure desktop (screenshots go black;
+    the user must click). The workload's vkd3d-proton log lands in `Documents\3DMark\3DMark.log`. After
+    killing 3DMark, also kill its `javaw.exe`, or Steam keeps the game "running" and refuses to relaunch it.
+  - Driver changes that touch shared (external-memory) images can crash DWM in a loop (viewer: "display not
+    active"); check `Dwminit` events in the Application log right after installing.

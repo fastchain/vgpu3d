@@ -14,7 +14,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
 ![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
-![Release](https://img.shields.io/badge/release-1.0.26312-brightgreen)
+![Release](https://img.shields.io/badge/release-1.0.26312.27465-brightgreen)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
 </div>
@@ -71,7 +71,8 @@ while the GPU stays shared with the host and with other VMs.
 ## 🧩 Supported APIs and engines
 
 The guest sees one adapter, **"vgpu VirtIO GPU 3D (WDDM)"**, and reports the host GPU by name
-(e.g. `Virtio-GPU Venus (NVIDIA GeForce RTX 4090)`). Apps use it automatically, with no per-app setup.
+(e.g. `Virtio-GPU Venus (NVIDIA GeForce RTX 4090)`) with the host GPU's memory as dedicated video memory.
+Apps use it automatically, with no per-app setup.
 
 | API | 64-bit | 32-bit | Implementation |
 |---|:---:|:---:|---|
@@ -84,7 +85,7 @@ The guest sees one adapter, **"vgpu VirtIO GPU 3D (WDDM)"**, and reports the hos
 | **OpenCL 3.0** | ✅ | ❌ | **clvk** (OpenCL on Vulkan, clspv compiler built in) |
 | DirectML | ✅ | – | Windows' DirectML.dll on our D3D12 |
 
-**Tested engines and apps:** Unigine (Heaven, Valley, Superposition), Tellusim (GravityMark),
+**Tested engines and apps:** 3DMark (Steel Nomad), Unigine (Heaven, Valley, Superposition), Tellusim (GravityMark),
 FurMark 2, PassMark PerformanceTest, Autodesk Fusion, Steam client, plus the repository's own
 D3D9/11/12, Vulkan and OpenGL test programs. Display modes go up to **5120×2160**.
 
@@ -101,6 +102,7 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 | | OpenGL | 12684 (~76 fps) |
 | | Direct3D 11 | 11516 (~69 fps) |
 | **GravityMark 1.89**, 3840×2160 exclusive fullscreen | D3D12 / Vulkan / OpenGL / D3D11 | 12587 / 5539 / 5295 / 4767 (75 / 33 / 32 / 29 fps) |
+| **3DMark Steel Nomad** (demo), 4K offscreen | Direct3D 12 | **2295** (22.96 fps) |
 | **Unigine Superposition 1.1**, 1080p | Direct3D 11 / OpenGL | 69.8 / 56.4 fps |
 | **Unigine Heaven 4.0** (5K desktop) | Direct3D 11 / OpenGL | 82–88 / 67.4 fps |
 | **Unigine Heaven 4.0**, exclusive fullscreen | Direct3D 11, 3840×2160 / 1920×1080 | 72.0 / 187.2 fps |

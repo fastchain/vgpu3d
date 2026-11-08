@@ -913,7 +913,7 @@ NTSTATUS VioGpuAdapter::QueryDeviceDescriptor(_In_ ULONG ChildUid, _Inout_ DXGK_
 // The segment topology shared by DXGKQAITYPE_QUERYSEGMENT3 and 4: segment 1
 // is the CPU-invisible aperture, optional segment 2 the CPU-visible host
 // shmem window.
-template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSegmentInfo)
+template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSegmentInfo, bool hasShmem)
 {
     // Room for the monitored-fence deferral to stamp a VIOGPU_DMA_PRIVATE
     // into each paging buffer's private data (SIGNAL_MONITORED_FENCE); 0
@@ -937,7 +937,7 @@ template <typename SEGMENTOUT> static void FillPagingBufferInfo(SEGMENTOUT *pSeg
         RTL_OSVERSIONINFOW vi = {sizeof(vi)};
         s_build = NT_SUCCESS(RtlGetVersion(&vi)) ? vi.dwBuildNumber : 1;
     }
-    if (s_build < 26100 && pSegmentInfo->NbSegment >= 2)
+    if (s_build < 26100 && hasShmem)
     {
         pSegmentInfo->PagingBufferSegmentId = 2;
     }
@@ -952,6 +952,25 @@ template <typename DESC> static void FillApertureSegment(DESC *pDesc)
     pDesc->Flags.CacheCoherent = TRUE;
     pDesc->Flags.CpuVisible = FALSE;
     pDesc->Flags.DirectFlip = TRUE;
+}
+
+// The host GPU's local memory (see m_VideoMemoryBytes): a memory segment no
+// allocation lists in its segment sets, so VidMm never places anything there.
+template <typename DESC> static void FillVramSegment(DESC *pDesc, ULONGLONG size)
+{
+    pDesc->BaseAddress.QuadPart = VioGpuAdapter::VRAM_SEGMENT_BASE;
+    pDesc->Size = (SIZE_T)size;
+    pDesc->CommitLimit = (SIZE_T)size;
+    pDesc->Flags.Aperture = FALSE;
+    pDesc->Flags.CpuVisible = FALSE;
+}
+
+// Dedicated video memory is the sum of all memory segments, and the host-visible
+// shmem window already counts, so the extra segment carries the remainder.
+ULONGLONG VioGpuAdapter::VramSegmentSize() const
+{
+    ULONGLONG shmem = m_VioDev.shmem.available ? m_VioDev.shmem.length : 0;
+    return m_VideoMemoryBytes > shmem ? m_VideoMemoryBytes - shmem : 0;
 }
 
 template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
@@ -1128,16 +1147,20 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
 
                 DXGK_QUERYSEGMENTOUT3 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT3 *)pQueryAdapterInfo->pOutputData;
-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
+                const UINT nbSegments = 1 + (m_VioDev.shmem.available ? 1 : 0) + (VramSegmentSize() ? 1 : 0);
                 pSegmentInfo->NbSegment = nbSegments;
                 if (pSegmentInfo->pSegmentDescriptor)
                 {
                     RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, sizeof(DXGK_SEGMENTDESCRIPTOR3) * nbSegments);
-                    FillPagingBufferInfo(pSegmentInfo);
+                    FillPagingBufferInfo(pSegmentInfo, m_VioDev.shmem.available);
                     FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
-                    if (nbSegments == 2)
+                    if (m_VioDev.shmem.available)
                     {
                         FillShmemSegment(&pSegmentInfo->pSegmentDescriptor[1]);
+                    }
+                    if (VramSegmentSize())
+                    {
+                        FillVramSegment(&pSegmentInfo->pSegmentDescriptor[nbSegments - 1], VramSegmentSize());
                     }
                 }
                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
@@ -1161,7 +1184,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
 
                 DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
+                const UINT nbSegments = 1 + (m_VioDev.shmem.available ? 1 : 0) + (VramSegmentSize() ? 1 : 0);
 
                 // Two-call contract: the first call has NbSegment == 0 (and no
                 // descriptor array); report only the segment count and touch
@@ -1173,7 +1196,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
 
                 pSegmentInfo->NbSegment = nbSegments;
-                FillPagingBufferInfo(pSegmentInfo);
+                FillPagingBufferInfo(pSegmentInfo, m_VioDev.shmem.available);
 
                 // pSegmentDescriptor is a BYTE* stride array: dxgkrnl OWNS
                 // SegmentDescriptorStride (its per-element size, matching the
@@ -1191,9 +1214,14 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
                 RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, stride * nbSegments);
                 FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
-                if (nbSegments == 2)
+                if (m_VioDev.shmem.available)
                 {
                     FillShmemSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + stride));
+                }
+                if (VramSegmentSize())
+                {
+                    FillVramSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + stride * (nbSegments - 1)),
+                                    VramSegmentSize());
                 }
 
                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments (v4)\n", __FUNCTION__));
@@ -2850,6 +2878,20 @@ NTSTATUS VioGpuAdapter::WriteRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle,
     return Status;
 }
 
+NTSTATUS VioGpuAdapter::WriteRegistryQWORD(_In_ HANDLE DevInstRegKeyHandle, _In_ PCWSTR pszwValueName, _In_ ULONGLONG qwValue)
+{
+    PAGED_CODE();
+
+    UNICODE_STRING UnicodeStrValueName;
+    RtlInitUnicodeString(&UnicodeStrValueName, pszwValueName);
+    NTSTATUS Status = ZwSetValueKey(DevInstRegKeyHandle, &UnicodeStrValueName, 0, REG_QWORD, &qwValue, sizeof(qwValue));
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("ZwSetValueKey failed with Status: 0x%X\n", Status));
+    }
+    return Status;
+}
+
 NTSTATUS VioGpuAdapter::ReadRegistryDWORD(_In_ HANDLE DevInstRegKeyHandle,
                                           _In_ PCWSTR pszwValueName,
                                           _Inout_ PDWORD pdwValue)
@@ -2946,13 +2988,17 @@ NTSTATUS VioGpuAdapter::SetRegisterInfo(_In_ ULONG Id, _In_ DWORD MemSize)
             break;
         }
 
-        DWORD MemorySize = MemSize;
+        // MemorySize is a DWORD (WMI AdapterRAM, saturates at 4 GiB);
+        // qwMemorySize carries the full value for dxdiag / Task Manager.
+        UNREFERENCED_PARAMETER(MemSize);
+        DWORD MemorySize = (DWORD)min(m_VideoMemoryBytes, (ULONGLONG)MAXULONG);
         Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"HardwareInformation.MemorySize", &MemorySize);
         if (!NT_SUCCESS(Status))
         {
             DbgPrint(TRACE_LEVEL_ERROR, ("WriteRegistryDWORD failed for MemorySize with Status: 0x%X", Status));
             break;
         }
+        WriteRegistryQWORD(DevInstRegKeyHandle, L"HardwareInformation.qwMemorySize", m_VideoMemoryBytes);
 
         DWORD DeviceId = Id;
         Status = WriteRegistryDWORD(DevInstRegKeyHandle, L"VioGpuAdapterID", &DeviceId);
@@ -2984,6 +3030,13 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
     }
 
     DWORD value = 0;
+    if (NT_SUCCESS(ReadRegistryDWORD(DevInstRegKeyHandle, L"VideoMemoryMB", &value)) && value != 0)
+    {
+        // Cap at 1 TiB; anything larger is a bad registry value.
+        m_VideoMemoryBytes = (ULONGLONG)min(value, 1024u * 1024u) << 20;
+    }
+
+    value = 0;
     Status = ReadRegistryDWORD(DevInstRegKeyHandle, L"HWCursor", &value);
     if (NT_SUCCESS(Status))
     {

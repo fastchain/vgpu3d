@@ -71,6 +71,30 @@ index 25754b7..cdca336 100644
 +    return resource ? resource->vgpu_kmt : NULL;
 +}
 +#endif
+diff --git a/libs/vkd3d/utils.c b/libs/vkd3d/utils.c
+index c62fb31..3b37deb 100644
+--- a/libs/vkd3d/utils.c
++++ b/libs/vkd3d/utils.c
+@@ -1476,7 +1476,19 @@ HRESULT hresult_from_vk_result(VkResult vr)
+             /* NV driver sometimes returns this on invalid API usage. */
+             return E_INVALIDARG;
+         default:
++#ifdef _WIN32
++        {
++            /* vgpu: name the call site (module-relative) so the failing Vulkan call can be found. */
++            HMODULE module = NULL;
++            void *caller = __builtin_return_address(0);
++            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                    (LPCSTR)caller, &module);
++            FIXME("Unhandled VkResult %d, caller %p (module %p, +0x%"PRIxPTR").\n", vr, caller, (void *)module,
++                    (uintptr_t)caller - (uintptr_t)module);
++        }
++#else
+             FIXME("Unhandled VkResult %d.\n", vr);
++#endif
+             /* fall-through */
+         case VK_ERROR_DEVICE_LOST:
+         case VK_ERROR_EXTENSION_NOT_PRESENT:
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
 index 8024485..124c4ed 100644
 --- a/libs/vkd3d/vkd3d_private.h
