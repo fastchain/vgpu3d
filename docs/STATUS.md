@@ -588,3 +588,12 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   The INF ships clvk.dll and sets OpenCLDriverName; the installer installs/upgrades the Khronos loader in
   System32 (and removes it on uninstall only if it added it). cltest through the installed loader:
   "clvk: Virtio-GPU Venus (NVIDIA GeForce RTX 4090)", vector add of 1M floats, 0 mismatches. 64-bit only.
+- clpeak (bundled with PassMark as clpeak64.exe) on clvk: single precision 2983-3828 GFLOPS, half 3283-3898,
+  int 1559-1943 GIOPS; global memory bandwidth only 10-12 GB/s and transfers 12-16 GB/s. clvk reports 1
+  compute unit and no profiling (clGetEventProfileInfo -7). Likely next steps: buffer memory type selection
+  under Venus (bandwidth suggests system-memory backing), compute-unit count, timestamp queries. One host
+  "vkDestroyDescriptorPool resulted in CS error" at clpeak exit.
+- PassMark GPU Compute (G3D_DIRECTCOMPUTE): Mandelbrot/QJulia4D (DirectCompute) run (QJulia4D ~620-690 fps),
+  then PerformanceTest64 waits indefinitely with no subtest process alive and nothing in our DLLs on any
+  stack -- not diagnosed (its own orchestration; subtest exes need PassMark's arguments).
+- Fullscreen Unigine remains open (see above); the validation layer is installed in the VM for the next try.

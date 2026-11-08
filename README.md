@@ -105,6 +105,8 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 | **FurMark 2**, 1080p preset | Vulkan / OpenGL | 7882 (130.9 fps) / 7258 |
 | **PassMark 11.1** 3D | DX9 / DX10 / DX11 / DX12 | 37 / 198 / 54 / 27 |
 | **Autodesk Fusion**, 2.5M triangles, 2560×1080 | Direct3D 11 | **66–69 fps** |
+| **clpeak** (OpenCL via clvk) | OpenCL 3.0 | ~3.0–3.8 TFLOPS fp32, 10–12 GB/s global memory (not tuned yet) |
+| DirectML element-wise add, 65536 floats | DirectML | passes (1.1 ms) |
 
 **Versus the CPU (no driver, Microsoft Basic Display + WARP):**
 
