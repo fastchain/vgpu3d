@@ -576,3 +576,7 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   clCreateContext on a null mutex -- also on the WARP device, so it is that binary, not our D3D12. Building
   OpenCLOn12 needs MSVC. Moving to option 2 (clvk). build/build_opencl_loader.sh cross-builds the Khronos
   ICD loader (OpenCL.dll, 64/32-bit); cltest now checks every step and takes CLTEST_DEVICE=<n>.
+- DirectML works on our D3D12: src/umd/dmltest (build/build_tests.sh) creates a DirectML device through
+  System32 DirectML.dll (1.15.6) on the vgpu adapter and runs an element-wise add of 65536 floats, 0
+  mismatches. MinGW note: COM methods returning structs > 8 bytes (IDMLDispatchable::GetBindingProperties)
+  pass the hidden result pointer in a different position than MSVC; dmltest calls that vtable slot directly.
