@@ -287,6 +287,53 @@ index 4a359d5..8962be5 100644
        esc.CtxInit.NumRings = 1;
        HRESULT hr = tritonKmEscape(km, &esc);
        if (SUCCEEDED(hr))
+diff --git a/src/virtio/neptune/triton/tritonPresent12.c b/src/virtio/neptune/triton/tritonPresent12.c
+index 033c07f..48a4262 100644
+--- a/src/virtio/neptune/triton/tritonPresent12.c
++++ b/src/virtio/neptune/triton/tritonPresent12.c
+@@ -480,7 +480,7 @@ t12Present(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HCOMMANDQUEUE hQueue,
+     if (src && src->pResource && !src->pCompanion && !src->CompanionFailed &&
+         q->pDev && (src->ResidencyOnlyAlloc || !src->hKMAllocation)) {
+         D3D12_RESOURCE_DESC desc;
+-        ID3D12Resource_GetDesc(src->pResource, &desc);
++        src->pResource->lpVtbl->GetDesc(src->pResource, &desc); /* aggregate return: explicit out pointer */
+         HRESULT hr = E_INVALIDARG;
+         BOOL resolvable = desc.SampleDesc.Count <= 1;
+         if (!resolvable) {
+diff --git a/src/virtio/neptune/triton/tritonQueue12.c b/src/virtio/neptune/triton/tritonQueue12.c
+index c658197..77447c6 100644
+--- a/src/virtio/neptune/triton/tritonQueue12.c
++++ b/src/virtio/neptune/triton/tritonQueue12.c
+@@ -288,6 +288,29 @@ triton12QueueGate(PTRITON12_QUEUE q)
+         return FALSE;
+     }
+ 
++#ifdef VGPU_DXVK_INPROC
++    /* vgpu: the D3D12 device is vkd3d-proton in this process, with no host
++     * side to retire a kernel gate token.  Wait here until the work behind
++     * the drain value has completed, so the runtime's fence signals that
++     * follow this submission never run early. */
++    {
++        HANDLE evt = CreateEventW(NULL, FALSE, FALSE, NULL);
++        BOOL done = FALSE;
++        if (evt && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(q->pDrainFence, v, evt)))
++            done = WaitForSingleObject(evt, 5000) == WAIT_OBJECT_0;
++        if (evt)
++            CloseHandle(evt);
++        if (!done && ID3D12Fence_GetCompletedValue(q->pDrainFence) < v) {
++            static LONG late;
++            if (InterlockedIncrement(&late) <= 4)
++                TR_LOG("12.QueueGate: drain v=%llu not reached after 5 s",
++                       (unsigned long long)v);
++            return FALSE;
++        }
++        return TRUE;
++    }
++#endif
++
+     UINT64 kmdToken = 0;
+     if (!npt_d3d12_ecl_gate_arm(q->pDrainFence, v, &kmdToken)) {
+         static LONG armFail;
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
 index e47217f..612e8fc 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
@@ -722,10 +769,31 @@ index 4e18632..30c6b95 100644
  
     /* For VK_ANDROID_external_memory_android_hardware_buffer, real image
 diff --git a/src/virtio/vulkan/vn_physical_device.c b/src/virtio/vulkan/vn_physical_device.c
-index 3355409..d62370f 100644
+index 3355409..df6de3b 100644
 --- a/src/virtio/vulkan/vn_physical_device.c
 +++ b/src/virtio/vulkan/vn_physical_device.c
-@@ -1015,6 +1015,18 @@ vn_physical_device_init_memory_properties(
+@@ -426,6 +426,20 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
+    struct vk_features *feats = &physical_dev->base.vk.supported_features;
+    vk_set_physical_device_features(feats, &feats2);
+ 
++   /* Below Vulkan 1.2 the renderer is queried through the extension structs,
++    * which have no counterpart for the VkPhysicalDeviceVulkan12Features
++    * members that only report "the extension is supported".  Apps written
++    * for 1.1 that still chain the 1.2 struct (FurMark 2) enable them, and
++    * the device creation then fails with VK_ERROR_FEATURE_NOT_PRESENT. */
++   if (renderer_version < VK_API_VERSION_1_2) {
++      feats->samplerMirrorClampToEdge = exts->KHR_sampler_mirror_clamp_to_edge;
++      feats->drawIndirectCount = exts->KHR_draw_indirect_count;
++      feats->descriptorIndexing = exts->EXT_descriptor_indexing;
++      feats->samplerFilterMinmax = exts->EXT_sampler_filter_minmax;
++      feats->shaderOutputViewportIndex = exts->EXT_shader_viewport_index_layer;
++      feats->shaderOutputLayer = exts->EXT_shader_viewport_index_layer;
++   }
++
+    /* Enable features for extensions natively implemented in Venus driver.
+     * See vn_physical_device_get_native_extensions.
+     */
+@@ -1015,6 +1029,18 @@ vn_physical_device_init_memory_properties(
     if (!has_coherent_cached) {
        props->memoryTypes[first_coherent].propertyFlags |=
           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -744,7 +812,7 @@ index 3355409..d62370f 100644
     }
  }
  
-@@ -1044,6 +1056,27 @@ vn_physical_device_init_external_memory(
+@@ -1044,6 +1070,27 @@ vn_physical_device_init_external_memory(
      * For vtest, the protocol does not support external memory import. So we
      * only mask out the importable bit so that wsi over vtest can be supported.
      */
@@ -772,7 +840,7 @@ index 3355409..d62370f 100644
     if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
        physical_dev->external_memory.renderer_handle_type =
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-@@ -1218,7 +1251,11 @@ vn_physical_device_get_native_extensions(
+@@ -1218,7 +1265,11 @@ vn_physical_device_get_native_extensions(
     if (physical_dev->external_memory.renderer_handle_type) {
  #if DETECT_OS_WINDOWS
        exts->KHR_external_memory_win32 = true;
@@ -785,7 +853,7 @@ index 3355409..d62370f 100644
  #else
        exts->KHR_external_memory_fd = true;
        exts->EXT_external_memory_dma_buf = true;
-@@ -2333,6 +2370,22 @@ vn_physical_device_fix_image_format_info(
+@@ -2333,6 +2384,22 @@ vn_physical_device_fix_image_format_info(
     local_info->format = *info;
     VkBaseOutStructure *dst = (void *)&local_info->format;
  
@@ -808,7 +876,7 @@ index 3355409..d62370f 100644
     vk_foreach_struct_const(src, info->pNext) {
        void *pnext = NULL;
        switch (src->sType) {
-@@ -2835,15 +2888,20 @@ vn_GetPhysicalDeviceImageFormatProperties2(
+@@ -2835,15 +2902,20 @@ vn_GetPhysicalDeviceImageFormatProperties2(
           external_info->handleType !=
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
  

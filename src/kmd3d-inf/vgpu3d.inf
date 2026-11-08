@@ -27,9 +27,11 @@ libgallium_wgl.dll = 1,,
 vgpu_d3d11.dll = 1,,
 dxvk_d3d11.dll = 1,,
 dxvk_dxgi.dll = 1,,
+vkd3d_d3d12core.dll = 1,,
 vgpu_d3d11_32.dll = 1,,
 dxvk32_d3d11.dll = 1,,
 dxvk32_dxgi.dll = 1,,
+vkd3d32_d3d12core.dll = 1,,
 vulkan_virtio32.dll = 1,,
 virtio_icd32.json = 1,,
 libgallium_wgl32.dll = 1,,
@@ -52,9 +54,11 @@ libgallium_wgl.dll,,,0
 vgpu_d3d11.dll,,,0
 dxvk_d3d11.dll,,,0
 dxvk_dxgi.dll,,,0
+vkd3d_d3d12core.dll,,,0
 vgpu_d3d11_32.dll,,,0
 dxvk32_d3d11.dll,,,0
 dxvk32_dxgi.dll,,,0
+vkd3d32_d3d12core.dll,,,0
 vulkan_virtio32.dll,,,0
 virtio_icd32.json,,,0
 libgallium_wgl32.dll,,,0

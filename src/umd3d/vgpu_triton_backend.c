@@ -127,16 +127,107 @@ npt_d3d11_create_device_internal(IDXGIAdapter *pAdapter,
    return hr;
 }
 
+/* D3D12: vkd3d-proton's d3d12core, loaded in-process like DXVK, creates the
+ * ID3D12Device that Triton's D3D12 DDI layer drives.  Its Agility-SDK entry
+ * point D3D12GetInterface hands out the device factory. */
+#ifdef _WIN64
+#define VGPU_VKD3D_CORE L"vkd3d_d3d12core.dll"
+#define VGPU_DXVK_DXGI L"dxvk_dxgi.dll"
+#else
+#define VGPU_VKD3D_CORE L"vkd3d32_d3d12core.dll"
+#define VGPU_DXVK_DXGI L"dxvk32_dxgi.dll"
+#endif
+
+/* ID3D12DeviceFactory (Agility SDK; not in the MinGW headers) */
+typedef struct vgpu_d3d12_device_factory vgpu_d3d12_device_factory;
+typedef struct {
+   HRESULT(STDMETHODCALLTYPE *QueryInterface)(vgpu_d3d12_device_factory *, REFIID, void **);
+   ULONG(STDMETHODCALLTYPE *AddRef)(vgpu_d3d12_device_factory *);
+   ULONG(STDMETHODCALLTYPE *Release)(vgpu_d3d12_device_factory *);
+   HRESULT(STDMETHODCALLTYPE *InitializeFromGlobalState)(vgpu_d3d12_device_factory *);
+   HRESULT(STDMETHODCALLTYPE *ApplyToGlobalState)(vgpu_d3d12_device_factory *);
+   HRESULT(STDMETHODCALLTYPE *SetFlags)(vgpu_d3d12_device_factory *, UINT);
+   UINT(STDMETHODCALLTYPE *GetFlags)(vgpu_d3d12_device_factory *);
+   HRESULT(STDMETHODCALLTYPE *GetConfigurationInterface)(vgpu_d3d12_device_factory *, REFCLSID, REFIID, void **);
+   HRESULT(STDMETHODCALLTYPE *EnableExperimentalFeatures)(vgpu_d3d12_device_factory *, UINT, const IID *, void *, UINT *);
+   HRESULT(STDMETHODCALLTYPE *CreateDevice)(vgpu_d3d12_device_factory *, IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+} vgpu_d3d12_device_factory_vtbl;
+struct vgpu_d3d12_device_factory {
+   const vgpu_d3d12_device_factory_vtbl *lpVtbl;
+};
+static const GUID vgpu_CLSID_D3D12DeviceFactory = { 0x114863bf, 0xc386, 0x4aee, { 0xb3, 0x9d, 0x8f, 0x0b, 0xbb, 0x06, 0x29, 0x55 } };
+static const GUID vgpu_IID_ID3D12DeviceFactory = { 0x61f307d3, 0xd34e, 0x4e7c, { 0x83, 0x74, 0x3b, 0xa4, 0xde, 0x23, 0xcc, 0xcb } };
+
+typedef HRESULT(WINAPI *PFN_D3D12_GET_INTERFACE_VGPU)(REFCLSID, REFIID, void **);
+typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY1_VGPU)(REFIID, void **);
+
+static HMODULE
+vgpu_load_sibling(const WCHAR *name)
+{
+   WCHAR path[MAX_PATH];
+   DWORD n = GetModuleFileNameW(g_self, path, MAX_PATH);
+   while (n && path[n - 1] != L'\\')
+      n--;
+   path[n] = 0;
+   if (n + wcslen(name) + 1 >= MAX_PATH)
+      return NULL;
+   wcscat(path, name);
+   HMODULE mod = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+   if (!mod)
+      TR_LOG("vgpu: loading %ls failed (%lu)", name, GetLastError());
+   return mod;
+}
+
 HRESULT
 npt_d3d12_create_device_internal(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel,
                                  REFIID riid, void **ppDevice)
 {
-   (void)pAdapter;
-   (void)MinimumFeatureLevel;
-   (void)riid;
-   if (ppDevice)
-      *ppDevice = NULL;
-   return E_NOTIMPL; /* D3D12 is M3 (vkd3d-proton) */
+   static PFN_D3D12_GET_INTERFACE_VGPU get_interface;
+   static PFN_CREATE_DXGI_FACTORY1_VGPU create_factory;
+   static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+   BOOL pending;
+
+   if (!ppDevice)
+      return E_POINTER;
+   *ppDevice = NULL;
+   if (!InitOnceBeginInitialize(&once, 0, &pending, NULL))
+      return E_FAIL;
+   if (pending) {
+      HMODULE core = vgpu_load_sibling(VGPU_VKD3D_CORE);
+      if (core)
+         get_interface = (PFN_D3D12_GET_INTERFACE_VGPU)(void *)GetProcAddress(core, "D3D12GetInterface");
+      HMODULE dxgi = vgpu_load_sibling(VGPU_DXVK_DXGI);
+      if (dxgi)
+         create_factory = (PFN_CREATE_DXGI_FACTORY1_VGPU)(void *)GetProcAddress(dxgi, "CreateDXGIFactory1");
+      InitOnceComplete(&once, 0, NULL);
+   }
+   if (!get_interface)
+      return E_FAIL;
+
+   /* Hand vkd3d-proton DXVK's adapter for the Venus device: without one it
+    * would enumerate through the system DXGI, from inside the runtime's own
+    * device creation. */
+   IDXGIAdapter *adapter = NULL;
+   if (!pAdapter && create_factory) {
+      IDXGIFactory1 *factory = NULL;
+      if (SUCCEEDED(create_factory(&IID_IDXGIFactory1, (void **)&factory))) {
+         IDXGIFactory1_EnumAdapters(factory, 0, &adapter);
+         IDXGIFactory1_Release(factory);
+      }
+   }
+
+   vgpu_d3d12_device_factory *factory = NULL;
+   HRESULT hr = get_interface(&vgpu_CLSID_D3D12DeviceFactory, &vgpu_IID_ID3D12DeviceFactory, (void **)&factory);
+   if (SUCCEEDED(hr)) {
+      hr = factory->lpVtbl->CreateDevice(factory, pAdapter ? pAdapter : (IUnknown *)adapter,
+                                         MinimumFeatureLevel, riid, ppDevice);
+      factory->lpVtbl->Release(factory);
+   }
+   if (adapter)
+      IDXGIAdapter_Release(adapter);
+   if (FAILED(hr))
+      TR_LOG("vgpu: vkd3d-proton D3D12 device creation failed 0x%08lx", hr);
+   return hr;
 }
 
 /* ---- adapter probe ------------------------------------------------------- */
@@ -145,12 +236,14 @@ void
 tritonSharedBridgeAdapterProbe(struct triton_adapter_probe *out)
 {
    /* Only loaded for our adapter (INF UserModeDriverName); its KMD is the
-    * WDDM2 viogpu3d.  No Neptune host capabilities. */
+    * WDDM2 viogpu3d.  The "host" is the in-process DXVK / vkd3d-proton pair:
+    * vkd3d-proton is a D3D12 backend that consumes DXIL (SM 6.x) through
+    * dxil-spirv. */
    *out = (struct triton_adapter_probe){
       .viogpu = true,
       .wddm2 = true,
       .host_ok = true,
-      .caps_flags = 0,
+      .caps_flags = TRITON_HOSTCAP_D3D12 | TRITON_HOSTCAP_DXIL,
    };
 }
 
@@ -386,18 +479,46 @@ vgpu_kmt_res_info(D3DKMT_HANDLE global, uint32_t *res_id, uint64_t *size)
    return ok;
 }
 
+typedef HANDLE(WINAPI *PFN_VKD3D_RESOURCE_KMT_VGPU)(IUnknown *);
+
+/* KMT handle of a vkd3d-proton shared resource (exported by our vkd3d build);
+ * NULL for anything else.  The resource must be an ID3D12Resource: only call
+ * it on objects that are not DXVK textures. */
+static HANDLE
+vgpu_vkd3d_resource_kmt(IUnknown *res)
+{
+   static const GUID iid_d3d12_resource = { 0x696442be, 0xa72e, 0x4059, { 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad } };
+   HMODULE core = GetModuleHandleW(VGPU_VKD3D_CORE);
+   PFN_VKD3D_RESOURCE_KMT_VGPU fn =
+      core ? (PFN_VKD3D_RESOURCE_KMT_VGPU)(void *)GetProcAddress(core, "vkd3d_vgpu_resource_kmt") : NULL;
+   IUnknown *d3d12 = NULL;
+   if (!fn || FAILED(res->lpVtbl->QueryInterface(res, &iid_d3d12_resource, (void **)&d3d12)))
+      return NULL;
+   HANDLE h = fn(d3d12);
+   d3d12->lpVtbl->Release(d3d12);
+   return h;
+}
+
 bool
 tritonSharedBridgeExportBlob(void *pResourceWrapper, struct triton_shared_texture_desc *desc)
 {
    IUnknown *tex = pResourceWrapper;
    IDXGIResource *dxgi = NULL;
-   if (FAILED(tex->lpVtbl->QueryInterface(tex, &vgpu_IID_IDXGIResource, (void **)&dxgi)))
-      return false;
    HANDLE share = NULL;
-   HRESULT hr = IDXGIResource_GetSharedHandle(dxgi, &share);
-   IDXGIResource_Release(dxgi);
+   HRESULT hr = E_NOINTERFACE;
+   bool d3d12 = false;
+   if (SUCCEEDED(tex->lpVtbl->QueryInterface(tex, &vgpu_IID_IDXGIResource, (void **)&dxgi))) {
+      hr = IDXGIResource_GetSharedHandle(dxgi, &share);
+      IDXGIResource_Release(dxgi);
+   } else {
+      /* a vkd3d-proton ID3D12Resource on a shared heap: our vkd3d build
+       * exports its memory's KMT handle */
+      share = vgpu_vkd3d_resource_kmt(tex);
+      hr = share ? S_OK : E_FAIL;
+      d3d12 = true;
+   }
    if (FAILED(hr) || !share || share == INVALID_HANDLE_VALUE) {
-      TR_LOG("vgpu: export: no shared handle (hr=0x%08lx)", hr);
+      TR_LOG("vgpu: export: no shared handle (hr=0x%08lx%s)", hr, d3d12 ? ", D3D12" : "");
       return false;
    }
 
@@ -413,7 +534,9 @@ tritonSharedBridgeExportBlob(void *pResourceWrapper, struct triton_shared_textur
    desc->plane_count = 1;
    desc->texture_layout = 0;
    uint64_t pitch = 0, offset = 0;
-   if (!vgpu_linear_layout(tex, &pitch, &offset))
+   /* D3D12 resources: no DXVK interop surface, and the stride only matters
+    * for blob scanout */
+   if (!d3d12 && !vgpu_linear_layout(tex, &pitch, &offset))
       TR_LOG("vgpu: export res_id=%u: no linear layout (scanout stride unknown)", res_id);
    desc->planes[0].offset = offset;
    desc->planes[0].pitch = pitch;

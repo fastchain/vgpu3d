@@ -19,9 +19,9 @@ cp $R/out/kmd3d/viogpu3d.sys $R/out/kmd3d/viogpu3d.pdb $P/
 cp $R/out/triton-venus/vulkan_virtio.dll $P/   # our MinGW build of the Triton Venus D3DKMT backend (build_triton_venus.sh)
 cp $TV/vgpusrv.exe $TV/viogpuap.exe $P/
 # D3D10/11 UMD: Triton DDI layer + DXVK (build_umd.sh)
-cp $R/out/umd3d/vgpu_d3d11.dll $R/out/umd3d/dxvk_d3d11.dll $R/out/umd3d/dxvk_dxgi.dll $P/
+cp $R/out/umd3d/vgpu_d3d11.dll $R/out/umd3d/dxvk_d3d11.dll $R/out/umd3d/dxvk_dxgi.dll $R/out/umd3d/vkd3d_d3d12core.dll $P/
 # WOW64 (32-bit) UMD, DXVK pair and Venus ICD (build_umd.sh 32, build_triton_venus.sh 32)
-cp $R/out/umd3d/vgpu_d3d11_32.dll $R/out/umd3d/dxvk32_d3d11.dll $R/out/umd3d/dxvk32_dxgi.dll $P/
+cp $R/out/umd3d/vgpu_d3d11_32.dll $R/out/umd3d/dxvk32_d3d11.dll $R/out/umd3d/dxvk32_dxgi.dll $R/out/umd3d/vkd3d32_d3d12core.dll $P/
 cp $R/out/triton-venus32/vulkan_virtio32.dll $R/src/kmd3d-inf/virtio_icd32.json $P/
 cp $R/out/gl-win/libgallium_wgl.dll $P/
 [ -f $R/out/gl-win32/libgallium_wgl32.dll ] || $R/build/build_gl.sh 32

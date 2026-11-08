@@ -1,0 +1,87 @@
+diff --git a/libs/d3d12core/d3d12core.def b/libs/d3d12core/d3d12core.def
+index abd56d6..4ee42d5 100644
+--- a/libs/d3d12core/d3d12core.def
++++ b/libs/d3d12core/d3d12core.def
+@@ -2,4 +2,5 @@ LIBRARY d3d12core.dll
+ 
+ EXPORTS
+     D3D12GetInterface
++    vkd3d_vgpu_resource_kmt
+     D3D12SDKVersion DATA PRIVATE
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 25754b7..cdca336 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -761,7 +761,8 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
+     if (resource && (resource->heap_flags & D3D12_HEAP_FLAG_SHARED))
+     {
+         external_info->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+-        external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++        /* vgpu: KMT, the handle type our Venus exports */
++        external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+         vk_prepend_struct(image_info, external_info);
+     }
+ 
+@@ -4479,7 +4480,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+             {
+                 export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+                 export_info.pNext = allocate_info.pNext;
+-                export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++                export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+                 allocate_info.pNext = &export_info;
+             }
+ #else
+@@ -4522,8 +4523,22 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+         if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, allocation)))
+             goto fail;
+ 
+-        if ((heap_flags & D3D12_HEAP_FLAG_SHARED) && export_info.handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT)
+-            d3d12_resource_open_export_kmt(object, device, allocation);
++#ifdef _WIN32
++        if ((heap_flags & D3D12_HEAP_FLAG_SHARED) && export_info.handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)
++        {
++            VkMemoryGetWin32HandleInfoKHR win32_handle_info;
++
++            win32_handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
++            win32_handle_info.pNext = NULL;
++            win32_handle_info.memory = allocation->device_allocation.vk_memory;
++            win32_handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
++            if ((vr = VK_CALL(vkGetMemoryWin32HandleKHR(device->vk_device, &win32_handle_info, &object->vgpu_kmt))))
++            {
++                ERR("Failed to get exported image memory KMT handle, vr %d.\n", vr);
++                object->vgpu_kmt = NULL;
++            }
++        }
++#endif
+ 
+         bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+         bind_info.pNext = NULL;
+@@ -11451,3 +11466,14 @@ void vkd3d_global_descriptor_buffer_cleanup(struct vkd3d_global_descriptor_buffe
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->resource.device_allocation);
+     vkd3d_free_device_memory(device, &global_descriptor_buffer->sampler.device_allocation);
+ }
++
++#ifdef _WIN32
++/* vgpu: the KMT handle of a shared committed resource's memory, for the WDDM
++ * driver that hosts this library to share it with other devices (DWM).
++ * Exported from d3d12core; NULL when the resource is not shared. */
++HANDLE WINAPI vkd3d_vgpu_resource_kmt(ID3D12Resource *iface)
++{
++    struct d3d12_resource *resource = impl_from_ID3D12Resource(iface);
++    return resource ? resource->vgpu_kmt : NULL;
++}
++#endif
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 8024485..124c4ed 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1189,6 +1189,9 @@ struct d3d12_resource
+     struct vkd3d_memory_allocation private_mem;
+     struct vkd3d_unique_resource res;
+     D3DKMT_HANDLE kmt_local;
++    /* vgpu: KMT handle of a shared committed resource's memory (Venus on our
++     * WDDM driver exports KMT handles only), see vkd3d_vgpu_resource_kmt */
++    HANDLE vgpu_kmt;
+ 
+     struct d3d12_heap *heap;
+ 

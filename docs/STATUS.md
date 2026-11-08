@@ -447,3 +447,36 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   117.3 fps pipelined vs ~72 with BltPipeline=0 at the same point. One mid-run frame showed a black streak
   over a wall poster (possible rendering glitch, to check). superposition_cli.exe exits silently here.
 - Geekbench 6 free CLI runs only the CPU test (no GPU compute without Pro/GUI); not used.
+
+### Bug-fix round and Direct3D 12 (2026-11-08)
+- OpenGL dual-source blending (Heaven/Valley black scene): the WGL target created the Zink screen without a
+  config, so none of Zink's driconf options (dual_color_blend_by_location for Unigine) applied on Windows.
+  wgl.c now hands Zink its option table; the disable_blend_func_extended workaround is gone. Heaven/Valley
+  GL render correctly with dual-source blending (67 fps each at the 5K desktop).
+- FurMark 2 Vulkan (VK_ERROR_FEATURE_NOT_PRESENT): a Vulkan 1.1 app chained VkPhysicalDeviceVulkan12Features;
+  Venus queries a <1.2 renderer through the extension structs, which leave the 1.2 "extension supported"
+  members (descriptorIndexing, drawIndirectCount, ...) false. Derived from the extensions now.
+  FurMark Vulkan 1080p: 7882 (130.9 fps avg).
+- GravityMark OpenGL (ARB_gl_spirv): four Mesa fixes -- image queries on an OpTypeSampledImage operand
+  (Tellusim compiler), snorm/unorm pack/unpack in Zink's SPIR-V emitter (an assert in a compile thread showed
+  a hidden message box and deadlocked the app), nir_opt_cse merging derefs of different sizes, and
+  util_queue_destroy joining threads under the loader lock (opengl32.dll unloaded by the app ->
+  deadlock at exit). GravityMark OpenGL: 11064 (66.2 fps), exits cleanly (4 of 5 runs; one earlier
+  timeout not reproduced).
+- Superposition D3D11 black patches: confirmed a D3D11-only rendering bug (OpenGL renders the same scenes
+  correctly). Not fixed yet; needs frame capture.
+- KMD async blt (BltAsync=1) stalls: root cause is a dependency cycle -- DXVK submits the readback copy
+  from its own thread after the PRESENT_WAIT packet entered the single-slot commander, so the fence it
+  waits for queues behind it until the 1.2 s deadline. Stays off (the pipelined path replaced it).
+- Exclusive-fullscreen Heaven D3D11: the app's GPU work never completes in fullscreen (with async Venus
+  calls the host also reports "vkQueueSubmit2 resulted in CS error"). Not fixed yet. Test-environment
+  note: after a reboot, windows started by the scheduled task cannot take the foreground and DXGI refuses
+  fullscreen (DXGI_ERROR_NOT_CURRENTLY_AVAILABLE / STATUS_OCCLUDED); C:\vgpu\fg.ps1 raises the window.
+- Direct3D 12 (M3): Triton's D3D12 DDI layer is built into vgpu_d3d11[_32].dll (OpenAdapter12) and drives
+  vkd3d-proton v3.1 (vkd3d_d3d12core.dll / vkd3d32_d3d12core.dll, build/build_vkd3d.sh) in-process, created
+  through its D3D12GetInterface device factory with DXVK's DXGI adapter. Patches: shared heaps export KMT
+  handles (the only kind our Venus exports) via a vkd3d_vgpu_resource_kmt export; the backend shares them
+  like DXVK textures. The queue gate waits on the CPU for the drain fence (no host to retire a kernel
+  token in-process). Host caps advertise DXIL, so SM 6.x shaders are accepted.
+  Results: d3d12test clear/readback (64- and 32-bit) and flip-model present pass; GravityMark D3D12
+  22313 (133.6 fps, renders correctly); PassMark DirectX 12: 27.

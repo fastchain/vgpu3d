@@ -10,7 +10,7 @@ I have absolutely no idea what's going on under the hood.
 # vgpu3d: hardware 3D for Windows VMs on QEMU/KVM, using the host's own GPU
 
 `vgpu3d` is a Windows 11 guest graphics driver for QEMU/KVM's `virtio-gpu` device. It gives a
-Windows virtual machine **Vulkan, Direct3D 10/11 and OpenGL acceleration on the host's GPU**
+Windows virtual machine **Vulkan, Direct3D 10/11/12 and OpenGL acceleration on the host's GPU**
 without dedicating that GPU to the VM. The host keeps its desktop and the GPU keeps working for
 everything else, as in VirtualBox or VMware Workstation, but on standard, unmodified QEMU/KVM.
 
@@ -58,6 +58,7 @@ guests had no driver for it. **vgpu3d is that driver.**
   "neptune" viogpu3d line.
 - **Vulkan**: Mesa's Venus driver with a Windows backend (D3DKMT virtual contexts, shared
   memory, cross-process resource sharing). Vulkan is the base layer everything else builds on.
+- **Direct3D 12**: the same user-mode driver; Triton's D3D12 DDI layer drives vkd3d-proton in-process.
 - **Direct3D 10/11**: a WDDM user-mode driver. Triton's D3D10/11 DDI layer runs DXVK in-process
   (D3D11 → Vulkan), on Venus. DWM uses it too, so the desktop is GPU-composited.
 - **OpenGL 4.6**: Mesa's Zink (OpenGL on Vulkan), registered as the system OpenGL ICD.
@@ -72,7 +73,7 @@ guests had no driver for it. **vgpu3d is that driver.**
 | Hypervisor | stock QEMU/KVM | QEMU/KVM | QEMU/KVM | QEMU/KVM, others | their own |
 | Host keeps using the GPU | **yes** | yes | no (GPU is dedicated) | yes | yes |
 | Hardware needed | any Vulkan GPU with Venus support | none | 2nd GPU + IOMMU | data-center GPU / licenses | any |
-| Windows 3D APIs | Vulkan 1.4, D3D10/11, OpenGL 4.6 (64+32-bit) | none (CPU WARP) | everything native | everything native | D3D9–11, GL (via SVGA translation) |
+| Windows 3D APIs | Vulkan 1.4, D3D10/11/12, OpenGL 4.6 (64+32-bit) | none (CPU WARP) | everything native | everything native | D3D9–11, GL (via SVGA translation) |
 | Several VMs on one GPU | yes | – | no | yes | yes |
 | Performance | good, CPU-bound for light workloads (see below) | very slow 3D | native | near native | moderate |
 | Open source | yes (BSD/MIT/zlib parts) | yes | yes | no | partly |
@@ -89,7 +90,7 @@ guests had no driver for it. **vgpu3d is that driver.**
 **Trade-offs, honestly:** commands cross the VM boundary. Each frame costs CPU time for translation
 (D3D/GL → Vulkan), encoding and decoding, and the display copy. Light and medium workloads are
 CPU-bound and won't saturate a high-end GPU, and the gap grows with desktop resolution.
-Direct3D 12 and Direct3D 9 aren't implemented yet. See [docs/SETUP.md §8](docs/SETUP.md#8-known-limitations).
+Direct3D 9 isn't implemented yet and Direct3D 12 is new. See [docs/SETUP.md §8](docs/SETUP.md#8-known-limitations).
 
 ### Measured (RTX 4090 host, 1920×1080 windowed unless noted)
 
@@ -98,7 +99,8 @@ Direct3D 12 and Direct3D 9 aren't implemented yet. See [docs/SETUP.md §8](docs/
 | Autodesk Fusion, 2.5M triangles, maximized 2560×1080 | 66–69 fps (WARP: 1.4 fps) |
 | Unigine Heaven 4.0 (32-bit), DX11 / OpenGL | 48.4 / 95.7 fps |
 | Unigine Valley 1.0 (32-bit), DX11 / OpenGL | 52.0 / 76.8 fps |
-| GravityMark 1.89, Vulkan / DX11 | 9463 / 6574 |
+| GravityMark 1.89, D3D12 / Vulkan / OpenGL / DX11 | 22313 / 11230 / 11064 / 6574 |
+| FurMark 2, 1080p preset, Vulkan | 7882 |
 | FurMark 2, 1080p preset, OpenGL | 7258 |
 
 ## Getting started

@@ -20,6 +20,7 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
   git -C mesa diff 7d52dbb HEAD > patches/mesa-venus-windows-vgpu.patch
   git -C upstream/dxvk diff v3.1.1 HEAD > patches/dxvk-vgpu.patch
   git -C upstream/triton/mesa diff $(git -C upstream/triton/mesa merge-base HEAD neptune) HEAD > patches/triton-mesa-vgpu-m1.patch
+  git -C upstream/vkd3d-proton diff v3.1 HEAD > patches/vkd3d-proton-vgpu.patch
   ```
 
 ## Building
@@ -27,7 +28,7 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
 - `build/package_kmd3d.sh` builds the kernel driver and both UMDs and produces `out/vgpu3d-m1.zip`.
   It **fails if a binary wasn't rebuilt**, so never work around that check.
 - Third-party builds take an optional `32` argument for the WOW64 variant:
-  `build_triton_venus.sh`, `build_dxvk.sh`, `build_umd.sh`, `build_gl.sh`.
+  `build_triton_venus.sh`, `build_dxvk.sh`, `build_vkd3d.sh`, `build_umd.sh`, `build_gl.sh`.
 - After a container or session restart, apt packages may be gone. Check
   `which x86_64-w64-mingw32-gcc-posix i686-w64-mingw32-gcc-posix clang-cl-19 meson ninja`.
   After reinstalling the toolchain, **delete the meson build dirs (`out/*-build`)**: a partial
@@ -76,7 +77,6 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
   - `tools/windows/bench3.ps1` (FurMark 2, GravityMark)
   - `tools/fusion-bench/bench.sh` (Autodesk Fusion via MCP)
 - Known issues to keep in mind:
-  - OpenGL dual-source blending renders black on Zink/Venus; disabled for Heaven/Valley via
-    Mesa driconf.
-  - FurMark Vulkan gets `VK_ERROR_FEATURE_NOT_PRESENT`.
-  - DX12/DX9 are not implemented.
+  - DX9 and OpenCL are not implemented; DX12 is new (vkd3d-proton, CPU-waited queue gate).
+  - Exclusive-fullscreen Heaven D3D11 hangs (host `CS error`); Superposition D3D11 shows black patches.
+  - Fullscreen tests need the app in the foreground: run `C:\vgpu\fg.ps1 -Name <process>` beside it.

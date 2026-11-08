@@ -64,7 +64,14 @@ WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
         return 1;
     }
     if (fullscreen) {
-        hr = IDXGISwapChain_SetFullscreenState(sc, TRUE, NULL);
+        /* fullscreen needs the foreground window; retry while a helper may still be raising it */
+        for (int tries = 0; tries < 50; tries++) {
+            SetForegroundWindow(hwnd);
+            hr = IDXGISwapChain_SetFullscreenState(sc, TRUE, NULL);
+            if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+                break;
+            Sleep(200);
+        }
         char m[96];
         snprintf(m, sizeof(m), "blttest: SetFullscreenState hr=0x%08lx\n", hr);
         OutputDebugStringA(m);

@@ -1,25 +1,238 @@
-diff --git a/src/util/00-mesa-defaults.conf b/src/util/00-mesa-defaults.conf
-index ef70666..6e0711f 100644
---- a/src/util/00-mesa-defaults.conf
-+++ b/src/util/00-mesa-defaults.conf
-@@ -32,6 +32,8 @@
+diff --git a/src/compiler/nir/nir_instr_set.c b/src/compiler/nir/nir_instr_set.c
+index 88cf4e7..150f639 100644
+--- a/src/compiler/nir/nir_instr_set.c
++++ b/src/compiler/nir/nir_instr_set.c
+@@ -655,6 +655,14 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
+           deref1->type != deref2->type)
+          return false;
  
-         <application name="Unigine Heaven (Windows)" executable="heaven.exe">
-             <option name="allow_glsl_extension_directive_midshader" value="true" />
-+            <!-- vgpu: dual-source blending renders the lit scene black on zink/Venus (open issue) -->
-+            <option name="disable_blend_func_extended" value="true" />
-             <!-- remove dual_color_blend_by_location if 4.1 ever comes out -->
-             <option name="dual_color_blend_by_location" value="true" />
-         </application>
-@@ -50,6 +52,8 @@
++      /* Derefs of one variable may carry different pointer sizes (GL SPIR-V
++       * UBOs reach the linker with both 1- and 2-component derefs); merging
++       * them leaves children whose parent has the wrong size.
++       */
++      if (deref1->def.num_components != deref2->def.num_components ||
++          deref1->def.bit_size != deref2->def.bit_size)
++         return false;
++
+       if (deref1->deref_type == nir_deref_type_var)
+          return deref1->var == deref2->var;
  
-         <application name="Unigine Valley (Windows)" executable="valley.exe">
-             <option name="allow_glsl_extension_directive_midshader" value="true" />
-+            <!-- vgpu: dual-source blending renders the lit scene black on zink/Venus (open issue) -->
-+            <option name="disable_blend_func_extended" value="true" />
-             <!-- remove dual_color_blend_by_location if 1.1 ever comes out -->
-             <option name="dual_color_blend_by_location" value="true" />
-         </application>
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index 6d9097f..9342346 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -6428,6 +6428,17 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
+    case SpvOpImageQuerySizeLod:
+    case SpvOpImageQuerySize: {
+       struct vtn_type *image_type = vtn_get_value_type(b, w[3]);
++      /* The Image operand must be an OpTypeImage, but some compilers (the
++       * Tellusim Clay compiler used by GravityMark's OpenGL renderer) pass
++       * the OpTypeSampledImage instead.  Other drivers accept that; query
++       * the texture of the sampled image, which vtn_handle_texture handles.
++       */
++      if (image_type->base_type == vtn_base_type_sampled_image) {
++         vtn_warn("Image operand of an image query is an OpTypeSampledImage; "
++                  "querying its image");
++         vtn_handle_texture(b, opcode, w, count);
++         break;
++      }
+       vtn_assert(image_type->base_type == vtn_base_type_image);
+       if (glsl_type_is_image(image_type->glsl_image)) {
+          vtn_handle_image(b, opcode, w, count);
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+index 4d0e707..714049c 100644
+--- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -2022,6 +2022,25 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
+       break;
+ 
+    BUILTIN_UNOPF(nir_op_unpack_half_2x16, GLSLstd450UnpackHalf2x16)
++
++   /* SPIR-V input (GL_ARB_gl_spirv) keeps these as ALU ops */
++   case nir_op_pack_snorm_2x16:
++   case nir_op_pack_unorm_2x16:
++   case nir_op_pack_snorm_4x8:
++   case nir_op_pack_unorm_4x8: {
++      enum GLSLstd450 op = alu->op == nir_op_pack_snorm_2x16 ? GLSLstd450PackSnorm2x16 :
++                           alu->op == nir_op_pack_unorm_2x16 ? GLSLstd450PackUnorm2x16 :
++                           alu->op == nir_op_pack_snorm_4x8 ? GLSLstd450PackSnorm4x8 :
++                                                               GLSLstd450PackUnorm4x8;
++      assert(nir_op_infos[alu->op].num_inputs == 1);
++      result = emit_builtin_unop(ctx, op, get_def_type(ctx, &alu->def, nir_type_uint), src[0]);
++      break;
++   }
++
++   BUILTIN_UNOPF(nir_op_unpack_snorm_2x16, GLSLstd450UnpackSnorm2x16)
++   BUILTIN_UNOPF(nir_op_unpack_unorm_2x16, GLSLstd450UnpackUnorm2x16)
++   BUILTIN_UNOPF(nir_op_unpack_snorm_4x8, GLSLstd450UnpackSnorm4x8)
++   BUILTIN_UNOPF(nir_op_unpack_unorm_4x8, GLSLstd450UnpackUnorm4x8)
+ #undef BUILTIN_UNOP
+ #undef BUILTIN_UNOPF
+ 
+diff --git a/src/gallium/targets/wgl/wgl.c b/src/gallium/targets/wgl/wgl.c
+index 100753a..31c8a7c 100644
+--- a/src/gallium/targets/wgl/wgl.c
++++ b/src/gallium/targets/wgl/wgl.c
+@@ -38,6 +38,7 @@
+ 
+ #include "util/u_debug.h"
+ #include "util/driconf.h"
++#include "util/xmlconfig.h"
+ #include "stw_winsys.h"
+ #include "stw_device.h"
+ #include "gdi/gdi_sw_winsys.h"
+@@ -79,6 +80,37 @@ static const char *created_driver_name = NULL;
+ /* this must outlive later option lookups, which reuse the getenv buffer on windows */
+ DEBUG_GET_ONCE_OPTION(gallium_driver, "GALLIUM_DRIVER", "")
+ 
++#ifdef GALLIUM_ZINK
++static const driOptionDescription zink_driconf[] = {
++   #include "zink/driinfo_zink.h"
++};
++
++/* Zink reads its own driconf options (e.g. per-application workarounds such
++ * as dual_color_blend_by_location) only from the screen config, so hand it a
++ * parsed copy of its option table as the DRI pipe loader does. */
++static struct pipe_screen *
++wgl_zink_create_screen(struct sw_winsys *winsys)
++{
++   static driOptionCache options_info;
++   static bool info_parsed;
++   driOptionCache options = {0};
++
++   if (!info_parsed) {
++      driParseOptionInfo(&options_info, zink_driconf, ARRAY_SIZE(zink_driconf));
++      info_parsed = true;
++   }
++   struct pipe_screen_config config = {
++      .options = &options,
++      .options_info = &options_info,
++   };
++   struct pipe_screen *screen = zink_create_screen(winsys, &config);
++   /* zink copies what it needs; the cache is filled only when it got that far */
++   if (options.info)
++      driDestroyOptionCache(&options);
++   return screen;
++}
++#endif
++
+ static struct pipe_screen *
+ wgl_screen_create_by_name(HDC hDC, const char* driver, struct sw_winsys *winsys)
+ {
+@@ -100,7 +132,7 @@ wgl_screen_create_by_name(HDC hDC, const char* driver, struct sw_winsys *winsys)
+ #endif
+ #ifdef GALLIUM_ZINK
+    if (strcmp(driver, "zink") == 0) {
+-      screen = zink_create_screen(winsys, NULL);
++      screen = wgl_zink_create_screen(winsys);
+       if (screen)
+          use_zink = true;
+    }
+@@ -247,10 +279,6 @@ static const driOptionDescription *
+ wgl_get_driconf(unsigned *count)
+ {
+ #ifdef GALLIUM_ZINK
+-   static const driOptionDescription zink_driconf[] = {
+-      #include "zink/driinfo_zink.h"
+-   };
+-
+    if (use_zink) {
+       *count = ARRAY_SIZE(zink_driconf);
+       return zink_driconf;
+diff --git a/src/util/u_queue.c b/src/util/u_queue.c
+index 13659c7..65fd1e0 100644
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -34,6 +34,11 @@
+ #include "util/timespec.h"
+ #include "u_process.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#include <winternl.h>
++#endif
++
+ #if defined(__linux__)
+ #include <sys/time.h>
+ #include <sys/resource.h>
+@@ -317,6 +322,8 @@ util_queue_thread_func(void *input)
+       queue->read_idx = queue->write_idx;
+       queue->num_queued = 0;
+    }
++   /* last access to the queue: see util_queue_kill_threads_locked */
++   queue->exited_threads++;
+    mtx_unlock(&queue->lock);
+    return 0;
+ }
+@@ -489,6 +496,21 @@ fail_lock:
+    return false;
+ }
+ 
++#ifdef _WIN32
++/* Whether this thread holds the loader lock, i.e. runs inside a DllMain.
++ * PEB->LoaderLock is undocumented but has been at the same offset since
++ * Windows NT 4.
++ */
++static bool
++loader_lock_held(void)
++{
++   const char *peb = (const char *)NtCurrentTeb()->ProcessEnvironmentBlock;
++   const RTL_CRITICAL_SECTION *lock =
++      *(const RTL_CRITICAL_SECTION *const *)(peb + (sizeof(void *) == 8 ? 0x110 : 0xa0));
++   return lock && lock->OwningThread == (HANDLE)(uintptr_t)GetCurrentThreadId();
++}
++#endif
++
+ static void
+ util_queue_kill_threads_locked(struct util_queue *queue,
+                                unsigned keep_num_threads)
+@@ -501,12 +523,34 @@ util_queue_kill_threads_locked(struct util_queue *queue,
+    }
+ 
+    unsigned old_num_threads = queue->num_threads;
++#ifdef _WIN32
++   const unsigned exited_before = queue->exited_threads;
++#endif
+    /* Setting num_threads is what causes the threads to terminate.
+     * Then cnd_broadcast wakes them up and they will exit their function.
+     */
+    queue->num_threads = keep_num_threads;
+    cnd_broadcast(&queue->has_queued_cond);
+ 
++#ifdef _WIN32
++   /* Inside a DllMain (e.g. opengl32.dll deleting leftover contexts when an
++    * app frees it) a thread cannot finish exiting until the loader lock is
++    * released, so joining it deadlocks.  Wait until each one has left the
++    * queue code instead; nothing touches the queue after that.
++    */
++   if (keep_num_threads < old_num_threads && loader_lock_held()) {
++      const unsigned killed = old_num_threads - keep_num_threads;
++      while (queue->exited_threads - exited_before < killed) {
++         mtx_unlock(&queue->lock);
++         Sleep(1);
++         mtx_lock(&queue->lock);
++      }
++      for (unsigned i = keep_num_threads; i < old_num_threads; i++)
++         thrd_detach(queue->threads[i]);
++      return;
++   }
++#endif
++
+    /* Wait for threads to terminate. */
+    if (keep_num_threads < old_num_threads) {
+       /* We need to unlock the mutex to allow threads to terminate. */
+diff --git a/src/util/u_queue.h b/src/util/u_queue.h
+index de32baf..eeec639 100644
+--- a/src/util/u_queue.h
++++ b/src/util/u_queue.h
+@@ -237,6 +237,7 @@ struct util_queue {
+    int num_queued;
+    unsigned max_threads;
+    unsigned num_threads; /* decreasing this number will terminate threads */
++   unsigned exited_threads; /* threads that left util_queue_thread_func */
+    int max_jobs;
+    int write_idx, read_idx; /* ring buffer pointers */
+    size_t total_jobs_size;  /* memory use of all jobs in the queue */
 diff --git a/src/util/xmlconfig.c b/src/util/xmlconfig.c
 index 17d4148..2dde219 100644
 --- a/src/util/xmlconfig.c
