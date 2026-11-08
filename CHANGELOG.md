@@ -2,7 +2,7 @@
 
 ## 1.0.26312 (2026-11-08)
 
-First release. Installer: `vgpu3d-setup-1.0.26312.exe`, driver version 1.0.26312.23940.
+First release. Installer: `vgpu3d-setup-1.0.26312.exe`, driver version 1.0.26312.24550.
 
 ### APIs
 - **Vulkan 1.4**: Mesa Venus ICD over the WDDM driver, 64- and 32-bit.
@@ -18,6 +18,9 @@ First release. Installer: `vgpu3d-setup-1.0.26312.exe`, driver version 1.0.26312
 ### Display
 - GPU-composited desktop (DWM) with modes up to 5120×2160 and dirty-rectangle framebuffer presents.
 - Exclusive fullscreen works (Heaven, Superposition, GravityMark in every API).
+- Hardware mouse cursor: the pointer goes through the virtio-gpu cursor queue, so the viewer (SPICE /
+  virt-manager) draws it on the host side and it moves as smoothly as on the host. Registry `HWCursor=0` in the
+  adapter key turns it off.
 
 ### Packaging
 - NSIS installer: enables test signing if needed, creates and trusts a local signing certificate, signs and
@@ -30,8 +33,6 @@ First release. Installer: `vgpu3d-setup-1.0.26312.exe`, driver version 1.0.26312
 - Test-signed: Secure Boot must be off (not enforced).
 - OpenCL is 64-bit only. Never install Microsoft's OpenCL, OpenGL and Vulkan Compatibility Pack (its
   Dozen driver deadlocks with our D3D12).
-- No hardware mouse cursor yet: the pointer is drawn into the desktop image and moves at the display
-  pipeline's frame rate.
 - Installing or updating the driver restarts the adapter; apps using the GPU restart.
 - Light workloads are CPU-bound, and very high desktop resolutions cost CPU.
 - Tested on an NVIDIA RTX 4090 host only.

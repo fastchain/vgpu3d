@@ -106,7 +106,7 @@ HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,,TypesSupported,%REG_DWORD%,7
 
 [VioGpu3D_DeviceSettings]
-HKR,, HWCursor,          %REG_DWORD%, 0
+HKR,, HWCursor,          %REG_DWORD%, 1
 HKR,, FlexResolution,    %REG_DWORD%, 1
 HKR,, UsePhysicalMemory, %REG_DWORD%, 0
 ; WDDM render adapters must name a D3D UMD or dxgkrnl refuses to start them (LIVEDUMP 0x193/0x804,

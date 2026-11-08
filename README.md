@@ -270,8 +270,6 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
 - **OpenCL is 64-bit only** (clvk). Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility
   Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
-- **No hardware mouse cursor yet:** the pointer is drawn into the desktop image, so in the VM viewer it moves
-  at the display pipeline's frame rate rather than as smoothly as on the host.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.

@@ -127,8 +127,20 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
 
+    // Hardware cursor (virtio-gpu cursor queue): a POINTER_SIZE^2 B8G8R8A8 host
+    // resource the viewer draws itself, so the pointer does not wait for DWM
+    // frames.  m_CursorLock serialises the pointer DDIs and the D3 teardown.
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
+    FAST_MUTEX m_CursorLock;
+    BOOLEAN m_CursorShown;
+    UINT m_CursorHotX;
+    UINT m_CursorHotY;
+    UINT m_CursorX; // hot-spot position last sent to the host
+    UINT m_CursorY;
+    BOOLEAN CreateCursor(void);
+    void DropCursor(void);
+    void QueueCursorCmd(ULONG type, UINT x, UINT y, UINT resId);
 
     ULONG m_PciBus;
     ULONG m_PciDev;
@@ -216,6 +228,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
+    NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
+    NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition);
     PDXGKRNL_INTERFACE GetDxgkInterface(void)
     {
         return &m_DxgkInterface;

@@ -688,3 +688,17 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
     summaries, CheckFormatSupport answers and rejected texture descriptions.
   - `VGPU_VERIFY_INIT=1` checks initial uploads.
   - Both log through the DXVK logger, so set `DXVK_LOG_LEVEL=warn` and `DXVK_LOG_PATH`.
+
+### Hardware cursor (2026-11-08)
+- The 3D driver had pointer caps zeroed and SetPointerShape failing, so DWM drew a software cursor and every
+  pointer move went through the whole display path (DWM frame, framebuffer copy, egl-headless readback,
+  SPICE encode). In virt-manager the pointer lagged and stuttered.
+- Now: caps Color + MaskedColor up to 64x64. SetPointerShape converts the shape to a 64x64 B8G8R8A8 2D
+  resource (created once, backing from m_CursorSegment). It transfers the shape, waits for the control
+  queue (GET_DISPLAY_INFO as a fence, because the cursor queue is processed independently), then sends
+  UPDATE_CURSOR. SetPointerPosition sends MOVE_CURSOR with the hot-spot position (X + XHot), and
+  resource 0 when hidden. Monochrome or oversized shapes return an error, so Windows draws them itself.
+  A device reset (D3, stop) drops the guest object; the next shape re-creates the resource.
+- INF `HWCursor=1` (was 0). Confirmed by the user in virt-manager: the pointer is smooth, with the right
+  shapes and hot spot. The pointer stress (876 moves over arrow/I-beam/hand/wait) and the D3D11/12/Vulkan
+  tests pass.
