@@ -14,6 +14,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
 ![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
+![Release](https://img.shields.io/badge/release-1.0.26312-brightgreen)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
 </div>
@@ -37,6 +38,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 - [Limitations](#-limitations)
 - [Building from source](#-building-from-source)
 - [Licensing](#-licensing)
+- [Changelog](CHANGELOG.md)
 
 ---
 
@@ -268,6 +270,8 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
 - **OpenCL is 64-bit only** (clvk). Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility
   Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
+- **No hardware mouse cursor yet:** the pointer is drawn into the desktop image, so in the VM viewer it moves
+  at the display pipeline's frame rate rather than as smoothly as on the host.
 - **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.
@@ -297,7 +301,7 @@ LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (
 | `src/umd3d/` | D3D10/11/12 user-mode driver backend (Triton DDI → DXVK / vkd3d-proton) |
 | `src/installer/` | NSIS installer script |
 | `src/umd/` | guest test programs (`d3d9test`, `d3d11test`, `d3d12test`, `blttest`, `gltest`, `vkcompute`, …) |
-| `patches/` | our changes to Mesa, Triton, DXVK and vkd3d-proton |
+| `patches/` | our changes to Mesa, Triton, DXVK, vkd3d-proton and clvk |
 | `build/` | cross-build, packaging and installer scripts |
 | `tools/windows/` | guest scripts: install/uninstall, test rounds, benchmark runners |
 | `docs/` | setup manual, progress log, design notes |
@@ -307,5 +311,5 @@ LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (
 ## 📜 Licensing
 
 The kernel driver derives from virtio-win (BSD-3-Clause). Mesa (Venus, Zink) is MIT. DXVK is zlib.
-vkd3d-proton is LGPL-2.1. Triton's DDI layer has its own license, in `upstream/triton`. Check each
+vkd3d-proton is LGPL-2.1. clvk is Apache-2.0 (with LLVM/clspv inside, Apache-2.0 with LLVM exceptions). Triton's DDI layer has its own license, in `upstream/triton`. Check each
 component's license before redistributing binaries.

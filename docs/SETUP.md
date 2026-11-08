@@ -323,6 +323,8 @@ webdeploy folder; they're no longer needed.
   Windows restarts the shell; save your work before updating.
 - **The desktop goes through a CPU framebuffer copy** (section 4.5), and so do old-style (blt-model)
   D3D windows. Large resolutions cost CPU.
+- **No hardware mouse cursor yet.** Windows draws the pointer into the desktop image (software cursor), so
+  in virt-manager it moves at the display pipeline's frame rate instead of being drawn by the SPICE client.
 - Video memory is reported as 256 MB to apps; that's an estimate, not a limit.
 
 ---
