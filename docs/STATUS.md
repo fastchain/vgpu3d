@@ -632,3 +632,17 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
 - Launch-time console commands (render_ssao/ssgi/shadows 0) are overridden by the preset, so per-effect
   bisection needs another route. Next: a RenderDoc capture of one frame to find the pass or texture
   that comes out zero.
+
+### clvk memory bandwidth (2026-11-08)
+- Why clpeak sees 10-12 GB/s: clvk allocates every buffer from a host-visible memory type and prefers
+  HOST_CACHED ones (it was written for UMA/mobile GPUs), and our Venus hides host visibility on all
+  non-cached types (KVM maps host RAM write-back in the guest while the host GPU accesses uncached memory
+  unsnooped). The only host-visible type left (memory type 3) lives in the 96 GB system heap, so kernels
+  read system memory over PCIe. The 4090's resizable-BAR type (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT,
+  24 GB) exists on the host and appears with VN_VGPU_ALLOW_UNCACHED=1.
+- Tried: a clvk option buffer_prefer_device_local (patches/clvk-vgpu.patch) that puts buffers into that
+  type. With VN_VGPU_ALLOW_UNCACHED=1 the kernel compiles but the first kernel never completes (host VRAM
+  mapped into the guest through hostmem does not work as a CL buffer path here). The option stays, off by
+  default.
+- Real fix: device-local (not host-visible) buffers in clvk with staging copies for map/read/write/
+  fill/copy-host-ptr -- a larger change to clvk's buffer paths, not done yet.

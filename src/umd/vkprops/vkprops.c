@@ -80,6 +80,17 @@ main(void)
     fmt(pd, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, "R9G9B9E5_SHAREDEXP");
     fmt(pd, VK_FORMAT_D32_SFLOAT, "D32_FLOAT");
     fmt(pd, VK_FORMAT_D24_UNORM_S8_UINT, "D24S8");
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    printf("memory heaps:\n");
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        printf("  heap %u: %llu MiB flags 0x%x\n", i, (unsigned long long)(mp.memoryHeaps[i].size >> 20), mp.memoryHeaps[i].flags);
+    printf("memory types (DL=device-local HV=host-visible HC=coherent CA=cached):\n");
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        printf("  type %u heap %u:%s%s%s%s\n", i, mp.memoryTypes[i].heapIndex, f & 1 ? " DL" : "", f & 2 ? " HV" : "",
+               f & 4 ? " HC" : "", f & 8 ? " CA" : "");
+    }
     VkPhysicalDeviceLimits *l = &props.limits;
     printf("limits:\n");
     F(l->maxImageDimension3D); F(l->maxImageArrayLayers); F(l->maxSamplerAllocationCount);

@@ -1,3 +1,50 @@
+diff --git a/src/config.def b/src/config.def
+index a1665b3..ae24566 100644
+--- a/src/config.def
++++ b/src/config.def
+@@ -132,6 +132,13 @@ OPTION(uint32_t, percentage_of_available_memory_reported, 100u)
+ // Specify the maximum allowed memory allocation size in megabytes.
+ OPTION(uint32_t, max_mem_alloc_size_mb, 1024u)
+ 
++// Place buffers in a DEVICE_LOCAL|HOST_VISIBLE memory type (resizable-BAR VRAM on discrete
++// GPUs) when the device has one: kernels then read video memory instead of system memory over
++// PCIe, at the cost of slower host reads of mapped buffers.  Off by default: under Venus on
++// Windows (vgpu) the BAR type is hidden, and unhiding it (VN_VGPU_ALLOW_UNCACHED=1) made the
++// first kernel never complete.
++OPTION(bool, buffer_prefer_device_local, false)
++
+ 
+ ////////////////////////////////////////////////////////////
+ // RUNTIME PARAMETERS //////////////////////////////////////
+diff --git a/src/device.hpp b/src/device.hpp
+index b388761..529617d 100644
+--- a/src/device.hpp
++++ b/src/device.hpp
+@@ -223,8 +223,22 @@ struct cvk_device : public _cl_device_id,
+ 
+         allocation_parameters ret;
+         ret.size = memreqs.size;
+-        ret.memory_type_index =
+-            memory_type_index_for_buffer(memreqs.memoryTypeBits);
++        ret.memory_type_index = VK_MAX_MEMORY_TYPES;
++        if (config.buffer_prefer_device_local()) {
++            // typed arguments: an int flags expression and a literal 0 would
++            // pick the (count, list pointer) overload
++            const VkMemoryPropertyFlags required =
++                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
++                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++            const VkMemoryPropertyFlags avoid = 0;
++            ret.memory_type_index = memory_type_index_for_resource(
++                memreqs.memoryTypeBits, required, avoid);
++        }
++        if (ret.memory_type_index == VK_MAX_MEMORY_TYPES) {
++            ret.memory_type_index =
++                memory_type_index_for_buffer(memreqs.memoryTypeBits);
++        }
+         ret.memory_coherent = memory_index_is_coherent(ret.memory_type_index);
+ 
+         return ret;
 diff --git a/src/utils.cpp b/src/utils.cpp
 index e4787e2..e595cfe 100644
 --- a/src/utils.cpp
