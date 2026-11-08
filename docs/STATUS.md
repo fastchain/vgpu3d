@@ -614,3 +614,21 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   blocked every caller (blttest "hung" in OpenAdapter10_2); GDI screenshots of a blt-model exclusive-
   fullscreen app show DWM's black desktop; fg.ps1 now keeps raising the app's largest window (Superposition
   opens a console first).
+
+### Superposition D3D11 black patches: narrowed, still open (2026-11-08)
+- What it is: D3D11 renders sun-shadowed areas pure black and the whole image greyer -- the indirect /
+  environment lighting is missing. Superposition's OpenGL renderer (Zink, same Venus) shows the warm
+  bounce light and dim (not black) shadows at the same moments. Measured as the share of near-black
+  pixels in the lower frame: D3D11 4-12 %, OpenGL 0-1 %.
+- Not Triton's DDI layer: the same patches with DXVK loaded app-local (d3d11.dll/dxgi.dll next to the exe,
+  straight on Venus). Not Venus async/batching (VN_PERF no_async_*,no_cmd_batching,no_multi_ring) nor its
+  feedback paths. Not feature exposure: src/umd/vkprops shows every feature/format DXVK relies on
+  (typed UAV loads without format, cube arrays, robustness2 null descriptors, custom border colours,
+  BC6H/BC7/R11G11B10/RGBA16F). DXVK options without effect: d3d11.zeroWorkgroupMemory,
+  d3d11.enableRtOutputNanFixup, d3d11.cachedDynamicResources=vicra, dxvk.enableUnifiedImageLayouts=False,
+  dxvk.enableNvRawAccessChains=False, dxvk.enableMemoryDefrag=False (earlier: descriptor buffer/heap, GPL,
+  BltPipeline). DXVK's NVIDIA-keyed workarounds are off under Venus's driver ID, but the host driver
+  (615.78) is past their version limits except renderPassResolveFormatBug (MSAA only).
+- Launch-time console commands (render_ssao/ssgi/shadows 0) are overridden by the preset, so per-effect
+  bisection needs another route. Next: a RenderDoc capture of one frame to find the pass or texture
+  that comes out zero.
