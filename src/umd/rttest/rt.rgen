@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1) buffer Out { uvec2 px[]; };
+layout(location = 0) rayPayloadEXT uvec2 payload;
+void main() {
+    uvec2 p = gl_LaunchIDEXT.xy;
+    vec3 o = vec3(-1.0 + (float(p.x) + 0.5) / 32.0, -1.0 + (float(p.y) + 0.5) / 32.0, 0.0);
+    payload = uvec2(0u);
+    traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, o, 0.001, vec3(0, 0, 1), 100.0, 0);
+    px[p.y * 64u + p.x] = payload;
+}

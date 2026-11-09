@@ -851,3 +851,11 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   once its queues are drained.
 - Result: 3 restarts in a row under page heap with no DWM crash; desktop, taskbar and windows keep drawing.
 - 1.0.26313.13703 was never published; this release is 1.0.26313.15979.
+
+### Ray tracing (2026-11-09)
+- Vulkan: Venus passes the host's ray tracing through (VK_KHR_acceleration_structure, ray_tracing_pipeline,
+  ray_query, ray_tracing_maintenance1, ray_tracing_position_fetch, deferred_host_operations). New test
+  `src/umd/rttest` builds a BLAS/TLAS on the GPU and traces a 64x64 ray grid with ray queries (compute) and with a
+  ray tracing pipeline + SBT; RTX 4090 host: both 4096 of 4096 rays correct.
+- D3D12 DXR: not supported. Triton reports RaytracingTier 0; the DXR DDIs (state objects, acceleration-structure
+  builds, DispatchRays) are not implemented, although vkd3d-proton could translate them to the Vulkan path above.

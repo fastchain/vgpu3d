@@ -347,7 +347,7 @@ LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (
 | `src/kmd3d/viogpu/` | WDDM kernel driver; `src/kmd3d-inf/` has the INF and Vulkan ICD manifests |
 | `src/umd3d/` | D3D10/11/12 user-mode driver backend (Triton DDI → DXVK / vkd3d-proton) |
 | `src/installer/` | NSIS installer script |
-| `src/umd/` | guest test programs (`d3d9test`, `d3d11test`, `d3d12test`, `blttest`, `gltest`, `vkcompute`, …) |
+| `src/umd/` | guest test programs (`d3d9test`, `d3d11test`, `d3d12test`, `blttest`, `gltest`, `vkcompute`, `rttest`, …) |
 | `patches/` | our changes to Mesa, Triton, DXVK, vkd3d-proton and clvk |
 | `build/` | cross-build, packaging and installer scripts |
 | `tools/windows/` | guest scripts: install/uninstall, test rounds, benchmark runners |
