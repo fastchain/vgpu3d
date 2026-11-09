@@ -613,7 +613,7 @@ index e2da5c4..9198566 100644
  // Per-submission DMA private data.  The KMD's build-phase DDIs and the D3D12
  // DDI's SubmitCommandCb (virtual contexts) both carry the command `body` by
 diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
-index d34f523..d4b802e 100644
+index d34f523..e949626 100644
 --- a/src/virtio/vulkan/vn_common.c
 +++ b/src/virtio/vulkan/vn_common.c
 @@ -11,6 +11,9 @@
@@ -626,10 +626,21 @@ index d34f523..d4b802e 100644
  
  #include "util/log.h"
  #include "util/os_misc.h"
-@@ -246,6 +249,36 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+@@ -235,7 +238,8 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+ {
+    struct vn_ring *ring = instance->ring.ring;
+    struct vn_watchdog *watchdog = &instance->ring.watchdog;
+-   if (vn_watchdog_acquire(watchdog, true))
++   if (!vn_renderer_is_lost(instance->renderer) &&
++       vn_watchdog_acquire(watchdog, true))
+       vn_ring_unset_status_bits(ring, VK_RING_STATUS_ALIVE_BIT_MESA);
+ 
+    return (struct vn_relax_state){
+@@ -246,7 +250,38 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
     };
  }
  
+-void
 +#ifdef _WIN32
 +#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 +#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -660,20 +671,52 @@ index d34f523..d4b802e 100644
 +#define vn_relax_sleep_us(us) os_time_sleep(us)
 +#endif
 +
- void
++/* Returns false when the device is lost; the caller stops waiting. */
++bool
  vn_relax(struct vn_relax_state *state)
  {
-@@ -291,7 +324,7 @@ vn_relax(struct vn_relax_state *state)
+    const uint32_t base_sleep_us = state->profile.base_sleep_us;
+@@ -258,14 +293,27 @@ vn_relax(struct vn_relax_state *state)
+    (*iter)++;
+    if (*iter < (1 << busy_wait_order)) {
+       thrd_yield();
+-      return;
++      return true;
+    }
+ 
++   struct vn_renderer *renderer = state->instance->renderer;
++   if (unlikely(vn_renderer_is_lost(renderer)))
++      return false;
++
+    if (unlikely(*iter % (1 << warn_order) == 0)) {
+       struct vn_instance *instance = state->instance;
+       vn_log(instance, "stuck in %s wait with iter at %d", state->reason_str,
+              *iter);
+ 
++      /* vgpu: after an adapter stop or driver update the host context is
++       * gone and nothing will ever retire the wait; report device loss
++       * instead of aborting the whole process (DWM, Explorer, ...).
++       */
++      if (vn_renderer_check_lost(renderer)) {
++         vn_log(instance, "device lost in %s wait", state->reason_str);
++         return false;
++      }
++
+       struct vn_ring *ring = instance->ring.ring;
+       const uint32_t status = vn_ring_load_status(ring);
+       if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+@@ -291,7 +339,8 @@ vn_relax(struct vn_relax_state *state)
     }
  
     const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
 -   os_time_sleep(base_sleep_us << shift);
 +   vn_relax_sleep_us(base_sleep_us << shift);
++   return true;
  }
  
  struct vn_ring *
 diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
-index 7566a9f..b3384f2 100644
+index 7566a9f..9a06d92 100644
 --- a/src/virtio/vulkan/vn_common.h
 +++ b/src/virtio/vulkan/vn_common.h
 @@ -50,7 +50,9 @@
@@ -686,6 +729,15 @@ index 7566a9f..b3384f2 100644
  #else
  #include <sys/syscall.h>
  
+@@ -427,7 +429,7 @@ vn_watchdog_fini(struct vn_watchdog *watchdog)
+ struct vn_relax_state
+ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason);
+ 
+-void
++bool
+ vn_relax(struct vn_relax_state *state);
+ 
+ void
 diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
 index 4386d62..4623345 100644
 --- a/src/virtio/vulkan/vn_device_memory.c
@@ -997,8 +1049,25 @@ index 3355409..df6de3b 100644
           pImageFormatInfo = vn_physical_device_fix_image_format_info(
              pImageFormatInfo, renderer_handle_type, &local_info);
           if (!pImageFormatInfo) {
+diff --git a/src/virtio/vulkan/vn_query_pool.c b/src/virtio/vulkan/vn_query_pool.c
+index 3db33dc..93f1e17 100644
+--- a/src/virtio/vulkan/vn_query_pool.c
++++ b/src/virtio/vulkan/vn_query_pool.c
+@@ -293,9 +293,11 @@ vn_query_feedback_wait_ready(struct vn_device *dev,
+       vn_relax_init(dev->instance, VN_RELAX_REASON_QUERY);
+    for (uint32_t i = 0, j = 0; i < query_count; i++, j += step) {
+       while (!avail[j]) {
+-         vn_relax(&relax_state);
++         if (!vn_relax(&relax_state))
++            goto out; /* device lost */
+       }
+    }
++out:
+    vn_relax_fini(&relax_state);
+ }
+ 
 diff --git a/src/virtio/vulkan/vn_queue.c b/src/virtio/vulkan/vn_queue.c
-index fd5d1c7..186b190 100644
+index fd5d1c7..408bc15 100644
 --- a/src/virtio/vulkan/vn_queue.c
 +++ b/src/virtio/vulkan/vn_queue.c
 @@ -1009,6 +1009,50 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
@@ -1146,6 +1215,17 @@ index fd5d1c7..186b190 100644
     vn_async_vkCreateFence(dev->primary_ring, device, pCreateInfo, NULL,
                            pFence);
  
+@@ -1852,8 +1962,8 @@ vn_update_sync_result(struct vn_device *dev,
+       if (abs_timeout != OS_TIMEOUT_INFINITE &&
+           os_time_get_nano() >= abs_timeout)
+          result = VK_TIMEOUT;
+-      else
+-         vn_relax(relax_state);
++      else if (!vn_relax(relax_state))
++         result = VK_ERROR_DEVICE_LOST;
+       break;
+    default:
+       assert(result == VK_SUCCESS || result < 0);
 @@ -2321,8 +2431,25 @@ vn_CreateSemaphore(VkDevice device,
     }
  
@@ -1196,7 +1276,7 @@ index fd5d1c7..186b190 100644
         !(pWaitInfo->flags & VK_SEMAPHORE_WAIT_ANY_BIT)) {
        uint32_t semaphore_count = pWaitInfo->semaphoreCount;
 diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
-index dbee43f..5d1acab 100644
+index dbee43f..f69d4ea 100644
 --- a/src/virtio/vulkan/vn_renderer.h
 +++ b/src/virtio/vulkan/vn_renderer.h
 @@ -63,6 +63,16 @@ struct vn_renderer_info {
@@ -1216,8 +1296,78 @@ index dbee43f..5d1acab 100644
  
     uint32_t max_timeline_count;
  
+@@ -136,6 +146,13 @@ struct vn_renderer_ops {
+     */
+    VkResult (*wait)(struct vn_renderer *renderer,
+                     const struct vn_renderer_wait *wait);
++
++   /*
++    * Optional.  Asks the kernel whether the device is still there; returns
++    * true and marks the renderer lost when it is not.  Called only from
++    * waits that are already stuck, so it may be slow.
++    */
++   bool (*check_lost)(struct vn_renderer *renderer);
+ };
+ 
+ struct vn_renderer_shmem_ops {
+@@ -253,6 +270,12 @@ struct vn_renderer_sync_ops {
+ 
+ struct vn_renderer {
+    struct vn_renderer_info info;
++   /* set once the device is gone (e.g. the adapter was stopped); waits on
++    * the ring give up instead of aborting
++    */
++   uint32_t lost;
++   /* last time vn_renderer_check_lost_idle found the device alive */
++   int64_t alive_ns;
+    struct vn_renderer_ops ops;
+    struct vn_renderer_shmem_ops shmem_ops;
+    struct vn_renderer_bo_ops bo_ops;
+@@ -301,6 +324,42 @@ vn_renderer_create(struct vn_instance *instance,
+ #endif
+ }
+ 
++static inline bool
++vn_renderer_is_lost(struct vn_renderer *renderer)
++{
++   return p_atomic_read(&renderer->lost);
++}
++
++static inline bool
++vn_renderer_check_lost(struct vn_renderer *renderer)
++{
++   if (vn_renderer_is_lost(renderer))
++      return true;
++   return renderer->ops.check_lost && renderer->ops.check_lost(renderer);
++}
++
++/* Before writing the ring after a quiet period, ask the kernel whether the
++ * device is still there.  Once the adapter stops, the ring's mapping is
++ * gone and its address may already belong to another mapping (an app that
++ * recreated its device), so a thread that slept through the stop must not
++ * touch it.  Busy threads fault on the unmapped ring right after the stop
++ * instead and are caught there.
++ */
++static inline bool
++vn_renderer_check_lost_idle(struct vn_renderer *renderer)
++{
++   if (vn_renderer_is_lost(renderer))
++      return true;
++   if (!renderer->ops.check_lost)
++      return false;
++
++   const int64_t now = os_time_get_nano();
++   const int64_t last = p_atomic_xchg(&renderer->alive_ns, now);
++   if (now - last < 20 * 1000 * 1000)
++      return false;
++   return renderer->ops.check_lost(renderer);
++}
++
+ static inline void
+ vn_renderer_destroy(struct vn_renderer *renderer,
+                     const VkAllocationCallbacks *alloc)
 diff --git a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
-index 0acb349..36152d1 100644
+index 0acb349..3dcb784 100644
 --- a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 +++ b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 @@ -2,6 +2,7 @@
@@ -1228,25 +1378,52 @@ index 0acb349..36152d1 100644
  #include <d3dkmthk.h>
  #include <d3dukmdt.h>
  #include <dxgiddi.h>
-@@ -24,6 +25,8 @@ struct virtgpu;
+@@ -15,15 +16,34 @@
+ #include "virtio/virtio-gpu/venus_hw.h"
+ #include "virtio/virtio-gpu/wddm_hw.h"
+ 
++#ifndef D3DDDIERR_DEVICEREMOVED
++#define D3DDDIERR_DEVICEREMOVED ((HRESULT)0x88760870L)
++#endif
++#ifndef DXGI_ERROR_DEVICE_REMOVED
++#define DXGI_ERROR_DEVICE_REMOVED ((HRESULT)0x887A0005L)
++#endif
++
+ #define VIRTGPU_PCI_VENDOR_ID 0x1af4
+ #define VIRTGPU_PCI_DEVICE_ID 0x1050
+ #define VIRTGPU_WIN_DEVICE_ID "PCI\\VEN_1AF4&DEV_1050"
+ 
+ struct virtgpu;
+ 
++/* vgpu: a KMD-made user mapping (RES_INFO UserVa).  The KMD unmaps these
++ * when the adapter stops, so a later access faults; see virtgpu_va_guard.
++ */
++struct virtgpu_va_range {
++   char *base;
++   size_t size;
++   struct virtgpu *gpu;
++};
++
  struct virtgpu_shmem {
     struct vn_renderer_shmem base;
++   struct virtgpu_va_range guard;
     D3DKMT_HANDLE alloc;
 +   /* vgpu: mmap_ptr is the WDDM2 KMD's RES_INFO UserVa (no D3DKMTLock/MAP_BLOB) */
 +   bool kmd_mapped;
     union {
        D3DKMT_HANDLE kmt;
        HANDLE h;
-@@ -42,6 +45,8 @@ struct virtgpu_bo {
+@@ -42,6 +62,9 @@ struct virtgpu_bo {
        HANDLE h;
     } /* resource */;
     uint32_t blob_flags;
 +   /* vgpu: WDDM2 KMD's RES_INFO UserVa, used instead of D3DKMTLock */
 +   void *kmd_va;
++   struct virtgpu_va_range guard;
  };
  
  struct virtgpu_sync {
-@@ -93,6 +98,13 @@ struct virtgpu {
+@@ -93,6 +116,13 @@ struct virtgpu {
           PFND3DKMT_DESTROYDEVICE destroyDevice;
           PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
           PFND3DKMT_CLOSEADAPTER closeAdapter;
@@ -1260,7 +1437,7 @@ index 0acb349..36152d1 100644
        } cb;
     } d3dkmt;
  
-@@ -112,6 +124,15 @@ struct virtgpu {
+@@ -112,6 +142,15 @@ struct virtgpu {
  
        D3DDDI_PATCHLOCATIONLIST *patch_list;
        size_t patch_size;
@@ -1276,7 +1453,17 @@ index 0acb349..36152d1 100644
     } ctx;
  
     struct {
-@@ -550,6 +571,101 @@ sim_submit_signal_syncs(struct virtgpu *gpu,
+@@ -157,6 +196,9 @@ hr_to_nt(struct virtgpu *gpu, HRESULT hr)
+       return STATUS_NO_MEMORY;
+    case E_INVALIDARG:
+       return STATUS_INVALID_PARAMETER;
++   case D3DDDIERR_DEVICEREMOVED:
++   case DXGI_ERROR_DEVICE_REMOVED:
++      return STATUS_DEVICE_REMOVED;
+    default:
+       vn_log(gpu->instance, "Unknown HRESULT: %lx", hr);
+       return STATUS_INVALID_PARAMETER;
+@@ -550,6 +592,101 @@ sim_submit_signal_syncs(struct virtgpu *gpu,
     return VK_SUCCESS;
  }
  
@@ -1378,7 +1565,7 @@ index 0acb349..36152d1 100644
  static NTSTATUS
  virtgpu_ioctl_create_context(struct virtgpu *gpu)
  {
-@@ -577,6 +693,9 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu)
+@@ -577,6 +714,9 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu)
  
        return STATUS_SUCCESS;
     } else {
@@ -1388,7 +1575,7 @@ index 0acb349..36152d1 100644
        D3DKMT_CREATECONTEXT context = {
           .hDevice = gpu->d3dkmt.device,
           .ClientHint = D3DKMT_CLIENTHINT_VULKAN,
-@@ -663,6 +782,33 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
+@@ -663,6 +803,33 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
  static NTSTATUS
  virtgpu_ioctl_signal(struct virtgpu *gpu, HANDLE fence)
  {
@@ -1422,7 +1609,7 @@ index 0acb349..36152d1 100644
     if (gpu->ddicb != NULL) {
        D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signal = {
             .hContext = gpu->ctx.h,
-@@ -702,6 +848,20 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+@@ -702,6 +869,20 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
        const struct vn_renderer_submit_batch *batch = &submit->batches[i];
        mtx_lock(&gpu->ctx.lock);
  
@@ -1443,7 +1630,7 @@ index 0acb349..36152d1 100644
        for (uint32_t i = 0; i < submit->bo_count; i++) {
           struct virtgpu_bo *bo = (struct virtgpu_bo *)submit->bos[i];
           assert(bo->alloc != 0);
-@@ -726,6 +886,7 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+@@ -726,6 +907,7 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
           break;
        }
  
@@ -1451,7 +1638,190 @@ index 0acb349..36152d1 100644
        if (batch->sync_count > 0) {
           HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
           // vn_log(gpu->instance, "created handle %p", fence);
-@@ -818,9 +979,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
+@@ -774,7 +956,7 @@ virtgpu_ioctl_getparam(struct virtgpu *gpu,
+ }
+ 
+ static NTSTATUS
+-virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
++virtgpu_ioctl_escape_raw(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
+ {
+    if (gpu->ddicb != NULL) {
+       D3DDDICB_ESCAPE escape = {
+@@ -797,6 +979,173 @@ virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
+    }
+ }
+ 
++static NTSTATUS
++virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
++{
++   NTSTATUS status = virtgpu_ioctl_escape_raw(gpu, priv);
++   if (status == STATUS_DEVICE_REMOVED)
++      p_atomic_set(&gpu->base.lost, 1);
++   return status;
++}
++
++/* Called from stuck ring/fence waits.  GET_PCI_INFO has no side effects
++ * and succeeds for as long as the adapter is started.
++ */
++static bool
++virtgpu_check_lost(struct vn_renderer *renderer)
++{
++   struct virtgpu *gpu = (struct virtgpu *)renderer;
++   if (vn_renderer_is_lost(renderer))
++      return true;
++
++   VIOGPU_ESCAPE probe = {
++      .Type = VIOGPU_GET_PCI_INFO,
++      .DataLength = sizeof(probe.PciInfo),
++   };
++   const NTSTATUS status = virtgpu_ioctl_escape_raw(gpu, &probe);
++   if (NT_SUCCESS(status))
++      return false;
++
++   vn_log(gpu->instance, "vgpu: adapter probe failed (0x%lx), device lost",
++          status);
++   p_atomic_set(&gpu->base.lost, 1);
++   return true;
++}
++
++/* vgpu: when the adapter stops (driver update, disable, TDR recovery) the
++ * KMD unmaps every RES_INFO user view, and the next ring head read faults
++ * (0xc0000005 in vn_ring_submit_locked killed DWM and every Vulkan/D3D app).
++ * This handler catches faults inside a registered view that is no longer
++ * mapped, puts zeroed memory there and marks the renderer lost; the ring
++ * waits then give up and the app sees VK_ERROR_DEVICE_LOST.
++ */
++static struct {
++   once_flag init;
++   SRWLOCK lock;
++   struct hash_table *ranges; /* base -> struct virtgpu_va_range */
++   PVOID handler;
++} virtgpu_va_guard = { .init = ONCE_FLAG_INIT, .lock = SRWLOCK_INIT };
++
++static LONG WINAPI
++virtgpu_va_guard_handler(EXCEPTION_POINTERS *ep)
++{
++   const EXCEPTION_RECORD *rec = ep->ExceptionRecord;
++   if ((rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
++        rec->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) ||
++       rec->NumberParameters < 2)
++      return EXCEPTION_CONTINUE_SEARCH;
++
++   const char *addr = (const char *)rec->ExceptionInformation[1];
++   LONG ret = EXCEPTION_CONTINUE_SEARCH;
++
++   AcquireSRWLockShared(&virtgpu_va_guard.lock);
++   hash_table_foreach(virtgpu_va_guard.ranges, entry) {
++      struct virtgpu_va_range *range = entry->data;
++      if (addr < range->base || addr >= range->base + range->size)
++         continue;
++
++      /* Map zeroes over the free run around the fault.  Part of the view
++       * may already be reused by a new mapping (the app recreating its
++       * device), so start at the fault's 64K reservation granule rather
++       * than the view base.
++       */
++      char *start = (char *)((uintptr_t)addr & ~(uintptr_t)0xffff);
++      if (start < range->base)
++         start = range->base;
++      MEMORY_BASIC_INFORMATION mbi = { 0 };
++      const SIZE_T q = VirtualQuery(start, &mbi, sizeof(mbi));
++      void *mem = NULL;
++      if (q == sizeof(mbi) && mbi.State == MEM_FREE) {
++         char *end = MIN2(range->base + range->size, start + mbi.RegionSize);
++         mem = VirtualAlloc(start, end - start, MEM_RESERVE | MEM_COMMIT,
++                            PAGE_READWRITE);
++      }
++      if (mem == start) {
++         p_atomic_set(&range->gpu->base.lost, 1);
++         ret = EXCEPTION_CONTINUE_EXECUTION;
++      }
++      break;
++   }
++   ReleaseSRWLockShared(&virtgpu_va_guard.lock);
++
++   return ret;
++}
++
++static void
++virtgpu_va_guard_init_once(void)
++{
++   virtgpu_va_guard.ranges =
++      _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
++}
++
++static void
++virtgpu_va_guard_add(struct virtgpu *gpu, struct virtgpu_va_range *range,
++                     void *ptr, size_t size)
++{
++   call_once(&virtgpu_va_guard.init, virtgpu_va_guard_init_once);
++   if (!ptr || !virtgpu_va_guard.ranges)
++      return;
++
++   *range = (struct virtgpu_va_range){
++      .base = ptr,
++      .size = size,
++      .gpu = gpu,
++   };
++
++   AcquireSRWLockExclusive(&virtgpu_va_guard.lock);
++   _mesa_hash_table_insert(virtgpu_va_guard.ranges, ptr, range);
++   if (!virtgpu_va_guard.handler) {
++      virtgpu_va_guard.handler =
++         AddVectoredExceptionHandler(1, virtgpu_va_guard_handler);
++   }
++   ReleaseSRWLockExclusive(&virtgpu_va_guard.lock);
++}
++
++/* Must run before the KMD tears the mapping down. */
++static void
++virtgpu_va_guard_remove(struct virtgpu_va_range *range)
++{
++   if (!range->base)
++      return;
++
++   AcquireSRWLockExclusive(&virtgpu_va_guard.lock);
++   struct hash_entry *entry =
++      _mesa_hash_table_search(virtgpu_va_guard.ranges, range->base);
++   if (entry && entry->data == range)
++      _mesa_hash_table_remove(virtgpu_va_guard.ranges, entry);
++   range->base = NULL;
++   /* the handler must not outlive this DLL */
++   if (!virtgpu_va_guard.ranges->entries && virtgpu_va_guard.handler) {
++      RemoveVectoredExceptionHandler(virtgpu_va_guard.handler);
++      virtgpu_va_guard.handler = NULL;
++   }
++   ReleaseSRWLockExclusive(&virtgpu_va_guard.lock);
++}
++
++/* drop whatever views of this renderer are still registered (leaked after
++ * device loss)
++ */
++static void
++virtgpu_va_guard_remove_all(struct virtgpu *gpu)
++{
++   if (!virtgpu_va_guard.ranges)
++      return;
++
++   AcquireSRWLockExclusive(&virtgpu_va_guard.lock);
++   hash_table_foreach(virtgpu_va_guard.ranges, entry) {
++      struct virtgpu_va_range *range = entry->data;
++      if (range->gpu == gpu) {
++         range->base = NULL;
++         _mesa_hash_table_remove(virtgpu_va_guard.ranges, entry);
++      }
++   }
++   if (!virtgpu_va_guard.ranges->entries && virtgpu_va_guard.handler) {
++      RemoveVectoredExceptionHandler(virtgpu_va_guard.handler);
++      virtgpu_va_guard.handler = NULL;
++   }
++   ReleaseSRWLockExclusive(&virtgpu_va_guard.lock);
++}
++
+ static NTSTATUS
+ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
+                        uint32_t id,
+@@ -818,9 +1167,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
     return virtgpu_ioctl_escape(gpu, &caps);
  }
  
@@ -1476,7 +1846,7 @@ index 0acb349..36152d1 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -859,8 +1034,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
+@@ -859,8 +1222,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
  }
  
  static NTSTATUS
@@ -1498,7 +1868,7 @@ index 0acb349..36152d1 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -906,6 +1093,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+@@ -906,6 +1281,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
     // vn_log(gpu->instance, "created handle %p", fence);
     NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
     if (!NT_SUCCESS(status)) {
@@ -1506,7 +1876,7 @@ index 0acb349..36152d1 100644
        return status;
     }
     // vn_log(gpu->instance, "waiting for handle %p", fence);
-@@ -924,6 +1112,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+@@ -924,6 +1300,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
        } \
     } while (0)
  
@@ -1525,7 +1895,7 @@ index 0acb349..36152d1 100644
  static NTSTATUS
  virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     uint32_t blob_mem,
-@@ -934,19 +1134,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -934,19 +1322,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     D3DKMT_HANDLE *alloc_handle,
                                     D3DKMT_HANDLE *res_kmt_local,
                                     D3DKMT_HANDLE *res_kmt_global,
@@ -1564,7 +1934,7 @@ index 0acb349..36152d1 100644
  
     VIOGPU_CREATE_RESOURCE_EXCHANGE res_priv = { 0 };
  
-@@ -991,6 +1201,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -991,6 +1389,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        };
        NTSTATUS status = gpu->d3dkmt.cb.createAllocation(&alloc);
        if (!NT_SUCCESS(status)) {
@@ -1572,7 +1942,7 @@ index 0acb349..36152d1 100644
           return status;
        }
        *res_kmt_local = alloc.hResource;
-@@ -1008,22 +1219,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -1008,22 +1407,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        .DataLength = sizeof(res_info.ResourceInfo),
        .ResourceInfo = {
           .ResHandle = *alloc_handle,
@@ -1629,7 +1999,7 @@ index 0acb349..36152d1 100644
  }
  
  static NTSTATUS
-@@ -1379,6 +1615,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
+@@ -1379,6 +1803,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
           (void *)GetProcAddress(gdi32lib, "D3DKMTOpenAdapterFromHdc");
        gpu->d3dkmt.cb.closeAdapter =
           (void *)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
@@ -1648,7 +2018,7 @@ index 0acb349..36152d1 100644
  
        NTSTATUS status = virtgpu_find_adapter(gpu);
        if (!NT_SUCCESS(status)) {
-@@ -1496,11 +1744,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
+@@ -1496,11 +1932,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
        *alloc = alloc_list[0].hAllocation;
        *res_kmt_local = open.hResource;
  
@@ -1669,7 +2039,13 @@ index 0acb349..36152d1 100644
           },
        };
  
-@@ -1551,6 +1808,15 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
+@@ -1546,11 +1991,21 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
+       virtgpu_ioctl_open_resource(gpu, kmt_global, &alloc, &kmt_local, &res_info, d3d_open);
+    if (!NT_SUCCESS(status)) {
+       vn_log(gpu->instance, "failed to open resource: 0x%lx", status);
++      mtx_unlock(&gpu->win32_handle_import_mutex);
+       return VK_ERROR_DEVICE_LOST;
+    }
  
     if (!alloc)
        goto fail;
@@ -1685,7 +2061,7 @@ index 0acb349..36152d1 100644
     bo = util_sparse_array_get(&gpu->bo_array, alloc);
  
     /* Upon import, blob_flags is not passed to the kernel and is only for
-@@ -1668,9 +1934,11 @@ virtgpu_bo_create_from_device_memory(
+@@ -1668,9 +2123,11 @@ virtgpu_bo_create_from_device_memory(
     }
  
     D3DKMT_HANDLE alloc, kmt_local, kmt_global;
@@ -1698,7 +2074,7 @@ index 0acb349..36152d1 100644
     if (!NT_SUCCESS(status)) {
        vn_log(gpu->instance,
               "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
-@@ -1692,6 +1960,7 @@ virtgpu_bo_create_from_device_memory(
+@@ -1692,6 +2149,7 @@ virtgpu_bo_create_from_device_memory(
           .DataLength = sizeof(res_info.ResourceInfo),
           .ResourceInfo = {
              .ResHandle = alloc,
@@ -1706,15 +2082,17 @@ index 0acb349..36152d1 100644
           },
        };
  
-@@ -1725,6 +1994,7 @@ virtgpu_bo_create_from_device_memory(
+@@ -1725,7 +2183,9 @@ virtgpu_bo_create_from_device_memory(
        },
        .alloc = alloc,
        .blob_flags = blob_flags,
 +      .kmd_va = kmd_va,
     };
++   virtgpu_va_guard_add(gpu, &bo->guard, kmd_va, size);
  
     if (gpu->ddicb != NULL) {
-@@ -1770,7 +2040,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
+       bo->h = h;
+@@ -1770,7 +2230,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
     const bool mappable = bo->blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE;
  
     /* not thread-safe but is fine */
@@ -1725,12 +2103,13 @@ index 0acb349..36152d1 100644
        NTSTATUS status =
           virtgpu_ioctl_lock(gpu, bo->alloc, &bo->base.mmap_ptr);
        if (!NT_SUCCESS(status)) {
-@@ -1817,9 +2089,10 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+@@ -1817,9 +2279,11 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
        return false;
     }
  
 -   if (bo->base.mmap_ptr) {
 +   /* a KMD-owned mapping is torn down by the KMD at allocation destroy */
++   virtgpu_va_guard_remove(&bo->guard);
 +   if (bo->base.mmap_ptr && !bo->kmd_va) {
        virtgpu_ioctl_unlock(gpu, bo->alloc);
 -      virtgpu_ioctl_destroy_map(gpu, bo->alloc);
@@ -1738,12 +2117,13 @@ index 0acb349..36152d1 100644
     }
  
     /* Set alloc and res to 0 to indicate that the bo is invalid. Must be set
-@@ -1981,8 +2254,10 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
+@@ -1981,8 +2445,11 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
     struct virtgpu *gpu = (struct virtgpu *)renderer;
     struct virtgpu_shmem *shmem = (struct virtgpu_shmem *)_shmem;
  
 -   virtgpu_ioctl_unlock(gpu, shmem->alloc);
 -   virtgpu_ioctl_destroy_map(gpu, shmem->alloc);
++   virtgpu_va_guard_remove(&shmem->guard);
 +   if (!shmem->kmd_mapped) {
 +      virtgpu_ioctl_unlock(gpu, shmem->alloc);
 +      virtgpu_ioctl_destroy_map(gpu, shmem->alloc, shmem->base.res_id);
@@ -1751,7 +2131,7 @@ index 0acb349..36152d1 100644
     virtgpu_ioctl_resource_destroy_blob(gpu, shmem->alloc, shmem->kmt,
                                         shmem->h);
  }
-@@ -2015,14 +2290,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2015,14 +2482,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
     HANDLE h = NULL; /* This is a device allocation */
     D3DKMT_HANDLE alloc, kmt;
  
@@ -1774,15 +2154,18 @@ index 0acb349..36152d1 100644
     if (!NT_SUCCESS(status)) {
        virtgpu_ioctl_resource_destroy_blob(gpu, alloc, kmt, h);
        vn_log(gpu->instance, "failed to map blob resource: 0x%lx", status);
-@@ -2039,6 +2318,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2039,7 +2510,10 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
           .mmap_ptr = ptr,
        },
        .alloc = alloc,
 +      .kmd_mapped = kmd_mapped,
     };
++   if (kmd_mapped)
++      virtgpu_va_guard_add(gpu, &shmem->guard, ptr, size);
  
     if (gpu->ddicb != NULL) {
-@@ -2108,6 +2388,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
+       shmem->h = h;
+@@ -2108,6 +2582,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
     assert(capset->supports_multiple_timelines);
     info->max_timeline_count = gpu->max_timeline_count;
  
@@ -1801,7 +2184,11 @@ index 0acb349..36152d1 100644
     /* Use guest blob allocations from dedicated heap (Host visible memory) */
     //if (gpu->bo_blob_mem == VIOGPU_BLOB_MEM_HOST3D && capset->use_guest_vram)
     //   info->has_guest_vram = true;
-@@ -2170,6 +2462,12 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2167,9 +2653,16 @@ virtgpu_destroy(struct vn_renderer *renderer,
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+ 
+    vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
++   virtgpu_va_guard_remove_all(gpu);
  
     if (gpu->ctx.h)
        virtgpu_ioctl_destroy_context(gpu);
@@ -1814,7 +2201,7 @@ index 0acb349..36152d1 100644
     if (gpu->d3dkmt.device)
        virtgpu_ioctl_destroy_device(gpu);
     if (gpu->d3dkmt.adapter)
-@@ -2179,6 +2477,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2179,6 +2672,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
  
     mtx_destroy(&gpu->win32_handle_import_mutex);
     mtx_destroy(&gpu->ctx.lock);
@@ -1822,7 +2209,7 @@ index 0acb349..36152d1 100644
  
     util_sparse_array_finish(&gpu->shmem_array);
     util_sparse_array_finish(&gpu->bo_array);
-@@ -2199,6 +2498,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+@@ -2199,6 +2693,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
     mtx_init(&gpu->win32_handle_import_mutex, mtx_plain);
  
     mtx_init(&gpu->ctx.lock, mtx_plain);
@@ -1830,7 +2217,15 @@ index 0acb349..36152d1 100644
  
     VkResult result = virtgpu_open(gpu, info);
     if (result == VK_SUCCESS)
-@@ -2274,3 +2574,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
+@@ -2220,6 +2715,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+    gpu->base.ops.destroy = virtgpu_destroy;
+    gpu->base.ops.submit = virtgpu_submit;
+    gpu->base.ops.wait = virtgpu_wait;
++   gpu->base.ops.check_lost = virtgpu_check_lost;
+ 
+    gpu->base.shmem_ops.create = virtgpu_shmem_create;
+    gpu->base.shmem_ops.destroy = virtgpu_shmem_destroy;
+@@ -2274,3 +2770,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
  
     return VK_SUCCESS;
  }
@@ -1881,11 +2276,122 @@ index 0acb349..36152d1 100644
 +   __asm__("__imp__vgpu_mesa_wassert") = _wassert;
 +#endif
 +#endif
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 5bbe8bd..1f33c8b 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -193,7 +193,11 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
+          vn_relax_fini(&relax_state);
+          return;
+       }
+-      vn_relax(&relax_state);
++      if (!vn_relax(&relax_state)) {
++         /* device lost: nothing will retire the seqno */
++         vn_relax_fini(&relax_state);
++         return;
++      }
+    } while (true);
+ }
+ 
+@@ -236,7 +240,13 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
+       struct vn_relax_state relax_state =
+          vn_relax_init(ring->instance, VN_RELAX_REASON_RING_SPACE);
+       do {
+-         vn_relax(&relax_state);
++         if (!vn_relax(&relax_state)) {
++            /* device lost: pretend the space is free so the caller can
++             * finish; nothing reads the ring any more
++             */
++            vn_relax_fini(&relax_state);
++            return ring->cur + size - ring->buffer_size;
++         }
+          if (vn_ring_has_space(ring, size, &head)) {
+             vn_relax_fini(&relax_state);
+             return head;
+@@ -623,6 +633,9 @@ vn_ring_submit_locked(struct vn_ring *ring,
+                       struct vn_renderer_shmem *extra_shmem,
+                       uint32_t *ring_seqno)
+ {
++   if (unlikely(vn_renderer_check_lost_idle(ring->instance->renderer)))
++      return VK_ERROR_DEVICE_LOST;
++
+    const bool direct = vn_ring_submission_can_direct(ring, cs);
+    if (!direct && cs->storage_type == VN_CS_ENCODER_STORAGE_POINTER) {
+       cs = vn_ring_cs_upload_locked(ring, cs);
+@@ -725,7 +738,11 @@ vn_ring_submit_command(struct vn_ring *ring,
+          submit->reply =
+             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
+          vn_ring_wait_seqno(ring, submit->ring_seqno);
+-      } else {
++         /* a wait that gave up on device loss leaves no reply to decode */
++         if (unlikely(vn_renderer_is_lost(ring->instance->renderer)))
++            submit->ring_seqno_valid = false;
++      }
++      if (unlikely(!submit->ring_seqno_valid)) {
+          vn_renderer_shmem_unref(ring->instance->renderer,
+                                  submit->reply_shmem);
+          submit->reply_shmem = NULL;
 diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
-index 71ff678..898595e 100644
+index 71ff678..c0570fa 100644
 --- a/src/virtio/vulkan/vn_wsi.c
 +++ b/src/virtio/vulkan/vn_wsi.c
-@@ -1011,6 +1011,7 @@ vn_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+@@ -547,6 +547,8 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
+    /* VK_KHR_incremental_present */
+    VkPresentRegionsKHR *_pr;
+    VkPresentRegionKHR *_pr_regions;
++   VkRectLayerKHR *_pr_rects;
++   uint32_t pr_rect_count = 0;
+ 
+    /* VK_KHR_present_id */
+    VkPresentIdKHR *_id;
+@@ -586,9 +588,18 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
+                         dgpi->swapchainCount);
+    }
+    if (pr) {
++      /* The info outlives vkQueuePresentKHR (async present), so the
++       * rectangles the regions point at are copied too.
++       */
++      for (uint32_t i = 0; pr->pRegions && i < pr->swapchainCount; i++) {
++         if (pr->pRegions[i].pRectangles)
++            pr_rect_count += pr->pRegions[i].rectangleCount;
++      }
+       vk_multialloc_add(&ma, &_pr, __typeof__(*_pr), 1);
+       vk_multialloc_add(&ma, &_pr_regions, __typeof__(*_pr_regions),
+                         pr->swapchainCount);
++      vk_multialloc_add(&ma, &_pr_rects, __typeof__(*_pr_rects),
++                        pr_rect_count);
+    }
+    if (id) {
+       vk_multialloc_add(&ma, &_id, __typeof__(*_id), 1);
+@@ -646,12 +657,25 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
+    }
+ 
+    if (pr) {
+-      typed_memcpy(_pr_regions, pr->pRegions, pr->swapchainCount);
++      VkPresentRegionKHR *regions = NULL;
++      if (pr->pRegions) {
++         typed_memcpy(_pr_regions, pr->pRegions, pr->swapchainCount);
++         VkRectLayerKHR *rects = _pr_rects;
++         for (uint32_t i = 0; i < pr->swapchainCount; i++) {
++            if (!_pr_regions[i].pRectangles)
++               continue;
++            typed_memcpy(rects, _pr_regions[i].pRectangles,
++                         _pr_regions[i].rectangleCount);
++            _pr_regions[i].pRectangles = rects;
++            rects += _pr_regions[i].rectangleCount;
++         }
++         regions = _pr_regions;
++      }
+ 
+       *_pr = (VkPresentRegionsKHR){
+          .sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR,
+          .swapchainCount = pr->swapchainCount,
+-         .pRegions = _pr_regions,
++         .pRegions = regions,
+       };
+       __vk_append_struct(_pi, _pr);
+    }
+@@ -1011,6 +1035,7 @@ vn_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
     struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
  
     if (!dev->renderer->info.has_implicit_fencing &&
@@ -1893,3 +2399,71 @@ index 71ff678..898595e 100644
         !VN_PERF(NO_ASYNC_PRESENT)) {
        struct vn_queue *queue = vn_queue_from_handle(_queue);
        return vn_wsi_present_async(dev, queue, pPresentInfo);
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 10669f8..1a43a7e 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2729,7 +2729,10 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
+ 
+    VkMemoryRequirements reqs;
+    wsi->GetBufferMemoryRequirements(chain->device, image->blit.buffer, &reqs);
+-   assert(reqs.size <= info->linear_size);
++   /* A layered driver (Venus) reports the host's requirements, which may
++    * round the size up past linear_size; allocating less fails the bind.
++    */
++   const VkDeviceSize blit_alloc_size = MAX2(info->linear_size, reqs.size);
+ 
+    struct wsi_memory_allocate_info memory_wsi_info = {
+       .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
+@@ -2747,14 +2750,14 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
+    VkMemoryAllocateInfo buf_mem_info = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+       .pNext = &buf_mem_dedicated_info,
+-      .allocationSize = info->linear_size,
++      .allocationSize = blit_alloc_size,
+       .memoryTypeIndex =
+          info->select_blit_dst_memory_type(wsi, reqs.memoryTypeBits),
+    };
+ 
+    void *sw_host_ptr = NULL;
+    if (info->alloc_shm)
+-      sw_host_ptr = info->alloc_shm(image, info->linear_size);
++      sw_host_ptr = info->alloc_shm(image, blit_alloc_size);
+ 
+    VkExportMemoryAllocateInfo memory_export_info;
+    VkImportMemoryHostPointerInfoEXT host_ptr_info;
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index df41fd9..63ff50b 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -657,16 +657,25 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+       }
+    }
+ 
+-   assert(chain->dxgi);
++   /* The GDI path returns every image to IDLE in queue_present, so no idle
++    * image means a present never reached it (the submit failed, e.g. after
++    * device loss) and the images are stuck in DRAWING.
++    */
++   if (!chain->dxgi) {
++      chain->status = VK_ERROR_OUT_OF_DATE_KHR;
++      return chain->status;
++   }
+    uint32_t index = chain->dxgi->GetCurrentBackBufferIndex();
+    if (chain->images[index].state == WSI_IMAGE_DRAWING) {
+       index = (index + 1) % chain->base.image_count;
+       assert(chain->images[index].state == WSI_IMAGE_QUEUED);
+    }
+-   if (chain->wsi->wsi->WaitForFences(chain->base.device, 1,
+-                                      &chain->base.fences[index],
+-                                      false, info->timeout) != VK_SUCCESS)
+-      return VK_TIMEOUT;
++   VkResult result =
++      chain->wsi->wsi->WaitForFences(chain->base.device, 1,
++                                     &chain->base.fences[index],
++                                     false, info->timeout);
++   if (result != VK_SUCCESS)
++      return result;
+ 
+    *image_index = index;
+    chain->images[index].state = WSI_IMAGE_DRAWING;

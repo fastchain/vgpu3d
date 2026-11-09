@@ -774,3 +774,28 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   3-slot ring. Holding until DWM's next frame instead capped blt apps at DWM's rate (~67 fps): dxgkrnl lets a
   window's next blt present through only after the previous completes, so "newest wins" never applies.
   tearcheck blt uncapped: 17 % -> 1-2 % mixed, ~400 -> ~122 fps. Vulkan WSI windows unchanged (GDI blit path).
+
+### Adapter restarts no longer crash GPU apps (2026-11-09, Yttrium adoption phase 3)
+- Before: a driver update, disable/enable or TDR recovery (`pnputil /restart-device`) killed DWM, Explorer,
+  the Start menu and every D3D11/D3D12/Vulkan app (0xc0000005 in `vn_ring_submit_locked`, DWM abort in
+  `vn_relax`). Cause: the KMD unmaps every RES_INFO user view when the adapter stops; Venus then read the ring
+  head from freed memory, and its waits aborted on the expired ring alive status.
+- Now (Venus): the renderer has a lost flag. A vectored exception handler maps zeroed memory over a faulting,
+  now-free registered view and marks the renderer lost; `vn_relax` waits give up instead of aborting; fence
+  waits return VK_ERROR_DEVICE_LOST; a side-effect-free escape (GET_PCI_INFO) probes the adapter from stuck
+  waits and before ring writes after 20 ms of quiet. The probe matters: an app that recreated its device can
+  get the old view's address for a new mapping (seen in DWM: a read-only monitored-fence page), and a thread
+  that slept through the stop must not write there. Remaining risk: a busy writer racing that reuse.
+- DXVK: an exception on the CS thread (vkEndCommandBuffer failing on the lost device) ended the thread, and
+  DWM then hung forever destroying its device; failed submissions were dropped without releasing the
+  resources they tracked, so Map() hung. Both now retire and report the device as lost.
+- WSI (GDI path): acquire dereferenced a NULL DXGI swapchain once failed presents left every image in DRAWING.
+- Result, 3 runs with tearcheck (D3D11 flip), tearcheck12 (D3D12) and tearcheckvk (Vulkan) running across
+  the restart: all three get DXGI_ERROR_DEVICE_REMOVED / VK_ERROR_DEVICE_LOST and exit cleanly, DWM keeps
+  running (no restart, no crash event), Explorer survives, new apps start normally right after.
+- Also fixed: the import mutex was left locked when opening a resource failed (deadlock after removal), the
+  WSI blit buffer is sized by its real memory requirements, async present deep-copies its damage rectangles.
+- Debugging recipe used here: `MiniDumpWriteDump` via PowerShell Add-Type (comsvcs MiniDump produced a broken
+  dump) and a stack scanner over the minidump (thread contexts + Memory64 list) symbolized with `nm`.
+  Don't start DbgView from the vgpu-run task: a DbgView that doesn't drain DBWIN_BUFFER makes every
+  OutputDebugString block and looks like a driver hang.

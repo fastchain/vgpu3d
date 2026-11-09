@@ -234,11 +234,19 @@ main(int argc, char **argv)
             DispatchMessageA(&msg);
         }
         const int s = frame & 1;
-        vkWaitForFences(dev, 1, &fences[s], VK_TRUE, UINT64_MAX);
+        /* adapter restarts (driver updates) lose the device; stop cleanly */
+        VkResult vr = vkWaitForFences(dev, 1, &fences[s], VK_TRUE, UINT64_MAX);
+        if (vr < 0) {
+            printf("device lost: wait %d\n", vr);
+            break;
+        }
         vkResetFences(dev, 1, &fences[s]);
         uint32_t idx;
-        if (vkAcquireNextImageKHR(dev, sc, UINT64_MAX, acq[s], VK_NULL_HANDLE, &idx) < 0)
+        vr = vkAcquireNextImageKHR(dev, sc, UINT64_MAX, acq[s], VK_NULL_HANDLE, &idx);
+        if (vr < 0) {
+            printf("device lost: acquire %d\n", vr);
             break;
+        }
         VkCommandBuffer cb = cbs[s];
         vkResetCommandBuffer(cb, 0);
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -257,9 +265,17 @@ main(int argc, char **argv)
         vkEndCommandBuffer(cb);
         VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &acq[s], &ws, 1, &cb, 1, &done[s] };
-        vkQueueSubmit(q, 1, &si, fences[s]);
+        vr = vkQueueSubmit(q, 1, &si, fences[s]);
+        if (vr < 0) {
+            printf("device lost: submit %d\n", vr);
+            break;
+        }
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &done[s], 1, &sc, &idx };
-        vkQueuePresentKHR(q, &pi);
+        vr = vkQueuePresentKHR(q, &pi);
+        if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR) {
+            printf("device lost: present %d\n", vr);
+            break;
+        }
         frame++;
     }
     vkDeviceWaitIdle(dev);

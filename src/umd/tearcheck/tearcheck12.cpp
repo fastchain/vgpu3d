@@ -278,7 +278,13 @@ main(int argc, char **argv)
         cl->Close();
         ID3D12CommandList *lists[] = { cl };
         queue->ExecuteCommandLists(1, lists);
-        sc->Present(interval, 0);
+        HRESULT phr = sc->Present(interval, 0);
+        if (phr == DXGI_ERROR_DEVICE_REMOVED || phr == DXGI_ERROR_DEVICE_RESET) {
+            /* adapter restarts (driver updates) remove the device; stop cleanly */
+            printf("device lost at present: 0x%08lx (removed reason 0x%08lx)\n", (unsigned long)phr,
+                   (unsigned long)dev->GetDeviceRemovedReason());
+            break;
+        }
         queue->Signal(fence, ++fv);
         used[i] = fv;
         frame++;

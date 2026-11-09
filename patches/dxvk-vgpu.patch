@@ -493,6 +493,106 @@ index 0eaf992b..c8d3052d 100644
  };
  
  /**
+diff --git a/src/dxvk/dxvk_cs.cpp b/src/dxvk/dxvk_cs.cpp
+index 06f6aa48..d7fd8904 100644
+--- a/src/dxvk/dxvk_cs.cpp
++++ b/src/dxvk/dxvk_cs.cpp
+@@ -247,7 +247,20 @@ namespace dxvk {
+ 
+           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+ 
+-          entry.chunk->executeAll(m_context.ptr());
++          // vgpu: an error here (e.g. the device was lost when the adapter
++          // restarted) used to end this thread, and every later synchronize()
++          // waited forever (DWM hung destroying its device).  Log it and keep
++          // going; on a lost device the submissions fail and retire normally.
++          try {
++            entry.chunk->executeAll(m_context.ptr());
++          } catch (const DxvkError& e) {
++            Logger::err("Exception on CS thread!");
++            Logger::err(e.message());
++            // The failed chunk may have dropped a command list whose
++            // resources never retire; report the device as lost so that
++            // waiters give up and the app sees DXGI_ERROR_DEVICE_REMOVED.
++            m_device->setDeviceLost();
++          }
+ 
+           if (entry.seq) {
+             // Use a separate mutex for the chunk counter, this will only
+diff --git a/src/dxvk/dxvk_device.h b/src/dxvk/dxvk_device.h
+index 7fb070d5..81c960f9 100644
+--- a/src/dxvk/dxvk_device.h
++++ b/src/dxvk/dxvk_device.h
+@@ -264,6 +264,13 @@ namespace dxvk {
+       return m_submissionQueue.getLastError();
+     }
+ 
++    /**
++     * \brief Marks the device as lost (vgpu)
++     */
++    void setDeviceLost() {
++      m_submissionQueue.setDeviceLost();
++    }
++
+     /**
+      * \brief Queries mapped image subresource layout
+      *
+diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
+index e705ed91..fb9826fa 100644
+--- a/src/dxvk/dxvk_queue.cpp
++++ b/src/dxvk/dxvk_queue.cpp
+@@ -210,8 +210,15 @@ namespace dxvk {
+           Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", entry.result));
+           m_lastError = entry.result;
+ 
+-          if (m_lastError != VK_ERROR_DEVICE_LOST)
++          if (m_lastError != VK_ERROR_DEVICE_LOST) {
+             m_device->waitForIdle();
++          } else if (entry.submit.cmdList != nullptr) {
++            // vgpu: still retire the command list (the finish thread skips
++            // the GPU wait once the device is lost), or the resources it
++            // tracks stay in use and Map()/waitForResource() hang forever.
++            entry.present = { };
++            m_finishQueue.push(std::move(entry));
++          }
+         }
+ 
+         m_submitQueue.pop();
+diff --git a/src/dxvk/dxvk_queue.h b/src/dxvk/dxvk_queue.h
+index 5e056902..742a8e02 100644
+--- a/src/dxvk/dxvk_queue.h
++++ b/src/dxvk/dxvk_queue.h
+@@ -110,6 +110,18 @@ namespace dxvk {
+     VkResult getLastError() const {
+       return m_lastError.load();
+     }
++
++    /**
++     * \brief Marks the device as lost
++     *
++     * vgpu: for failures outside of submission (a command buffer that
++     * could not be ended).  Releases threads waiting on resources.
++     */
++    void setDeviceLost() {
++      std::unique_lock<dxvk::mutex> lock(m_mutex);
++      m_lastError = VK_ERROR_DEVICE_LOST;
++      m_finishCond.notify_all();
++    }
+     
+     /**
+      * \brief Submits a command list asynchronously
+@@ -168,7 +180,10 @@ namespace dxvk {
+     template<typename Pred>
+     void synchronizeUntil(const Pred& pred) {
+       std::unique_lock<dxvk::mutex> lock(m_mutex);
+-      m_finishCond.wait(lock, pred);
++      // vgpu: work that was never submitted (lost device) never retires
++      m_finishCond.wait(lock, [&] {
++        return pred() || m_lastError.load() == VK_ERROR_DEVICE_LOST;
++      });
+     }
+ 
+     /**
 diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
 index 5158cd7e..ec26710d 100644
 --- a/src/util/log/log.cpp

@@ -203,10 +203,19 @@ main(int argc, char **argv)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        ID3D11Texture2D *bb;
-        IDXGISwapChain1_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void **)&bb);
-        ID3D11RenderTargetView *rtv;
-        ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)bb, NULL, &rtv);
+        /* adapter restarts (driver updates) remove the device; stop cleanly */
+        ID3D11Texture2D *bb = NULL;
+        ID3D11RenderTargetView *rtv = NULL;
+        HRESULT hr = IDXGISwapChain1_GetBuffer(sc, 0, &IID_ID3D11Texture2D, (void **)&bb);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)bb, NULL, &rtv);
+        if (FAILED(hr)) {
+            printf("device lost: 0x%08lx (removed reason 0x%08lx)\n", (unsigned long)hr,
+                   (unsigned long)ID3D11Device_GetDeviceRemovedReason(dev));
+            if (bb)
+                ID3D11Texture2D_Release(bb);
+            break;
+        }
         D3D11_TEXTURE2D_DESC td;
         ID3D11Texture2D_GetDesc(bb, &td);
         struct { float col[4]; UINT loops, pad[3]; } c = { { (frame & 1) ? 0.f : 1.f, 0.f, (frame & 1) ? 1.f : 0.f, 1.f },
@@ -222,7 +231,12 @@ main(int argc, char **argv)
         ID3D11DeviceContext_Draw(ctx, 3, 0);
         ID3D11RenderTargetView_Release(rtv);
         ID3D11Texture2D_Release(bb);
-        IDXGISwapChain1_Present(sc, interval, 0);
+        hr = IDXGISwapChain1_Present(sc, interval, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            printf("device lost at present: 0x%08lx (removed reason 0x%08lx)\n", (unsigned long)hr,
+                   (unsigned long)ID3D11Device_GetDeviceRemovedReason(dev));
+            break;
+        }
         frame++;
     }
     if (fs == 2)
