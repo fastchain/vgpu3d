@@ -201,6 +201,10 @@ sudo tail -f /var/log/libvirt/qemu/WIN11_3D.log     # no "failed to initialize v
 **Requirements:** Windows 11 x64, Secure Boot **not enforced** (the driver is test-signed),
 about 200 MB of free disk space.
 
+**Turn off Fast Startup / hibernation** in the guest (elevated prompt: `powercfg /hibernate off`). Fast Startup
+resumes the guest's graphics driver state from disk, while QEMU and virglrenderer start fresh: host resources
+the restored driver expects are gone, and allocations fail after such a "shutdown". Use full shutdowns and restarts.
+
 ### With the installer (recommended)
 
 1. **Copy** `vgpu3d-setup-<version>.exe` into the VM.
