@@ -14,7 +14,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
 ![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
-![Release](https://img.shields.io/badge/release-1.0.26312.28657-brightgreen)
+![Release](https://img.shields.io/badge/release-1.0.26313.7767-brightgreen)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
 </div>
@@ -290,9 +290,9 @@ what DWM shows and what the driver hands to the host):
 
 | Where | Status |
 |---|---|
-| Guest framebuffer → host | **Fixed** in 1.0.26312.28657: the next frame overwrote the framebuffer while the host was still reading the previous one (up to ~3 % of frames in fast motion). |
+| Guest framebuffer → host | **Fixed** in 1.0.26313.7767: the next frame overwrote the framebuffer while the host was still reading the previous one (up to ~3 % of frames in fast motion). |
 | Modern apps (flip-model D3D11/D3D12: most games, 3DMark, Unigine) | **Clean**: 0 mixed frames, windowed, borderless and exclusive fullscreen. |
-| Older windowed D3D apps (legacy *blt-model* swap chains) running **uncapped** | **Tear** (~15–18 % of frames). The copy into DWM's window surface can overlap DWM reading it on the host GPU, because DWM composes outside Windows' GPU scheduler. Clean with vsync on. |
+| Older windowed D3D apps (legacy *blt-model* swap chains) running **uncapped** | **Mostly fixed** in 1.0.26313.7767: ~1–2 % of frames mixed (was ~17 %). The copy into DWM's window surface could overlap DWM reading it on the host GPU, because DWM composes outside Windows' GPU scheduler; it now waits while DWM composes, which lowers such apps' *uncapped* frame rate (test window ~400 → ~120 fps). Clean with vsync on. |
 | Vulkan apps in a window (e.g. GravityMark-Vulkan) | **Tear** occasionally (1–5 %): their last step is a GDI blit into the window, with the same overlap. |
 | Host side (QEMU readback, SPICE, viewer) | Not measurable from the guest. Steel Nomad's frames leave the guest clean, yet patches can show in fast motion in virt-manager's console; turning SPICE streaming and image compression off did not change it. |
 
@@ -303,9 +303,9 @@ what DWM shows and what the driver hands to the host):
 - If patches show in fast motion, try another viewer, e.g. `remote-viewer spice://127.0.0.1:5900`
   instead of virt-manager's built-in console.
 
-An experimental fix for blt-model windows (hold the copy while DWM composes) cut their tearing to ~1–2 %, but
-also their uncapped frame rate from ~400 to ~120 fps; it is not in the release (branch `wip/blt-defer`).
-Details: [docs/STATUS.md](docs/STATUS.md).
+The driver cannot see exactly when DWM starts reading a window, so the blt-model fix waits conservatively
+(from each vsync until DWM's frame is done): hence the residual ~1–2 % and the frame-rate cost for uncapped
+blt-model apps. Details: [docs/STATUS.md](docs/STATUS.md).
 
 ---
 

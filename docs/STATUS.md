@@ -767,3 +767,10 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   KMD-visible "composing" flag (needs a hook in DXVK's submit path), (B) park blt copies until DWM finishes a
   frame with a source-buffer ring, newest-wins and an idle timeout (+1 frame latency), (C) throttle blt-model
   windows to one present per refresh (caps their frame rate).
+- Option B merged for 1.0.26313.7767 (user decision): the KMD holds blt-present copies into redirection
+  surfaces while DWM may be composing. "Composing" means a FB_PRESENT BEGIN mark (sent by DWM's UMD before it
+  submits a frame) without its END (the frame's FB_PRESENT copy), or a vsync newer than the last END, for at
+  most 8 ms. A dedicated KMD thread runs held copies at the END (12 ms cap). The UMD writes blt sources into a
+  3-slot ring. Holding until DWM's next frame instead capped blt apps at DWM's rate (~67 fps): dxgkrnl lets a
+  window's next blt present through only after the previous completes, so "newest wins" never applies.
+  tearcheck blt uncapped: 17 % -> 1-2 % mixed, ~400 -> ~122 fps. Vulkan WSI windows unchanged (GDI blit path).
