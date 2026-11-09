@@ -64,7 +64,7 @@ Start with `README.md`, then `docs/SETUP.md`, then `docs/STATUS.md` (newest sect
 - GUI and GPU tests must run in the interactive session (session 0 sees no display adapter).
   Use the scheduled task `vgpu-run`: write `C:\vgpu\job.ps1`, start the task, wait for
   `--- done` in `C:\vgpu\job.txt`.
-- Installing or reinstalling the driver restarts the adapter. With builds before 1.0.26313.13703 loaded, **every app holding a GPU
+- Installing or reinstalling the driver restarts the adapter. With builds before 1.0.26313.15979 loaded, **every app holding a GPU
   device crashes** (Explorer, DWM, Fusion). Close the user's apps first, or say so.
 - Logs:
   - Guest: DbgView writes `C:\vgpu\dbg.log`. It grows without limit, so rotate it.

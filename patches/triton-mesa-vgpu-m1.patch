@@ -612,6 +612,58 @@ index e2da5c4..9198566 100644
  
  // Per-submission DMA private data.  The KMD's build-phase DDIs and the D3D12
  // DDI's SubmitCommandCb (virtual contexts) both carry the command `body` by
+diff --git a/src/virtio/vulkan/vn_command_buffer.c b/src/virtio/vulkan/vn_command_buffer.c
+index 5421408..df3903c 100644
+--- a/src/virtio/vulkan/vn_command_buffer.c
++++ b/src/virtio/vulkan/vn_command_buffer.c
+@@ -18,6 +18,8 @@
+ #include "vn_device.h"
+ #include "vn_feedback.h"
+ #include "vn_image.h"
++#include "vn_instance.h"
++#include "vn_renderer.h"
+ #include "vn_physical_device.h"
+ #include "vn_query_pool.h"
+ #include "vn_render_pass.h"
+@@ -1049,6 +1051,15 @@ vn_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+ 
+    cmd_size = vn_sizeof_vkBeginCommandBuffer(commandBuffer, pBeginInfo);
+    if (!vn_cs_encoder_reserve(&cmd->cs, cmd_size)) {
++      /* vgpu: on a lost device the encoder has no backing any more; keep
++       * recording (nothing is encoded) and report the loss at submit and
++       * wait, as other drivers do.  Failing here made DXVK throw from its
++       * CS thread with a half-flushed command list.
++       */
++      if (vn_renderer_is_lost(instance->renderer)) {
++         cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_RECORDING;
++         return VK_SUCCESS;
++      }
+       cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_INVALID;
+       return vn_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+@@ -1125,6 +1136,12 @@ vn_EndCommandBuffer(VkCommandBuffer commandBuffer)
+    struct vn_instance *instance = dev->instance;
+    size_t cmd_size;
+ 
++   /* vgpu: see vn_BeginCommandBuffer */
++   if (vn_renderer_is_lost(instance->renderer)) {
++      cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE;
++      return VK_SUCCESS;
++   }
++
+    if (cmd->base.vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+       return vn_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+@@ -1137,7 +1154,8 @@ vn_EndCommandBuffer(VkCommandBuffer commandBuffer)
+    vn_encode_vkEndCommandBuffer(&cmd->cs, 0, commandBuffer);
+ 
+    vn_cmd_submit(cmd);
+-   if (cmd->base.vk.state == MESA_VK_COMMAND_BUFFER_STATE_INVALID)
++   if (cmd->base.vk.state == MESA_VK_COMMAND_BUFFER_STATE_INVALID &&
++       !vn_renderer_is_lost(instance->renderer))
+       return vn_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE;
 diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
 index d34f523..e949626 100644
 --- a/src/virtio/vulkan/vn_common.c
@@ -1367,7 +1419,7 @@ index dbee43f..f69d4ea 100644
  vn_renderer_destroy(struct vn_renderer *renderer,
                      const VkAllocationCallbacks *alloc)
 diff --git a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
-index 0acb349..3dcb784 100644
+index 0acb349..83c78e2 100644
 --- a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 +++ b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 @@ -2,6 +2,7 @@
@@ -1647,7 +1699,7 @@ index 0acb349..3dcb784 100644
  {
     if (gpu->ddicb != NULL) {
        D3DDDICB_ESCAPE escape = {
-@@ -797,6 +979,173 @@ virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
+@@ -797,6 +979,179 @@ virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
     }
  }
  
@@ -1716,10 +1768,11 @@ index 0acb349..3dcb784 100644
 +      if (addr < range->base || addr >= range->base + range->size)
 +         continue;
 +
-+      /* Map zeroes over the free run around the fault.  Part of the view
-+       * may already be reused by a new mapping (the app recreating its
-+       * device), so start at the fault's 64K reservation granule rather
-+       * than the view base.
++      /* Map zeroes over the dead view around the fault.  The KMD keeps the
++       * range reserved when it tears the adapter down (commit pages in the
++       * reservation); older KMDs freed it (reserve and commit the free run,
++       * from the fault's 64K granule: part of the view may already be
++       * reused by a new mapping).
 +       */
 +      char *start = (char *)((uintptr_t)addr & ~(uintptr_t)0xffff);
 +      if (start < range->base)
@@ -1727,7 +1780,12 @@ index 0acb349..3dcb784 100644
 +      MEMORY_BASIC_INFORMATION mbi = { 0 };
 +      const SIZE_T q = VirtualQuery(start, &mbi, sizeof(mbi));
 +      void *mem = NULL;
-+      if (q == sizeof(mbi) && mbi.State == MEM_FREE) {
++      if (q == sizeof(mbi) && mbi.State == MEM_RESERVE &&
++          mbi.Type == MEM_PRIVATE) {
++         char *end = MIN2(range->base + range->size,
++                          (char *)mbi.BaseAddress + mbi.RegionSize);
++         mem = VirtualAlloc(start, end - start, MEM_COMMIT, PAGE_READWRITE);
++      } else if (q == sizeof(mbi) && mbi.State == MEM_FREE) {
 +         char *end = MIN2(range->base + range->size, start + mbi.RegionSize);
 +         mem = VirtualAlloc(start, end - start, MEM_RESERVE | MEM_COMMIT,
 +                            PAGE_READWRITE);
@@ -1821,7 +1879,7 @@ index 0acb349..3dcb784 100644
  static NTSTATUS
  virtgpu_ioctl_get_caps(struct virtgpu *gpu,
                         uint32_t id,
-@@ -818,9 +1167,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
+@@ -818,9 +1173,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
     return virtgpu_ioctl_escape(gpu, &caps);
  }
  
@@ -1846,7 +1904,7 @@ index 0acb349..3dcb784 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -859,8 +1222,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
+@@ -859,8 +1228,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
  }
  
  static NTSTATUS
@@ -1868,7 +1926,7 @@ index 0acb349..3dcb784 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -906,6 +1281,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+@@ -906,6 +1287,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
     // vn_log(gpu->instance, "created handle %p", fence);
     NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
     if (!NT_SUCCESS(status)) {
@@ -1876,7 +1934,7 @@ index 0acb349..3dcb784 100644
        return status;
     }
     // vn_log(gpu->instance, "waiting for handle %p", fence);
-@@ -924,6 +1300,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+@@ -924,6 +1306,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
        } \
     } while (0)
  
@@ -1895,7 +1953,7 @@ index 0acb349..3dcb784 100644
  static NTSTATUS
  virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     uint32_t blob_mem,
-@@ -934,19 +1322,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -934,19 +1328,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     D3DKMT_HANDLE *alloc_handle,
                                     D3DKMT_HANDLE *res_kmt_local,
                                     D3DKMT_HANDLE *res_kmt_global,
@@ -1934,7 +1992,7 @@ index 0acb349..3dcb784 100644
  
     VIOGPU_CREATE_RESOURCE_EXCHANGE res_priv = { 0 };
  
-@@ -991,6 +1389,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -991,6 +1395,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        };
        NTSTATUS status = gpu->d3dkmt.cb.createAllocation(&alloc);
        if (!NT_SUCCESS(status)) {
@@ -1942,7 +2000,7 @@ index 0acb349..3dcb784 100644
           return status;
        }
        *res_kmt_local = alloc.hResource;
-@@ -1008,22 +1407,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -1008,22 +1413,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        .DataLength = sizeof(res_info.ResourceInfo),
        .ResourceInfo = {
           .ResHandle = *alloc_handle,
@@ -1999,7 +2057,7 @@ index 0acb349..3dcb784 100644
  }
  
  static NTSTATUS
-@@ -1379,6 +1803,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
+@@ -1379,6 +1809,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
           (void *)GetProcAddress(gdi32lib, "D3DKMTOpenAdapterFromHdc");
        gpu->d3dkmt.cb.closeAdapter =
           (void *)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
@@ -2018,7 +2076,7 @@ index 0acb349..3dcb784 100644
  
        NTSTATUS status = virtgpu_find_adapter(gpu);
        if (!NT_SUCCESS(status)) {
-@@ -1496,11 +1932,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
+@@ -1496,11 +1938,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
        *alloc = alloc_list[0].hAllocation;
        *res_kmt_local = open.hResource;
  
@@ -2039,7 +2097,7 @@ index 0acb349..3dcb784 100644
           },
        };
  
-@@ -1546,11 +1991,21 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
+@@ -1546,11 +1997,21 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
        virtgpu_ioctl_open_resource(gpu, kmt_global, &alloc, &kmt_local, &res_info, d3d_open);
     if (!NT_SUCCESS(status)) {
        vn_log(gpu->instance, "failed to open resource: 0x%lx", status);
@@ -2061,7 +2119,7 @@ index 0acb349..3dcb784 100644
     bo = util_sparse_array_get(&gpu->bo_array, alloc);
  
     /* Upon import, blob_flags is not passed to the kernel and is only for
-@@ -1668,9 +2123,11 @@ virtgpu_bo_create_from_device_memory(
+@@ -1668,9 +2129,11 @@ virtgpu_bo_create_from_device_memory(
     }
  
     D3DKMT_HANDLE alloc, kmt_local, kmt_global;
@@ -2074,7 +2132,7 @@ index 0acb349..3dcb784 100644
     if (!NT_SUCCESS(status)) {
        vn_log(gpu->instance,
               "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
-@@ -1692,6 +2149,7 @@ virtgpu_bo_create_from_device_memory(
+@@ -1692,6 +2155,7 @@ virtgpu_bo_create_from_device_memory(
           .DataLength = sizeof(res_info.ResourceInfo),
           .ResourceInfo = {
              .ResHandle = alloc,
@@ -2082,7 +2140,7 @@ index 0acb349..3dcb784 100644
           },
        };
  
-@@ -1725,7 +2183,9 @@ virtgpu_bo_create_from_device_memory(
+@@ -1725,7 +2189,9 @@ virtgpu_bo_create_from_device_memory(
        },
        .alloc = alloc,
        .blob_flags = blob_flags,
@@ -2092,7 +2150,7 @@ index 0acb349..3dcb784 100644
  
     if (gpu->ddicb != NULL) {
        bo->h = h;
-@@ -1770,7 +2230,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
+@@ -1770,7 +2236,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
     const bool mappable = bo->blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE;
  
     /* not thread-safe but is fine */
@@ -2103,7 +2161,7 @@ index 0acb349..3dcb784 100644
        NTSTATUS status =
           virtgpu_ioctl_lock(gpu, bo->alloc, &bo->base.mmap_ptr);
        if (!NT_SUCCESS(status)) {
-@@ -1817,9 +2279,11 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+@@ -1817,9 +2285,11 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
        return false;
     }
  
@@ -2117,7 +2175,7 @@ index 0acb349..3dcb784 100644
     }
  
     /* Set alloc and res to 0 to indicate that the bo is invalid. Must be set
-@@ -1981,8 +2445,11 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
+@@ -1981,8 +2451,11 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
     struct virtgpu *gpu = (struct virtgpu *)renderer;
     struct virtgpu_shmem *shmem = (struct virtgpu_shmem *)_shmem;
  
@@ -2131,7 +2189,7 @@ index 0acb349..3dcb784 100644
     virtgpu_ioctl_resource_destroy_blob(gpu, shmem->alloc, shmem->kmt,
                                         shmem->h);
  }
-@@ -2015,14 +2482,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2015,14 +2488,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
     HANDLE h = NULL; /* This is a device allocation */
     D3DKMT_HANDLE alloc, kmt;
  
@@ -2154,7 +2212,7 @@ index 0acb349..3dcb784 100644
     if (!NT_SUCCESS(status)) {
        virtgpu_ioctl_resource_destroy_blob(gpu, alloc, kmt, h);
        vn_log(gpu->instance, "failed to map blob resource: 0x%lx", status);
-@@ -2039,7 +2510,10 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2039,7 +2516,10 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
           .mmap_ptr = ptr,
        },
        .alloc = alloc,
@@ -2165,7 +2223,7 @@ index 0acb349..3dcb784 100644
  
     if (gpu->ddicb != NULL) {
        shmem->h = h;
-@@ -2108,6 +2582,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
+@@ -2108,6 +2588,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
     assert(capset->supports_multiple_timelines);
     info->max_timeline_count = gpu->max_timeline_count;
  
@@ -2184,7 +2242,7 @@ index 0acb349..3dcb784 100644
     /* Use guest blob allocations from dedicated heap (Host visible memory) */
     //if (gpu->bo_blob_mem == VIOGPU_BLOB_MEM_HOST3D && capset->use_guest_vram)
     //   info->has_guest_vram = true;
-@@ -2167,9 +2653,16 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2167,9 +2659,16 @@ virtgpu_destroy(struct vn_renderer *renderer,
     struct virtgpu *gpu = (struct virtgpu *)renderer;
  
     vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
@@ -2201,7 +2259,7 @@ index 0acb349..3dcb784 100644
     if (gpu->d3dkmt.device)
        virtgpu_ioctl_destroy_device(gpu);
     if (gpu->d3dkmt.adapter)
-@@ -2179,6 +2672,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2179,6 +2678,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
  
     mtx_destroy(&gpu->win32_handle_import_mutex);
     mtx_destroy(&gpu->ctx.lock);
@@ -2209,7 +2267,7 @@ index 0acb349..3dcb784 100644
  
     util_sparse_array_finish(&gpu->shmem_array);
     util_sparse_array_finish(&gpu->bo_array);
-@@ -2199,6 +2693,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+@@ -2199,6 +2699,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
     mtx_init(&gpu->win32_handle_import_mutex, mtx_plain);
  
     mtx_init(&gpu->ctx.lock, mtx_plain);
@@ -2217,7 +2275,7 @@ index 0acb349..3dcb784 100644
  
     VkResult result = virtgpu_open(gpu, info);
     if (result == VK_SUCCESS)
-@@ -2220,6 +2715,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+@@ -2220,6 +2721,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
     gpu->base.ops.destroy = virtgpu_destroy;
     gpu->base.ops.submit = virtgpu_submit;
     gpu->base.ops.wait = virtgpu_wait;
@@ -2225,7 +2283,7 @@ index 0acb349..3dcb784 100644
  
     gpu->base.shmem_ops.create = virtgpu_shmem_create;
     gpu->base.shmem_ops.destroy = virtgpu_shmem_destroy;
-@@ -2274,3 +2770,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
+@@ -2274,3 +2776,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
  
     return VK_SUCCESS;
  }

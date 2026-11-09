@@ -1,15 +1,18 @@
 # Changelog
 
-## 1.0.26313.13703 (2026-11-09)
+## 1.0.26313.15979 (2026-11-09)
 
-Installer: `vgpu3d-setup-1.0.26313.13703.exe`. Ideas adopted from the Yttrium project (re-implemented, no code
+Installer: `vgpu3d-setup-1.0.26313.15979.exe`. Ideas adopted from the Yttrium project (re-implemented, no code
 copied; see README credits).
 
 ### Fixed
 - **Driver updates and adapter restarts no longer crash apps or the desktop.** Installing a driver update,
   disabling/enabling the adapter or a GPU-timeout recovery used to crash DWM, Explorer, the Start menu and every
   running D3D11/D3D12/Vulkan app. Apps now get the regular "device removed / device lost" error (and can
-  recreate their device or exit), DWM keeps running, and new apps start normally right away.
+  recreate their device or exit), DWM, the taskbar and the desktop keep running and drawing, and new apps start
+  normally right away. When the adapter stops, the driver keeps each app's GPU memory views reserved instead of
+  freeing them, so a late write from an app thread can no longer land in memory the app has since reused (this
+  corrupted DWM's heap).
 - **Tearing in Vulkan and OpenGL windows** (e.g. GravityMark-Vulkan, FurMark, Zink apps): they ended with a GDI
   blit into the window, which DWM could show half-written (1–5 % of frames). They now present through a
   flip-model DXGI swap chain: 0 mixed frames in tests, about 4 % lower GravityMark score. IMMEDIATE and MAILBOX
@@ -24,7 +27,9 @@ copied; see README credits).
 
 ### Known limitations
 - Older windowed D3D apps with blt-model swap chains running uncapped: 1–4 % mixed frames remain, more under
-  heavy host load (unchanged since 1.0.26313.7767; clean with vsync). 3DMark's SystemInfo still shows the GPU as "not available".
+  heavy host load (unchanged since 1.0.26313.7767; clean with vsync).
+- After an adapter restart Windows may bring the display back in a different mode (seen once in about 20
+  restarts: 3840x2160 instead of 1920x1080); set the resolution again in Display settings. 3DMark's SystemInfo still shows the GPU as "not available".
 
 ## 1.0.26313.7767 (2026-11-09)
 

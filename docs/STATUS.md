@@ -832,3 +832,22 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   never-observed race (a process starting to exit between our liveness check and the foreign unmap in
   `~VioGpuAllocation`). It needs a global process-exit notify routine in the KMD that must be unregistered on
   every unload (driver updates), or the next process exit bugchecks the guest.
+
+### Adapter restarts, part 2: dead views stay reserved; no DWM heap corruption (2026-11-09)
+- Found after the user saw a broken desktop (taskbar gone, wallpaper only in a 1024x768 corner at a new
+  3840x2160 mode): DWM crashed with heap corruption (0xc0000374) on every adapter restart, and 3DMark's UI
+  (javaw) faulted in Venus. Explorer itself survived but never relaid out for the new mode.
+- Cause 1, address reuse: the KMD unmapped live processes' views at teardown, and later allocations in the same
+  process (heap, recreated device) could land there before the UMD noticed. Fix (KMD, `~VioGpuAllocation`):
+  when the destroy runs on a System thread (dxgkrnl teardown; normal destroys run on the app's or DWM's own
+  threads), unmap and immediately `ZwAllocateVirtualMemory(MEM_RESERVE, PAGE_NOACCESS)` the same range in that
+  process. The Venus VEH commits zero pages in the reservation on a stale access. Verified: every fault after a
+  restart lands in a reserved private range.
+- Cause 2, found with full page heap on dwm.exe (IFEO GlobalFlag 0x02000000, PageHeapFlags 3) and WER
+  LocalDumps: a use-after-free in `DxvkCommandList::reset()` during DWM's device teardown. On a lost device
+  Venus failed vkBegin/EndCommandBuffer (encoder without backing), DXVK threw on its CS thread mid-flush, and
+  the half-flushed command list was later released twice. Fix: Venus keeps recording on a lost device and
+  reports the loss at submit/wait, like other drivers; DXVK's synchronizeUntil() gives up on a lost device only
+  once its queues are drained.
+- Result: 3 restarts in a row under page heap with no DWM crash; desktop, taskbar and windows keep drawing.
+- 1.0.26313.13703 was never published; this release is 1.0.26313.15979.

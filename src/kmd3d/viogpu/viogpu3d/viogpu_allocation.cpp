@@ -5,6 +5,12 @@
 #include "viogpu_adapter.h"
 #include "virgl_hw.h"
 
+// ntifs.h declarations (exported by ntoskrnl), not pulled in by the WDDM headers.
+extern "C" NTKERNELAPI PEPROCESS IoThreadToProcess(_In_ PETHREAD Thread);
+extern "C" NTSYSAPI NTSTATUS NTAPI ZwAllocateVirtualMemory(_In_ HANDLE ProcessHandle, _Inout_ PVOID *BaseAddress,
+                                                          _In_ ULONG_PTR ZeroBits, _Inout_ PSIZE_T RegionSize,
+                                                          _In_ ULONG AllocationType, _In_ ULONG Protect);
+
 // KeStackAttachProcess / KAPC_STATE are declared only in ntifs.h, which
 // cannot coexist with the ntddk.h this display miniport already pulls.
 // Declare the ABI-stable prototypes locally (the import is matched by
@@ -403,22 +409,47 @@ VioGpuAllocation::~VioGpuAllocation(void)
     // mapping in that process.  A shared blob is legitimately RES_INFO'd
     // from several still-live processes (e.g. DWM), so this cannot assume
     // only the current process holds a mapping.
+    // An adapter stop (driver update, disable, TDR recovery) destroys every
+    // allocation from a System worker while the processes that map them keep
+    // running.  Their threads can still touch the views, so keep each range
+    // reserved (no access) after unmapping it: otherwise the next allocation
+    // in that process (its heap, the device it recreates) can land there and
+    // be silently corrupted by a stale write.  The Venus UMD catches the
+    // fault on the reservation, commits zeroed pages there and reports the
+    // device as lost.  Normal destroys run on the owning app's (or DWM's)
+    // threads and free the range as before.
+    const BOOLEAN teardown = IoThreadToProcess(PsGetCurrentThread()) == PsInitialSystemProcess;
     for (KmdShmemMapping *m = m_KmdShmem.Maps; m != NULL;)
     {
         KmdShmemMapping *next = m->Next;
         if (m->UserVa != NULL)
         {
-            if (m->Process == PsGetCurrentProcess())
+            const BOOLEAN own = m->Process == PsGetCurrentProcess();
+            if (own || PsGetProcessExitStatus(m->Process) == STATUS_PENDING)
             {
-                MmUnmapLockedPages(m->UserVa, m->Mdl);
-            }
-            else if (PsGetProcessExitStatus(m->Process) == STATUS_PENDING)
-            {
-                // Another live process's mapping: unmap in its context.
+                // A live process's mapping: unmap in its context.
                 VIOGPU_KAPC_STATE apc;
-                KeStackAttachProcess(m->Process, &apc);
+                if (!own)
+                {
+                    KeStackAttachProcess(m->Process, &apc);
+                }
                 MmUnmapLockedPages(m->UserVa, m->Mdl);
-                KeUnstackDetachProcess(&apc);
+                if (teardown)
+                {
+                    PVOID base = m->UserVa;
+                    SIZE_T size = MmGetMdlByteCount(m->Mdl);
+                    NTSTATUS status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &base, 0, &size, MEM_RESERVE,
+                                                              PAGE_NOACCESS);
+                    if (!NT_SUCCESS(status))
+                    {
+                        DbgPrint(TRACE_LEVEL_WARNING,
+                                 ("%s res_id=%d could not reserve the dead view: 0x%x\n", __FUNCTION__, m_Id, status));
+                    }
+                }
+                if (!own)
+                {
+                    KeUnstackDetachProcess(&apc);
+                }
             }
             // else: the process exited; the OS already reclaimed its user VAs.
         }

@@ -247,7 +247,7 @@ Uninstall from *Settings → Apps* (or `"C:\Program Files\vgpu3d\uninstall.exe" 
    **vgpu VirtIO GPU 3D (WDDM)** with status OK. Usually no reboot is needed.
 
 **Updating:** run the new installer (or `install.ps1` from the new package). A driver update restarts the
-adapter. Since 1.0.26313.13703, apps holding a GPU device get a "device removed/lost" error at that moment
+adapter. Since 1.0.26313.15979, apps holding a GPU device get a "device removed/lost" error at that moment
 (well-behaved apps recreate their device, others exit) and DWM keeps running. The update *from* an older release
 still runs the old driver's code during the restart, so it crashes them once (Explorer, the Start menu, DWM;
 Windows restarts these). **Close your work first.**
@@ -325,7 +325,7 @@ webdeploy folder; they're no longer needed.
   driver's view of host resources, while QEMU and virglrenderer start fresh next time. Turn it off in the guest
   (`powercfg /hibernate off`, elevated) and use full shutdowns/restarts.
 - **Driver updates end GPU-using apps' devices**: they get "device removed/lost" while the adapter restarts and
-  must recreate their device (many apps just exit). Updating from releases before 1.0.26313.13703 crashes them,
+  must recreate their device (many apps just exit). Updating from releases before 1.0.26313.15979 crashes them,
   including Explorer and DWM, once. Save your work before updating.
 - **The desktop goes through a CPU framebuffer copy** (section 4.5), and so do old-style (blt-model)
   D3D windows. Large resolutions cost CPU.
@@ -348,7 +348,7 @@ webdeploy folder; they're no longer needed.
 | Black viewer from the first frame | SPICE `gl=on` on NVIDIA: use the egl-headless setup (4.5) |
 | QEMU log: `vrend_renderer_transfer_iov … Illegal resource` | a resource without guest backing (old driver builds); update the driver |
 | High CPU load, GPU mostly idle (host `nvtop`) | expected with this design: D3D/GL → Vulkan translation in the guest, Venus decode on one host thread per app, and the CPU display copy. Give the VM more cores; lower resolution helps most |
-| Explorer/Start menu crash once | happened during an update from a release before 1.0.26313.13703 (8); Windows restarts it |
+| Explorer/Start menu crash once | happened during an update from a release before 1.0.26313.15979 (8); Windows restarts it |
 | Apps or 3DMark warn about too little VRAM; dxdiag shows ~4 GB dedicated | `VideoMemoryMB` not set (installer ran without a working adapter): run `install.ps1 -VramOnly` elevated in the desktop session |
 | Specific app renders black/white | check `C:\Users\<you>\<App>\log` and the host log. GL apps: see dual-source blending (8) |
 

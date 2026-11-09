@@ -538,10 +538,10 @@ index 7fb070d5..81c960f9 100644
       * \brief Queries mapped image subresource layout
       *
 diff --git a/src/dxvk/dxvk_queue.cpp b/src/dxvk/dxvk_queue.cpp
-index e705ed91..fb9826fa 100644
+index e705ed91..bc1a8ebb 100644
 --- a/src/dxvk/dxvk_queue.cpp
 +++ b/src/dxvk/dxvk_queue.cpp
-@@ -210,8 +210,15 @@ namespace dxvk {
+@@ -210,12 +210,21 @@ namespace dxvk {
            Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", entry.result));
            m_lastError = entry.result;
  
@@ -558,8 +558,14 @@ index e705ed91..fb9826fa 100644
          }
  
          m_submitQueue.pop();
+         m_submitCond.notify_all();
++        // vgpu: synchronizeUntil() also waits for an empty submit queue
++        m_finishCond.notify_all();
+       }
+ 
+       // Good time to invoke allocator tasks now since we
 diff --git a/src/dxvk/dxvk_queue.h b/src/dxvk/dxvk_queue.h
-index 5e056902..742a8e02 100644
+index 5e056902..e5ef50b8 100644
 --- a/src/dxvk/dxvk_queue.h
 +++ b/src/dxvk/dxvk_queue.h
 @@ -110,6 +110,18 @@ namespace dxvk {
@@ -581,14 +587,18 @@ index 5e056902..742a8e02 100644
      
      /**
       * \brief Submits a command list asynchronously
-@@ -168,7 +180,10 @@ namespace dxvk {
+@@ -168,7 +180,14 @@ namespace dxvk {
      template<typename Pred>
      void synchronizeUntil(const Pred& pred) {
        std::unique_lock<dxvk::mutex> lock(m_mutex);
 -      m_finishCond.wait(lock, pred);
-+      // vgpu: work that was never submitted (lost device) never retires
++      // vgpu: on a lost device, work that never reached the queue (a
++      // command list dropped by a failed CS chunk) never retires.  Give up
++      // once everything queued has retired -- not before, or the device
++      // teardown that follows frees what the finish thread still uses.
 +      m_finishCond.wait(lock, [&] {
-+        return pred() || m_lastError.load() == VK_ERROR_DEVICE_LOST;
++        return pred() || (m_lastError.load() == VK_ERROR_DEVICE_LOST &&
++                          m_submitQueue.empty() && m_finishQueue.empty());
 +      });
      }
  
