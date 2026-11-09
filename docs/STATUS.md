@@ -857,5 +857,27 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   ray_query, ray_tracing_maintenance1, ray_tracing_position_fetch, deferred_host_operations). New test
   `src/umd/rttest` builds a BLAS/TLAS on the GPU and traces a 64x64 ray grid with ray queries (compute) and with a
   ray tracing pipeline + SBT; RTX 4090 host: both 4096 of 4096 rays correct.
-- D3D12 DXR: not supported. Triton reports RaytracingTier 0; the DXR DDIs (state objects, acceleration-structure
-  builds, DispatchRays) are not implemented, although vkd3d-proton could translate them to the Vulkan path above.
+- D3D12 DXR: done, see below.
+- 3DMark Solar Bay (Vulkan ray queries; demo, 4K desktop): valid score 6558 (24.94 fps; sections 25.54 / 25.41 /
+  24.22). Fullscreen 3DMark workloads must keep the foreground (fg.ps1 -Name 3DMarkSolarBay): a mid-run screenshot
+  from the vgpu-run task made the first run fail with "Workload focus lost".
+
+### DirectX Raytracing (DXR 1.1) (2026-11-09)
+- vkd3d-proton on Venus already reports DXR 1.1 / SM 6.8 ("DX Ultimate supported"); only Triton's D3D12 DDI layer was
+  missing. Implemented in tritonList12.c: state objects (DDI subobjects -> API; root signature / collection handles
+  -> inner objects), AddToStateObject, shader identifiers and stack sizes, acceleration-structure prebuild / build /
+  copy / post-build info, SetPipelineState1, DispatchRays; acceleration-structure SRVs (tritonDescriptor12.c) and the
+  RTAS resource flag (tritonResource12.c). The AS/dispatch DDI structs equal the API ones (C_ASSERTed) and GPU VAs
+  come from vkd3d-proton, so those forward unchanged.
+- Two DDI specifics: the runtime replaces the API's association subobjects with a DDI-only export summary (per
+  export, the subobjects associated with it), which is turned back into SUBOBJECT_TO_EXPORTS_ASSOCIATIONs; and DXIL
+  libraries arrive as bare DXIL program parts, which vkd3d-proton cannot parse ("Failed to parse DXIL library") until
+  wrapped in a container (kept for the state object's lifetime).
+- Tier: the inner device's (1.1 here). Off with VGPU_DXR=0 or HKLM\SOFTWARE\vgpu DxrTier=0.
+- Tests: `src/umd/dxrtest` (64- and 32-bit) through the system runtime: DXR pipeline with a local root signature
+  association, DXR 1.1 inline RayQuery through an AS descriptor, compaction (post-build info 2560 -> 896 bytes +
+  compacting copy), AddToStateObject; each 4096 of 4096 rays correct. 3DMark's DXR_info now reports rayTracingTier
+  11 and meshShaderTier 10. No real DXR title was available (Port Royal / Speed Way are not in the 3DMark demo).
+- Regression: suite unchanged; Steel Nomad on the 4K desktop 1792 / 2027 with DXR vs 1937 / 1941 before (noise).
+  3DMark's "DXR compatibility detection timed out" at startup predates this (seen since 14:53).
+

@@ -17,6 +17,9 @@ $T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/tearch
   $R/out/vulkan-mingw/libvulkan-1.dll.a -lgdi32
 $T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/rttest.exe $R/src/umd/rttest/rttest.c \
   $R/out/vulkan-mingw/libvulkan-1.dll.a
+for t in x86_64 i686; do
+  $t-w64-mingw32-gcc-posix -O2 -Wall -o $O/dxrtest_$t.exe $R/src/umd/dxrtest/dxrtest.c -static -ld3d12 -luuid
+done
 $T-g++-posix -O2 -Wall -o $O/tearcheck12.exe $R/src/umd/tearcheck/tearcheck12.cpp -static -ld3d12 -ldxgi -lgdi32 -luuid
 $T-gcc-posix -O2 -Wall -o $O/tearcheck.exe $R/src/umd/tearcheck/tearcheck.c -static -ld3d11 -ldxgi -lgdi32 -luuid
 $T-gcc-posix -O2 -Wall -o $O/readbacktest.exe $R/src/umd/readbacktest/readbacktest.c -static -ld3d11 -ldxgi -luuid

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.26313.18562 (2026-11-09)
+
+Installer: `vgpu3d-setup-1.0.26313.18562.exe`.
+
+### Added
+- **DirectX Raytracing (DXR 1.1)** for Direct3D 12 apps, 64- and 32-bit. Windows, DXGI and apps now see ray tracing
+  tier 1.1 (3DMark's DXR detection reports it too); DXR pipelines, inline ray queries, acceleration-structure
+  compaction and AddToStateObject are verified ray by ray. It runs on vkd3d-proton and the host GPU's Vulkan ray
+  tracing. Turn it off with `HKLM\SOFTWARE\vgpu` `DxrTier`=0 (DWORD) or `VGPU_DXR=0`.
+- **Vulkan ray tracing** (acceleration structures, ray tracing pipelines, ray queries) is verified as well:
+  3DMark Solar Bay scores 6558 (RTX 4090 host).
+- Test programs `rttest` (Vulkan) and `dxrtest` (D3D12, 64/32-bit) for ray tracing.
+
+### Known limitations
+- No DXR title or benchmark was available for testing beyond our own tests (3DMark Port Royal and Speed Way are not in
+  the free demo). Ray tracing performance in real games is unmeasured.
+
 ## 1.0.26313.15979 (2026-11-09)
 
 Installer: `vgpu3d-setup-1.0.26313.15979.exe`. Ideas adopted from the Yttrium project (re-implemented, no code

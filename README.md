@@ -14,7 +14,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 ![OpenGL](https://img.shields.io/badge/OpenGL-4.6-5586A4?logo=opengl&logoColor=white)
 ![OpenCL](https://img.shields.io/badge/OpenCL-3.0-ED1C24)
 ![32-bit too](https://img.shields.io/badge/apps-64%20%2B%2032--bit-informational)
-![Release](https://img.shields.io/badge/release-1.0.26313.15979-brightgreen)
+![Release](https://img.shields.io/badge/release-1.0.26313.18562-brightgreen)
 ![Status](https://img.shields.io/badge/status-working%20prototype-yellow)
 
 </div>
@@ -77,8 +77,8 @@ Apps use it automatically, with no per-app setup.
 
 | API | 64-bit | 32-bit | Implementation |
 |---|:---:|:---:|---|
-| **Vulkan 1.4** | ✅ | ✅ | Mesa **Venus** ICD → host Vulkan driver |
-| **Direct3D 12** | ✅ | ✅ | Triton D3D12 DDI + **vkd3d-proton** (in-process); runs 3DMark Steel Nomad, GravityMark, DirectML |
+| **Vulkan 1.4** | ✅ | ✅ | Mesa **Venus** ICD → host Vulkan driver; ray tracing (pipelines and ray queries) |
+| **Direct3D 12** | ✅ | ✅ | Triton D3D12 DDI + **vkd3d-proton** (in-process), **DXR 1.1 ray tracing**, Shader Model 6.6; runs 3DMark Steel Nomad, GravityMark, DirectML |
 | **Direct3D 10 / 11** (FL 11_1) | ✅ | ✅ | Triton D3D10/11 DDI + **DXVK** (in-process) |
 | **Direct3D 9** | ✅ | ✅ | Windows' **D3D9On12** on our D3D12 driver |
 | **OpenGL 4.6** | ✅ | ✅ | Mesa **Zink** (OpenGL on Vulkan) |
@@ -104,6 +104,7 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 | | Direct3D 11 | 11516 (~69 fps) |
 | **GravityMark 1.89**, 3840×2160 exclusive fullscreen | D3D12 / Vulkan / OpenGL / D3D11 | 12587 / 5539 / 5295 / 4767 (75 / 33 / 32 / 29 fps) |
 | **3DMark Steel Nomad** (demo), 4K offscreen | Direct3D 12 | **2969** (~29.7 fps) |
+| **3DMark Solar Bay** (demo), ray tracing, 1440p offscreen | Vulkan | **6558** (24.9 fps) |
 | **Unigine Superposition 1.1**, 1080p | Direct3D 11 / OpenGL | 69.8 / 56.4 fps |
 | **Unigine Heaven 4.0** (5K desktop) | Direct3D 11 / OpenGL | 82–88 / 67.4 fps |
 | **Unigine Heaven 4.0**, exclusive fullscreen | Direct3D 11, 3840×2160 / 1920×1080 | 72.0 / 187.2 fps |
@@ -347,7 +348,7 @@ LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (
 | `src/kmd3d/viogpu/` | WDDM kernel driver; `src/kmd3d-inf/` has the INF and Vulkan ICD manifests |
 | `src/umd3d/` | D3D10/11/12 user-mode driver backend (Triton DDI → DXVK / vkd3d-proton) |
 | `src/installer/` | NSIS installer script |
-| `src/umd/` | guest test programs (`d3d9test`, `d3d11test`, `d3d12test`, `blttest`, `gltest`, `vkcompute`, `rttest`, …) |
+| `src/umd/` | guest test programs (`d3d9test`, `d3d11test`, `d3d12test`, `blttest`, `gltest`, `vkcompute`, `rttest`, `dxrtest`, …) |
 | `patches/` | our changes to Mesa, Triton, DXVK, vkd3d-proton and clvk |
 | `build/` | cross-build, packaging and installer scripts |
 | `tools/windows/` | guest scripts: install/uninstall, test rounds, benchmark runners |

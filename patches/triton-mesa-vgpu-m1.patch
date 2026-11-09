@@ -43,6 +43,27 @@ index 94a72f4..b718166 100644
  } TRITON_RESOURCE, *PTRITON_RESOURCE;
  
  /* Views keep the host desc they were created with, so recreating them after
+diff --git a/src/virtio/neptune/triton/triton12.h b/src/virtio/neptune/triton/triton12.h
+index 9eb6257..fecb4eb 100644
+--- a/src/virtio/neptune/triton/triton12.h
++++ b/src/virtio/neptune/triton/triton12.h
+@@ -125,6 +125,7 @@ triton12Device(D3D12DDI_HDEVICE hDevice)
+ /* Whether textures on CPU-visible heaps are built ROW_MAJOR for CPU access
+  * (see TRITON12_ADAPTER). */
+ BOOL triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter);
++BOOL triton12DxrEnabled(void);
+ 
+ typedef struct TRITON12_DESCRIPTOR_HEAP
+ {
+@@ -327,7 +328,7 @@ typedef struct TRITON12_LIST
+      * recording entries do not QueryInterface per call.  IfaceTried marks
+      * an index as resolved, NULL included.  A list records on one thread
+      * at a time, so no lock. */
+-    void                        *pIface[3];
++    void                        *pIface[4];
+     UINT                         IfaceTried;
+     PTRITON12_DEVICE             pDev;
+     /* Recording-thread stamp, kept only under
 diff --git a/src/virtio/neptune/triton/tritonDDI.c b/src/virtio/neptune/triton/tritonDDI.c
 index f012201..582dd86 100644
 --- a/src/virtio/neptune/triton/tritonDDI.c
@@ -68,6 +89,77 @@ index f012201..582dd86 100644
      if (p->pCtx1)
          ID3D11DeviceContext1_Flush(p->pCtx1);
      /* Tear down the present kernel context before the device goes away, under
+diff --git a/src/virtio/neptune/triton/tritonDDI12.c b/src/virtio/neptune/triton/tritonDDI12.c
+index bae8e4f..92455cc 100644
+--- a/src/virtio/neptune/triton/tritonDDI12.c
++++ b/src/virtio/neptune/triton/tritonDDI12.c
+@@ -250,6 +250,30 @@ triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter)
+     return pAdapter->CpuVisibleTextures;
+ }
+ 
++/* vgpu: DXR (forwarded to vkd3d-proton, tritonList12.c) is on by default.
++ * VGPU_DXR=0/1 (environment) overrides HKLM\SOFTWARE\vgpu DxrTier (DWORD,
++ * 0 = off; 64-bit view, also read by WOW64 processes). */
++BOOL
++triton12DxrEnabled(void)
++{
++    static LONG cached = -1;
++    LONG v = cached;
++    if (v >= 0)
++        return v != 0;
++    char env[8];
++    DWORD n = GetEnvironmentVariableA("VGPU_DXR", env, sizeof(env));
++    if (n > 0 && n < sizeof(env)) {
++        v = env[0] != '0';
++    } else {
++        DWORD value = 0, size = sizeof(value);
++        v = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "DxrTier",
++                         RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &value,
++                         &size) != ERROR_SUCCESS || value != 0;
++    }
++    InterlockedExchange(&cached, v);
++    return v != 0;
++}
++
+ #define HC12(bit) ((hc->have & TRITON_HC12_##bit) != 0)
+ #define CAP12_HOST(name, lv, bit, hv) \
+     TRITON_CAP_HOST("d3d12", name, lv, HC12(bit), hv)
+@@ -589,9 +613,14 @@ triton12GetCaps(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_GETCAPS *pArgs)
+         if (OPT12_AT(0054)) {
+             D3D12DDI_D3D12_OPTIONS_DATA_0054 *o =
+                 (D3D12DDI_D3D12_OPTIONS_DATA_0054 *)pArgs->pData;
+-            CAP12_TODO("OPTIONS.RaytracingTier", o->RaytracingTier, OPTIONS5,
+-                       hc->options5.RaytracingTier, 0,
+-                       "state objects, acceleration structures and DispatchRays DDI not implemented");
++            /* vgpu: DXR forwards to vkd3d-proton (tritonList12.c) */
++            if (triton12DxrEnabled())
++                CAP12_HOST("OPTIONS.RaytracingTier", o->RaytracingTier, OPTIONS5,
++                           hc->options5.RaytracingTier);
++            else
++                CAP12_TODO("OPTIONS.RaytracingTier", o->RaytracingTier, OPTIONS5,
++                           hc->options5.RaytracingTier, 0,
++                           "DXR turned off (VGPU_DXR=0 or HKLM\\SOFTWARE\\vgpu DxrTier=0)");
+         }
+         if (OPT12_AT(0062)) {
+             D3D12DDI_D3D12_OPTIONS_DATA_0062 *o =
+diff --git a/src/virtio/neptune/triton/tritonDescriptor12.c b/src/virtio/neptune/triton/tritonDescriptor12.c
+index 537df8d..480106a 100644
+--- a/src/virtio/neptune/triton/tritonDescriptor12.c
++++ b/src/virtio/neptune/triton/tritonDescriptor12.c
+@@ -243,6 +243,13 @@ t12CreateShaderResourceView(D3D12DDI_HDEVICE hDevice,
+     vd.Shader4ComponentMapping = pArgs->Shader4ComponentMapping;
+     const BOOL msaa = r && r->Desc.SampleDesc.Count > 1;
+     switch (pArgs->ResourceDimension) {
++    case D3D12DDI_RD_RAYTRACING_ACCELERATION_STRUCTURE_0042:
++        /* vgpu: DXR TLAS view; addressed by GPU VA, no resource */
++        vd.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
++        vd.RaytracingAccelerationStructure.Location =
++            pArgs->RaytracingAccelerationStructure.Location;
++        ID3D12Device_CreateShaderResourceView(p->pDev, NULL, &vd, dst);
++        return;
+     case D3D12DDI_RD_BUFFER:
+         vd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+         vd.Buffer.FirstElement = pArgs->Buffer.FirstElement;
 diff --git a/src/virtio/neptune/triton/tritonDxgi.c b/src/virtio/neptune/triton/tritonDxgi.c
 index bc4e182..6be5d28 100644
 --- a/src/virtio/neptune/triton/tritonDxgi.c
@@ -313,6 +405,519 @@ index 4a359d5..8962be5 100644
        esc.CtxInit.NumRings = 1;
        HRESULT hr = tritonKmEscape(km, &esc);
        if (SUCCEEDED(hr))
+diff --git a/src/virtio/neptune/triton/tritonList12.c b/src/virtio/neptune/triton/tritonList12.c
+index 117e4b2..5b90233 100644
+--- a/src/virtio/neptune/triton/tritonList12.c
++++ b/src/virtio/neptune/triton/tritonList12.c
+@@ -36,7 +36,7 @@ t12ListApiType(D3D12DDI_COMMAND_LIST_TYPE Type,
+     return D3D12_COMMAND_LIST_TYPE_DIRECT;
+ }
+ 
+-enum { T12_LIST1, T12_LIST2, T12_LIST6 };
++enum { T12_LIST1, T12_LIST2, T12_LIST6, T12_LIST4 };
+ 
+ static void *
+ t12ListIface(PTRITON12_LIST l, UINT which)
+@@ -45,6 +45,7 @@ t12ListIface(PTRITON12_LIST l, UINT which)
+         &IID_ID3D12GraphicsCommandList1,
+         &IID_ID3D12GraphicsCommandList2,
+         &IID_ID3D12GraphicsCommandList6,
++        &IID_ID3D12GraphicsCommandList4,
+     };
+     if (!l || !l->pList)
+         return NULL;
+@@ -1581,20 +1582,334 @@ static VOID APIENTRY
+ t12DestroySchedulingGroup(D3D12DDI_HDEVICE hDevice, D3D12DDI_HSCHEDULINGGROUP_0050 h)
+ { (void)hDevice; (void)h; }
+ 
++/* ---------- DXR: state objects (vgpu) ----------
++ *
++ * The runtime hands the driver its resolved view of a state object: the
++ * API's association subobjects are gone, and a DDI-only export summary
++ * lists, for every exported function, the subobjects associated with it.
++ * vkd3d-proton takes the API form, so the summary is turned back into
++ * explicit SUBOBJECT_TO_EXPORTS_ASSOCIATIONs (root signatures, shader and
++ * pipeline config).  Root signature and collection handles become the
++ * inner objects; DXIL libraries pass through (vkd3d-proton reads DXIL). */
++
++typedef struct TRITON12_STATEOBJ
++{
++    ID3D12StateObject           *pSO;
++    ID3D12StateObjectProperties *pProps;
++    /* DXIL containers wrapped around bare program parts, kept for the
++     * object's lifetime (a collection is relinked into later pipelines) */
++    void                       **ppLibs;
++    UINT                         NumLibs;
++} TRITON12_STATEOBJ;
++
++C_ASSERT(sizeof(D3D12DDI_EXPORT_DESC_0054) == sizeof(D3D12_EXPORT_DESC));
++C_ASSERT(sizeof(D3D12DDI_STATE_OBJECT_CONFIG_0054) == sizeof(D3D12_STATE_OBJECT_CONFIG));
++C_ASSERT(sizeof(D3D12DDI_NODE_MASK_0054) == sizeof(D3D12_NODE_MASK));
++C_ASSERT(sizeof(D3D12DDI_RAYTRACING_SHADER_CONFIG_0054) == sizeof(D3D12_RAYTRACING_SHADER_CONFIG));
++C_ASSERT(sizeof(D3D12DDI_RAYTRACING_PIPELINE_CONFIG_0075) == sizeof(D3D12_RAYTRACING_PIPELINE_CONFIG1));
++
++static TRITON12_STATEOBJ *
++t12StateObj(D3D12DDI_HSTATEOBJECT_0054 h)
++{
++    return (TRITON12_STATEOBJ *)h.pDrvPrivate;
++}
++
+ static SIZE_T APIENTRY
+ t12CalcPrivateStateObjectSize(D3D12DDI_HDEVICE hDevice,
+                               const D3D12DDIARG_CREATE_STATE_OBJECT_0054 *pArgs)
+-{ (void)hDevice; (void)pArgs; return 0; }
++{
++    (void)hDevice; (void)pArgs;
++    return sizeof(TRITON12_STATEOBJ);
++}
++
++/* A DXIL library arrives either as a full container (its size is
++ * ContainerSizeInBytes at byte 24) or, like other DXIL shaders, as a bare
++ * DXIL program part (DxilProgramHeader: 'DXIL' at dword 2, size in dwords
++ * at dword 1).  vkd3d-proton takes containers only, so a bare part is
++ * wrapped in a minimal one (header + the lone DXIL part), as
++ * t12CreateShaderCommon does.  *pWrapped receives the allocation to free. */
++static BOOL
++t12DxilLibrary(const UINT *tok, D3D12_SHADER_BYTECODE *out, void **pWrapped)
++{
++    *pWrapped = NULL;
++    if (!tok)
++        return FALSE;
++    if (tok[0] == 0x43425844u /* 'DXBC' */) {
++        out->pShaderBytecode = tok;
++        out->BytecodeLength = tok[6];
++        return tok[6] >= 32;
++    }
++    if (tok[2] != 0x4C495844u /* 'DXIL' */)
++        return FALSE;
++    const SIZE_T cbPart = (SIZE_T)tok[1] * sizeof(UINT);
++    if (cbPart < 16 || cbPart > (128u << 20))
++        return FALSE;
++    const SIZE_T cb = 36 + 8 + ((cbPart + 3) & ~(SIZE_T)3);
++    unsigned char *c = calloc(1, cb);
++    if (!c)
++        return FALSE;
++    *(UINT *)(c + 0) = 0x43425844u;      /* 'DXBC' */
++    *(USHORT *)(c + 20) = 1;             /* MajorVersion */
++    *(UINT *)(c + 24) = (UINT)cb;        /* ContainerSizeInBytes */
++    *(UINT *)(c + 28) = 1;               /* PartCount */
++    *(UINT *)(c + 32) = 36;              /* PartOffset[0] */
++    *(UINT *)(c + 36) = 0x4C495844u;     /* 'DXIL' */
++    *(UINT *)(c + 40) = (UINT)cbPart;
++    memcpy(c + 44, tok, cbPart);
++    out->pShaderBytecode = c;
++    out->BytecodeLength = cb;
++    *pWrapped = c;
++    return TRUE;
++}
++
++/* Converts a DDI subobject list and creates the inner state object, or,
++ * with grow_from, extends that one (AddToStateObject). */
++static HRESULT
++t12StateObjectFromDdi(PTRITON12_DEVICE p, D3D12DDI_STATE_OBJECT_TYPE type, UINT n,
++                      const D3D12DDI_STATE_SUBOBJECT_0054 *in, ID3D12StateObject *grow_from,
++                      TRITON12_STATEOBJ *so)
++{
++    if (!p || !p->pDev || !so || (n && !in))
++        return E_INVALIDARG;
++    memset(so, 0, sizeof(*so));
++    if (type != D3D12DDI_STATE_OBJECT_TYPE_COLLECTION &&
++        type != D3D12DDI_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE) {
++        TR_LOG("12.CreateStateObject: type %d not supported", (int)type);
++        return E_NOTIMPL;
++    }
++
++    /* Associations: one per (summary export, associated subobject). */
++    UINT nassoc = 0;
++    for (UINT i = 0; i < n; i++) {
++        if (in[i].Type != D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY || !in[i].pDesc)
++            continue;
++        const D3D12DDI_FUNCTION_SUMMARY_0054 *sum = in[i].pDesc;
++        for (UINT f = 0; f < sum->NumExportedFunctions; f++)
++            nassoc += sum->pSummaries[f].NumAssociatedSubobjects;
++    }
++
++    D3D12_STATE_SUBOBJECT *out = calloc(n + nassoc, sizeof(*out));
++    D3D12_GLOBAL_ROOT_SIGNATURE *rs = calloc(n ? n : 1, sizeof(*rs));
++    D3D12_DXIL_LIBRARY_DESC *lib = calloc(n ? n : 1, sizeof(*lib));
++    D3D12_EXISTING_COLLECTION_DESC *col = calloc(n ? n : 1, sizeof(*col));
++    D3D12_HIT_GROUP_DESC *hg = calloc(n ? n : 1, sizeof(*hg));
++    D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION *as = calloc(nassoc ? nassoc : 1, sizeof(*as));
++    LPCWSTR *as_name = calloc(nassoc ? nassoc : 1, sizeof(*as_name));
++    INT *map = calloc(n ? n : 1, sizeof(*map)); /* DDI index -> API index */
++    so->ppLibs = calloc(n ? n : 1, sizeof(*so->ppLibs));
++    HRESULT hr = S_OK;
++    if (!out || !rs || !lib || !col || !hg || !as || !as_name || !map || !so->ppLibs) {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++
++    UINT k = 0;
++    for (UINT i = 0; i < n; i++) {
++        map[i] = -1;
++        const void *d = in[i].pDesc;
++        D3D12_STATE_SUBOBJECT *o = &out[k];
++        switch (in[i].Type) {
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG:
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG;
++            o->pDesc = d;
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
++            rs[i].pGlobalRootSignature = triton12RootSig(
++                ((const D3D12DDI_GLOBAL_ROOT_SIGNATURE_0054 *)d)->hGlobalRootSignature);
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE;
++            o->pDesc = &rs[i];
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
++            /* same layout as the global one: one root signature pointer */
++            rs[i].pGlobalRootSignature = triton12RootSig(
++                ((const D3D12DDI_LOCAL_ROOT_SIGNATURE_0054 *)d)->hLocalRootSignature);
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE;
++            o->pDesc = &rs[i];
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_NODE_MASK:
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK;
++            o->pDesc = d;
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: {
++            const D3D12DDI_DXIL_LIBRARY_DESC_0054 *l = d;
++            void *wrapped;
++            if (!t12DxilLibrary(l->pDXILLibrary, &lib[i].DXILLibrary, &wrapped)) {
++                TR_LOG("12.CreateStateObject: unrecognized DXIL library %p", (void *)l->pDXILLibrary);
++                hr = E_INVALIDARG;
++                goto done;
++            }
++            if (wrapped)
++                so->ppLibs[so->NumLibs++] = wrapped;
++            lib[i].NumExports = l->NumExports;
++            lib[i].pExports = (D3D12_EXPORT_DESC *)l->pExports;
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
++            o->pDesc = &lib[i];
++            break;
++        }
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION: {
++            const D3D12DDI_EXISTING_COLLECTION_DESC_0054 *c = d;
++            TRITON12_STATEOBJ *cs = t12StateObj(c->hExistingCollection);
++            col[i].pExistingCollection = cs ? cs->pSO : NULL;
++            col[i].NumExports = c->NumExports;
++            col[i].pExports = (D3D12_EXPORT_DESC *)c->pExports;
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION;
++            o->pDesc = &col[i];
++            break;
++        }
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG:
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG;
++            o->pDesc = d;
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG:
++            /* DDI 0075+ (we negotiate 0082): {depth, flags} = CONFIG1 */
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1;
++            o->pDesc = d;
++            break;
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
++            const D3D12DDI_HIT_GROUP_DESC_0054 *g = d;
++            hg[i].HitGroupExport = g->HitGroupExport;
++            hg[i].Type = (D3D12_HIT_GROUP_TYPE)g->Type;
++            hg[i].AnyHitShaderImport = g->AnyHitShaderImport;
++            hg[i].ClosestHitShaderImport = g->ClosestHitShaderImport;
++            hg[i].IntersectionShaderImport = g->IntersectionShaderImport;
++            o->Type = D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP;
++            o->pDesc = &hg[i];
++            break;
++        }
++        case D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY:
++            continue;
++        default:
++            TR_LOG("12.CreateStateObject: subobject type %d not supported", (int)in[i].Type);
++            hr = E_NOTIMPL;
++            goto done;
++        }
++        map[i] = (INT)k++;
++    }
++
++    /* Rebuild the associations the runtime resolved into the summary. */
++    UINT a = 0;
++    for (UINT i = 0; i < n; i++) {
++        if (in[i].Type != D3D12DDI_STATE_SUBOBJECT_TYPE_SHADER_EXPORT_SUMMARY || !in[i].pDesc)
++            continue;
++        const D3D12DDI_FUNCTION_SUMMARY_0054 *sum = in[i].pDesc;
++        for (UINT f = 0; f < sum->NumExportedFunctions; f++) {
++            const D3D12DDI_FUNCTION_SUMMARY_NODE_0054 *node = &sum->pSummaries[f];
++            for (UINT j = 0; j < node->NumAssociatedSubobjects; j++) {
++                const D3D12DDI_STATE_SUBOBJECT_0054 *target = node->ppAssociatedSubobjects[j];
++                /* only subobjects of this state object; a collection
++                 * carries its own associations */
++                if (target < in || target >= in + n)
++                    continue;
++                const INT idx = map[target - in];
++                if (idx < 0)
++                    continue;
++                switch (target->Type) {
++                case D3D12DDI_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE:
++                case D3D12DDI_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE:
++                case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG:
++                case D3D12DDI_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG:
++                    break;
++                default:
++                    continue;
++                }
++                as_name[a] = node->ExportNameUnmangled;
++                as[a].pSubobjectToAssociate = &out[idx];
++                as[a].NumExports = 1;
++                as[a].pExports = &as_name[a];
++                out[k].Type = D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION;
++                out[k].pDesc = &as[a];
++                k++;
++                a++;
++            }
++        }
++    }
++
++    D3D12_STATE_OBJECT_DESC desc;
++    desc.Type = type == D3D12DDI_STATE_OBJECT_TYPE_COLLECTION
++                    ? D3D12_STATE_OBJECT_TYPE_COLLECTION
++                    : D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
++    desc.NumSubobjects = k;
++    desc.pSubobjects = out;
++    if (grow_from) {
++        ID3D12Device7 *dev7 = NULL;
++        hr = ID3D12Device_QueryInterface(p->pDev, &IID_ID3D12Device7, (void **)&dev7);
++        if (SUCCEEDED(hr)) {
++            hr = ID3D12Device7_AddToStateObject(dev7, &desc, grow_from, &IID_ID3D12StateObject,
++                                                (void **)&so->pSO);
++            ID3D12Device7_Release(dev7);
++        }
++    } else {
++        ID3D12Device5 *dev5 = NULL;
++        hr = ID3D12Device_QueryInterface(p->pDev, &IID_ID3D12Device5, (void **)&dev5);
++        if (SUCCEEDED(hr)) {
++            hr = ID3D12Device5_CreateStateObject(dev5, &desc, &IID_ID3D12StateObject, (void **)&so->pSO);
++            ID3D12Device5_Release(dev5);
++        }
++    }
++    if (SUCCEEDED(hr) &&
++        FAILED(ID3D12StateObject_QueryInterface(so->pSO, &IID_ID3D12StateObjectProperties,
++                                                (void **)&so->pProps)))
++        so->pProps = NULL;
++    TR_LOG_HR(hr, "12.%s: type=%d subobjects=%u (+%u associations) -> 0x%08lx",
++              grow_from ? "AddToStateObject" : "CreateStateObject", (int)type, n, a,
++              (unsigned long)hr);
++
++done:
++    free(out);
++    free(rs);
++    free(lib);
++    free(col);
++    free(hg);
++    free(as);
++    free(as_name);
++    free(map);
++    if (FAILED(hr) && so->ppLibs) {
++        for (UINT i = 0; i < so->NumLibs; i++)
++            free(so->ppLibs[i]);
++        free(so->ppLibs);
++        so->ppLibs = NULL;
++        so->NumLibs = 0;
++    }
++    return hr;
++}
+ 
+ static HRESULT APIENTRY
+ t12CreateStateObject(D3D12DDI_HDEVICE hDevice,
+                      const D3D12DDIARG_CREATE_STATE_OBJECT_0054 *pArgs,
+                      D3D12DDI_HSTATEOBJECT_0054 h, D3D12DDI_HRTSTATEOBJECT_0054 hRT)
+-{ (void)hDevice; (void)pArgs; (void)h; (void)hRT; return E_NOTIMPL; }
++{
++    (void)hRT;
++    if (!pArgs)
++        return E_INVALIDARG;
++    return t12StateObjectFromDdi(triton12Device(hDevice), pArgs->Type, pArgs->NumSubobjects,
++                                 pArgs->pSubobjects, NULL, t12StateObj(h));
++}
+ 
+ static VOID APIENTRY
+ t12DestroyStateObject(D3D12DDI_HDEVICE hDevice, D3D12DDI_HSTATEOBJECT_0054 h)
+-{ (void)hDevice; (void)h; }
++{
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    (void)hDevice;
++    if (!so)
++        return;
++    if (so->pProps)
++        ID3D12StateObjectProperties_Release(so->pProps);
++    if (so->pSO)
++        ID3D12StateObject_Release(so->pSO);
++    for (UINT i = 0; i < so->NumLibs; i++)
++        free(so->ppLibs[i]);
++    free(so->ppLibs);
++    memset(so, 0, sizeof(*so));
++}
++
++C_ASSERT(sizeof(D3D12DDI_RAYTRACING_GEOMETRY_DESC_0054) == sizeof(D3D12_RAYTRACING_GEOMETRY_DESC));
++C_ASSERT(sizeof(D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054) ==
++         sizeof(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS));
++C_ASSERT(sizeof(D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054) ==
++         sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO));
++C_ASSERT(sizeof(D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC_0054) ==
++         sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC));
++C_ASSERT(sizeof(D3D12DDIARG_DISPATCH_RAYS_0054) == sizeof(D3D12_DISPATCH_RAYS_DESC));
+ 
+ static void APIENTRY
+ t12GetRaytracingAccelerationStructurePrebuildInfo(
+@@ -1602,9 +1917,19 @@ t12GetRaytracingAccelerationStructurePrebuildInfo(
+     const D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054 *pInputs,
+     D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054 *pInfo)
+ {
+-    (void)hDevice; (void)pInputs;
+-    if (pInfo)
+-        memset(pInfo, 0, sizeof(*pInfo));
++    PTRITON12_DEVICE p = triton12Device(hDevice);
++    if (!pInfo)
++        return;
++    memset(pInfo, 0, sizeof(*pInfo));
++    ID3D12Device5 *dev5 = NULL;
++    if (!p || !p->pDev || !pInputs ||
++        FAILED(ID3D12Device_QueryInterface(p->pDev, &IID_ID3D12Device5, (void **)&dev5)))
++        return;
++    /* The inputs, geometry and prebuild structs match the API ones. */
++    ID3D12Device5_GetRaytracingAccelerationStructurePrebuildInfo(
++        dev5, (const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *)pInputs,
++        (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *)pInfo);
++    ID3D12Device5_Release(dev5);
+ }
+ 
+ static D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS APIENTRY
+@@ -1618,19 +1943,32 @@ t12CheckDriverMatchingIdentifier(D3D12DDI_HDEVICE hDevice,
+ 
+ static void *APIENTRY
+ t12GetShaderIdentifier(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR pName)
+-{ (void)h; (void)pName; return NULL; }
++{
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    return so && so->pProps ? ID3D12StateObjectProperties_GetShaderIdentifier(so->pProps, pName) : NULL;
++}
+ 
+ static UINT APIENTRY
+ t12GetShaderStackSize(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR pName)
+-{ (void)h; (void)pName; return 0; }
++{
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    return so && so->pProps ? (UINT)ID3D12StateObjectProperties_GetShaderStackSize(so->pProps, pName) : 0;
++}
+ 
+ static UINT APIENTRY
+ t12GetPipelineStackSize(D3D12DDI_HSTATEOBJECT_0054 h)
+-{ (void)h; return 0; }
++{
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    return so && so->pProps ? (UINT)ID3D12StateObjectProperties_GetPipelineStackSize(so->pProps) : 0;
++}
+ 
+ static void APIENTRY
+ t12SetPipelineStackSize(D3D12DDI_HSTATEOBJECT_0054 h, UINT size)
+-{ (void)h; (void)size; }
++{
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    if (so && so->pProps)
++        ID3D12StateObjectProperties_SetPipelineStackSize(so->pProps, size);
++}
+ 
+ static void APIENTRY
+ t12SetBackgroundProcessingMode(D3D12DDI_HDEVICE hDevice,
+@@ -1648,28 +1986,63 @@ t12ExecuteMetaCommand(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HMETACOMMAND_0052 h,
+                       const void *p, SIZE_T cb)
+ { (void)hList; (void)h; (void)p; (void)cb; }
+ 
++/* DXR recording (vgpu): GPU addresses come from the inner device, and the
++ * DDI structs match the API ones (asserted above), so these forward. */
+ static VOID APIENTRY
+ t12BuildRaytracingAccelerationStructure(D3D12DDI_HCOMMANDLIST hList,
+     const D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054 *pArgs)
+-{ (void)hList; (void)pArgs; TR_STUB("12.BuildRaytracingAccelerationStructure"); }
++{
++    ID3D12GraphicsCommandList4 *l4 = t12ListIface(t12List(hList), T12_LIST4);
++    if (!l4 || !pArgs)
++        return;
++    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC d;
++    d.DestAccelerationStructureData = pArgs->DestAccelerationStructureData;
++    memcpy(&d.Inputs, &pArgs->Inputs, sizeof(d.Inputs));
++    d.SourceAccelerationStructureData = pArgs->SourceAccelerationStructureData;
++    d.ScratchAccelerationStructureData = pArgs->ScratchAccelerationStructureData;
++    ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(
++        l4, &d, pArgs->NumPostbuildInfoDescs,
++        (const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *)pArgs->pPostbuildInfoDescs);
++}
+ 
+ static VOID APIENTRY
+ t12EmitRaytracingAccelerationStructurePostbuildInfo(D3D12DDI_HCOMMANDLIST hList,
+     const D3D12DDIARG_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_0054 *pArgs)
+-{ (void)hList; (void)pArgs; TR_STUB("12.EmitRaytracingAccelerationStructurePostbuildInfo"); }
++{
++    ID3D12GraphicsCommandList4 *l4 = t12ListIface(t12List(hList), T12_LIST4);
++    if (l4 && pArgs)
++        ID3D12GraphicsCommandList4_EmitRaytracingAccelerationStructurePostbuildInfo(
++            l4, (const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *)&pArgs->Desc,
++            pArgs->NumSourceAccelerationStructures, pArgs->pSourceAccelerationStructureData);
++}
+ 
+ static VOID APIENTRY
+ t12CopyRaytracingAccelerationStructure(D3D12DDI_HCOMMANDLIST hList,
+     const D3D12DDIARG_COPY_RAYTRACING_ACCELERATION_STRUCTURE_0054 *pArgs)
+-{ (void)hList; (void)pArgs; TR_STUB("12.CopyRaytracingAccelerationStructure"); }
++{
++    ID3D12GraphicsCommandList4 *l4 = t12ListIface(t12List(hList), T12_LIST4);
++    if (l4 && pArgs)
++        ID3D12GraphicsCommandList4_CopyRaytracingAccelerationStructure(
++            l4, pArgs->DestAccelerationStructureData, pArgs->SourceAccelerationStructureData,
++            (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE)pArgs->Mode);
++}
+ 
+ static VOID APIENTRY
+ t12SetPipelineState1(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HSTATEOBJECT_0054 h)
+-{ (void)hList; (void)h; TR_STUB("12.SetPipelineState1"); }
++{
++    ID3D12GraphicsCommandList4 *l4 = t12ListIface(t12List(hList), T12_LIST4);
++    TRITON12_STATEOBJ *so = t12StateObj(h);
++    if (l4 && so && so->pSO)
++        ID3D12GraphicsCommandList4_SetPipelineState1(l4, so->pSO);
++}
+ 
+ static VOID APIENTRY
+ t12DispatchRays(D3D12DDI_HCOMMANDLIST hList, const D3D12DDIARG_DISPATCH_RAYS_0054 *pArgs)
+-{ (void)hList; (void)pArgs; TR_STUB("12.DispatchRays"); }
++{
++    ID3D12GraphicsCommandList4 *l4 = t12ListIface(t12List(hList), T12_LIST4);
++    if (l4 && pArgs)
++        ID3D12GraphicsCommandList4_DispatchRays(l4, (const D3D12_DISPATCH_RAYS_DESC *)pArgs);
++}
+ 
+ static VOID APIENTRY
+ t12RSSetShadingRate(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_SHADING_RATE_0062 Rate,
+@@ -1683,13 +2056,22 @@ t12RSSetShadingRateImage(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HRESOURCE h)
+ static SIZE_T APIENTRY
+ t12CalcPrivateAddToStateObjectSize(D3D12DDI_HDEVICE hDevice,
+                                    const D3D12DDIARG_ADD_TO_STATE_OBJECT_0072 *pArgs)
+-{ (void)hDevice; (void)pArgs; return 0; }
++{ (void)hDevice; (void)pArgs; return sizeof(TRITON12_STATEOBJ); }
+ 
+ static HRESULT APIENTRY
+ t12AddToStateObject(D3D12DDI_HDEVICE hDevice,
+                     const D3D12DDIARG_ADD_TO_STATE_OBJECT_0072 *pArgs,
+                     D3D12DDI_HSTATEOBJECT_0054 h, D3D12DDI_HRTSTATEOBJECT_0054 hRT)
+-{ (void)hDevice; (void)pArgs; (void)h; (void)hRT; return E_NOTIMPL; }
++{
++    (void)hRT;
++    if (!pArgs)
++        return E_INVALIDARG;
++    TRITON12_STATEOBJ *parent = t12StateObj(pArgs->StateObjectToGrowFrom);
++    if (!parent || !parent->pSO)
++        return E_INVALIDARG;
++    return t12StateObjectFromDdi(triton12Device(hDevice), pArgs->Type, pArgs->NumSubobjects,
++                                 pArgs->pSubobjects, parent->pSO, t12StateObj(h));
++}
+ 
+ static void APIENTRY
+ t12SetBackgroundProcessingMode0063(D3D12DDI_HDEVICE hDevice,
 diff --git a/src/virtio/neptune/triton/tritonPresent12.c b/src/virtio/neptune/triton/tritonPresent12.c
 index 033c07f..48a4262 100644
 --- a/src/virtio/neptune/triton/tritonPresent12.c
@@ -462,6 +1067,20 @@ index e47217f..5c52f90 100644
      if (r->pPresentCompanion) {
          ID3D11Resource_Release(r->pPresentCompanion);
          r->pPresentCompanion = NULL;
+diff --git a/src/virtio/neptune/triton/tritonResource12.c b/src/virtio/neptune/triton/tritonResource12.c
+index 2a23e5b..9f19d22 100644
+--- a/src/virtio/neptune/triton/tritonResource12.c
++++ b/src/virtio/neptune/triton/tritonResource12.c
+@@ -99,6 +99,9 @@ t12ResourceDesc(const D3D12DDIARG_CREATERESOURCE_0003 *pR,
+         f |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+     if (pR->Flags & D3D12DDI_RESOURCE_FLAG_0003_SIMULTANEOUS_ACCESS)
+         f |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
++    /* vgpu: DXR acceleration-structure buffers (API flag 0x1000) */
++    if (pR->Flags & D3D12DDI_RESOURCE_FLAG_0088_RAYTRACING_ACCELERATION_STRUCTURE)
++        f |= (D3D12_RESOURCE_FLAGS)0x1000;
+     pDesc->Flags = f;
+ }
+ 
 diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
 index e2da5c4..9198566 100644
 --- a/src/virtio/virtio-gpu/wddm_hw.h
