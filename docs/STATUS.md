@@ -799,3 +799,20 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   dump) and a stack scanner over the minidump (thread contexts + Memory64 list) symbolized with `nm`.
   Don't start DbgView from the vgpu-run task: a DbgView that doesn't drain DBWIN_BUFFER makes every
   OutputDebugString block and looks like a driver hang.
+
+### Vulkan/Zink windows present through a flip-model swap chain (2026-11-09, Yttrium adoption phase 4)
+- Cause of the Vulkan-window tearing: the WSI software path copied each frame into a DIB and `StretchBlt`-ed it
+  into the window's GDI redirection surface, which DWM composes asynchronously.
+- Fix (`wsi_common_win32.cpp`): the CPU image path now uploads the frame (`UpdateSubresource`) into the back
+  buffer of a FLIP_DISCARD DXGI swap chain created on the HWND with the System32 `d3d11.dll` (our Triton/DXVK
+  UMD), then `Present`s (interval 1 for FIFO; IMMEDIATE/MAILBOX are now advertised, IMMEDIATE uses
+  ALLOW_TEARING when supported). A recreated Vulkan swapchain takes over the window's DXGI swap chain and
+  `ResizeBuffers` it (a new D3D11 device per recreation cost ~0.2 s). GDI stays as the fallback; switches:
+  `VGPU_WSI_DXGI=0`, registry `HKLM\SOFTWARE\vgpu` `WsiDxgi`=0 (64-bit view, also read by WOW64).
+- Simpler than Yttrium's DXGI_SHARED path (shared D3D11 textures imported into Venus + DComp): no cross-device
+  sharing, at the cost of keeping the existing CPU copy.
+- Results: tearcheckvk 0 mixed in IMMEDIATE, MAILBOX and FIFO (was 14-44 of ~330), also with the swapchain
+  recreated every 20-30 frames. GravityMark Vulkan 1280x720 19818 vs 20611 on GDI (-3.8 %), FurMark GL
+  4534 vs 4438, FurMark VK 6256 vs 5411 (same session). Device loss: unchanged (apps get device-lost, DWM ok).
+- Phase 2 (separate paging node) skipped: disable/enable with GPU apps running completes in ~10 s on Win11 with
+  no hang (Yttrium added it for a Win10 `VidSchFlushAdapter` hang).

@@ -297,12 +297,12 @@ what DWM shows and what the driver hands to the host):
 | Guest framebuffer → host | **Fixed** in 1.0.26313.7767: the next frame overwrote the framebuffer while the host was still reading the previous one (up to ~3 % of frames in fast motion). |
 | Modern apps (flip-model D3D11/D3D12: most games, 3DMark, Unigine) | **Clean**: 0 mixed frames, windowed, borderless and exclusive fullscreen. |
 | Older windowed D3D apps (legacy *blt-model* swap chains) running **uncapped** | **Mostly fixed** in 1.0.26313.7767: ~1–2 % of frames mixed (was ~17 %). The copy into DWM's window surface could overlap DWM reading it on the host GPU, because DWM composes outside Windows' GPU scheduler; it now waits while DWM composes, which lowers such apps' *uncapped* frame rate (test window ~400 → ~120 fps). Clean with vsync on. |
-| Vulkan apps in a window (e.g. GravityMark-Vulkan) | **Tear** occasionally (1–5 %): their last step is a GDI blit into the window, with the same overlap. |
+| Vulkan and OpenGL apps in a window (e.g. GravityMark-Vulkan, FurMark) | **Fixed** (next release): they used to end with a GDI blit into the window, which tore in 1–5 % of frames. They now present through a flip-model DXGI swap chain: 0 mixed frames, ~4 % lower GravityMark score. `VGPU_WSI_DXGI=0` (environment) or `HKLM\SOFTWARE\vgpu` `WsiDxgi`=0 (DWORD) restores the GDI path. |
 | Host side (QEMU readback, SPICE, viewer) | Not measurable from the guest. Steel Nomad's frames leave the guest clean, yet patches can show in fast motion in virt-manager's console; turning SPICE streaming and image compression off did not change it. |
 
 **What helps today**
 
-- Turn **vsync** on in apps that offer it (blt-model and Vulkan apps are then clean).
+- Turn **vsync** on in apps that offer it (blt-model apps are then clean).
 - Prefer fullscreen or borderless modes of modern (flip-model) apps.
 - If patches show in fast motion, try another viewer, e.g. `remote-viewer spice://127.0.0.1:5900`
   instead of virt-manager's built-in console.

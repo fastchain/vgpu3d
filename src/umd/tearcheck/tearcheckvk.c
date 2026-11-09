@@ -125,6 +125,9 @@ main(int argc, char **argv)
     int seconds = argc > 1 ? atoi(argv[1]) : 20;
     int load = argc > 2 ? atoi(argv[2]) : 40;
     VkPresentModeKHR mode = argc > 3 ? (VkPresentModeKHR)atoi(argv[3]) : VK_PRESENT_MODE_IMMEDIATE_KHR;
+    /* recreate the swapchain (oldSwapchain, same window) every N frames, as a resize does */
+    int recreate = argc > 4 ? atoi(argv[4]) : 0;
+    int recreated = 0;
     SetProcessDPIAware();
 
     WNDCLASSA wc = { 0 };
@@ -233,6 +236,20 @@ main(int argc, char **argv)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        if (recreate > 0 && frame > 0 && frame % recreate == 0) {
+            vkQueueWaitIdle(q);
+            swi.oldSwapchain = sc;
+            VkSwapchainKHR nsc;
+            if (vkCreateSwapchainKHR(dev, &swi, NULL, &nsc) != VK_SUCCESS) {
+                printf("recreate failed\n");
+                break;
+            }
+            vkDestroySwapchainKHR(dev, sc, NULL);
+            sc = nsc;
+            uint32_t n = 8;
+            vkGetSwapchainImagesKHR(dev, sc, &n, imgs);
+            recreated++;
+        }
         const int s = frame & 1;
         /* adapter restarts (driver updates) lose the device; stop cleanly */
         VkResult vr = vkWaitForFences(dev, 1, &fences[s], VK_TRUE, UINT64_MAX);
@@ -283,6 +300,8 @@ main(int argc, char **argv)
     WaitForSingleObject(cap, INFINITE);
     double secs = (GetTickCount64() - start) / 1000.0;
     printf("frames %u (%.1f fps, %d load clears, present mode %d, %u images)\n", frame, frame / secs, load, mode, nimg);
+    if (recreate > 0)
+        printf("swapchain recreated %d times\n", recreated);
     printf("captures %ld: red %ld, blue %ld, mixed %ld, mostly-other %ld\n", g_captures, g_red, g_blue, g_mixed,
            g_other);
     printf("[%s] mixed-frame captures: %ld of %ld\n", g_mixed ? "FAIL" : "PASS", g_mixed, g_captures);

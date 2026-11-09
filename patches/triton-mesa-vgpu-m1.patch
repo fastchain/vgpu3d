@@ -2433,10 +2433,266 @@ index 10669f8..1a43a7e 100644
     VkExportMemoryAllocateInfo memory_export_info;
     VkImportMemoryHostPointerInfoEXT host_ptr_info;
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index df41fd9..63ff50b 100644
+index df41fd9..1b9d824 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
-@@ -657,16 +657,25 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
+@@ -35,6 +35,8 @@
+ 
+ #define D3D12_IGNORE_SDK_LAYERS
+ #include <dxgi1_4.h>
++#include <dxgi1_5.h>
++#include <d3d11.h>
+ #include <directx/d3d12.h>
+ #include <dxguids/dxguids.h>
+ 
+@@ -53,6 +55,12 @@ struct wsi_win32 {
+ 
+    const VkAllocationCallbacks *alloc;
+    VkPhysicalDevice physical_device;
++   /* vgpu: present CPU (software-path) images through a flip-model DXGI
++    * swapchain of the system D3D11 driver instead of GDI; see
++    * wsi_win32_swapchain_init_d3d11().
++    */
++   bool sw_dxgi;
++
+    struct {
+       IDXGIFactory4 *factory;
+       IDCompositionDevice *dcomp;
+@@ -93,6 +101,8 @@ struct wsi_win32_surface {
+    IDCompositionTarget *target;
+    IDCompositionVisual *visual;
+    struct wsi_win32_swapchain *current_swapchain;
++   /* swapchain whose D3D11 swapchain is bound to the HWND (vgpu) */
++   struct wsi_win32_swapchain *d3d11_owner;
+ };
+ 
+ struct wsi_win32_swapchain {
+@@ -105,6 +115,12 @@ struct wsi_win32_swapchain {
+    VkExtent2D                 extent;
+    HWND wnd;
+    HDC chain_dc;
++   struct {
++      ID3D11Device *dev;
++      ID3D11DeviceContext *ctx;
++      IDXGISwapChain1 *sc;
++      bool tearing;
++   } d3d11;
+    struct wsi_win32_image     images[0];
+ };
+ 
+@@ -382,7 +398,10 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
+ {
+    const VkPresentModeKHR *array;
+    size_t array_size;
+-   if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
++   struct wsi_win32 *wsi =
++      (struct wsi_win32 *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WIN32];
++   if ((wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) &&
++       !wsi->sw_dxgi) {
+       array = present_modes_gdi;
+       array_size = ARRAY_SIZE(present_modes_gdi);
+    } else {
+@@ -568,6 +587,190 @@ wsi_win32_image_init(VkDevice device_h,
+    return VK_SUCCESS;
+ }
+ 
++/* vgpu: the software path used to StretchBlt each frame into the window's
++ * GDI redirection surface, which DWM composes while the blit is still
++ * writing it: Vulkan (and Zink) windows showed parts of two frames.  A
++ * flip-model swapchain hands DWM whole buffers.  It comes from the system
++ * D3D11 runtime (our Triton/DXVK UMD on the same adapter); the CPU image is
++ * uploaded into its back buffer at present.  GDI remains the fallback.
++ */
++static bool
++wsi_win32_sw_dxgi_enabled(void)
++{
++   const char *env = getenv("VGPU_WSI_DXGI");
++   if (env && *env)
++      return env[0] != '0';
++
++   DWORD value = 0, size = sizeof(value);
++   /* the knob lives in the 64-bit view; read it from WOW64 processes too */
++   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", "WsiDxgi",
++                    RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &value,
++                    &size) == ERROR_SUCCESS)
++      return value != 0;
++
++   return true;
++}
++
++static void
++wsi_win32_swapchain_finish_d3d11(struct wsi_win32_swapchain *chain)
++{
++   if (chain->surface && chain->surface->d3d11_owner == chain)
++      chain->surface->d3d11_owner = NULL;
++
++   if (chain->d3d11.sc)
++      chain->d3d11.sc->Release();
++   if (chain->d3d11.ctx) {
++      /* let the runtime destroy the swapchain now, so that the next one
++       * can bind to the window
++       */
++      chain->d3d11.ctx->ClearState();
++      chain->d3d11.ctx->Flush();
++      chain->d3d11.ctx->Release();
++   }
++   if (chain->d3d11.dev)
++      chain->d3d11.dev->Release();
++   memset(&chain->d3d11, 0, sizeof(chain->d3d11));
++}
++
++static void
++wsi_win32_swapchain_init_d3d11(struct wsi_win32_swapchain *chain,
++                               const VkSwapchainCreateInfoKHR *create_info,
++                               HWND hwnd)
++{
++   if (create_info->imageFormat != VK_FORMAT_B8G8R8A8_UNORM &&
++       create_info->imageFormat != VK_FORMAT_B8G8R8A8_SRGB)
++      return;
++
++   /* An HWND takes one DXGI swapchain.  A new Vulkan swapchain for the
++    * same window (resize) takes over the bound one and resizes it, which is
++    * much cheaper than a new device; the old Vulkan swapchain is retired.
++    */
++   struct wsi_win32_swapchain *old = chain->surface->d3d11_owner;
++   if (old) {
++      chain->d3d11 = old->d3d11;
++      memset(&old->d3d11, 0, sizeof(old->d3d11));
++      old->status = VK_ERROR_OUT_OF_DATE_KHR;
++      chain->surface->d3d11_owner = NULL;
++
++      HRESULT hr = chain->d3d11.sc->ResizeBuffers(
++         0, create_info->imageExtent.width, create_info->imageExtent.height,
++         DXGI_FORMAT_UNKNOWN,
++         chain->d3d11.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
++      if (SUCCEEDED(hr)) {
++         chain->surface->d3d11_owner = chain;
++         return;
++      }
++      wsi_win32_swapchain_finish_d3d11(chain);
++   }
++
++   /* System32 only: an app-local d3d11.dll (DXVK) must not be picked up */
++   HMODULE d3d11_mod =
++      LoadLibraryExW(L"d3d11.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++   if (!d3d11_mod)
++      return;
++   PFN_D3D11_CREATE_DEVICE create_device =
++      (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11_mod, "D3D11CreateDevice");
++   if (!create_device)
++      return;
++
++   if (FAILED(create_device(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
++                            D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++                            D3D11_SDK_VERSION, &chain->d3d11.dev, NULL,
++                            &chain->d3d11.ctx)))
++      goto fail;
++
++   {
++      IDXGIDevice *dxgi_dev = NULL;
++      IDXGIAdapter *adapter = NULL;
++      IDXGIFactory2 *factory = NULL;
++      HRESULT hr = chain->d3d11.dev->QueryInterface(IID_PPV_ARGS(&dxgi_dev));
++      if (SUCCEEDED(hr))
++         hr = dxgi_dev->GetAdapter(&adapter);
++      if (SUCCEEDED(hr))
++         hr = adapter->GetParent(IID_PPV_ARGS(&factory));
++      if (adapter)
++         adapter->Release();
++      if (dxgi_dev)
++         dxgi_dev->Release();
++      if (FAILED(hr))
++         goto fail;
++
++      IDXGIFactory5 *factory5 = NULL;
++      BOOL tearing = FALSE;
++      if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory5)))) {
++         if (FAILED(factory5->CheckFeatureSupport(
++                DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))))
++            tearing = FALSE;
++         factory5->Release();
++      }
++      chain->d3d11.tearing = tearing;
++
++      DXGI_SWAP_CHAIN_DESC1 desc = {};
++      desc.Width = create_info->imageExtent.width;
++      desc.Height = create_info->imageExtent.height;
++      desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++      desc.SampleDesc.Count = 1;
++      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++      desc.BufferCount = 2;
++      desc.Scaling = DXGI_SCALING_STRETCH;
++      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++      desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++      desc.Flags = tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
++
++      hr = factory->CreateSwapChainForHwnd(chain->d3d11.dev, hwnd, &desc,
++                                           NULL, NULL, &chain->d3d11.sc);
++      if (SUCCEEDED(hr))
++         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
++      factory->Release();
++      if (FAILED(hr))
++         goto fail;
++   }
++
++   chain->surface->d3d11_owner = chain;
++   return;
++
++fail:
++   wsi_win32_swapchain_finish_d3d11(chain);
++}
++
++static VkResult
++wsi_win32_queue_present_d3d11(struct wsi_win32_swapchain *chain,
++                              struct wsi_win32_image *image)
++{
++   ID3D11Texture2D *back = NULL;
++   HRESULT hr = chain->d3d11.sc->GetBuffer(0, IID_PPV_ARGS(&back));
++   if (SUCCEEDED(hr)) {
++      chain->d3d11.ctx->UpdateSubresource(back, 0, NULL, image->base.cpu_map,
++                                          image->base.row_pitches[0], 0);
++      back->Release();
++
++      const bool fifo =
++         chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ||
++         chain->base.present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
++      const UINT flags =
++         !fifo && chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR &&
++         chain->d3d11.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
++      hr = chain->d3d11.sc->Present(fifo ? 1 : 0, flags);
++   }
++
++   image->state = WSI_IMAGE_IDLE;
++
++   switch (hr) {
++   case S_OK:
++   case DXGI_STATUS_OCCLUDED:
++      return chain->status;
++   case DXGI_ERROR_DEVICE_REMOVED:
++   case DXGI_ERROR_DEVICE_RESET:
++      /* our D3D11 device is gone (adapter restart): a new swapchain gets a
++       * new one
++       */
++      chain->status = VK_ERROR_OUT_OF_DATE_KHR;
++      return chain->status;
++   default:
++      return FAILED(hr) ? VK_ERROR_OUT_OF_HOST_MEMORY : chain->status;
++   }
++}
++
+ static void
+ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
+                        const VkAllocationCallbacks *allocator,
+@@ -598,6 +801,8 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
+    if (chain->surface->current_swapchain == chain)
+       chain->surface->current_swapchain = NULL;
+ 
++   wsi_win32_swapchain_finish_d3d11(chain);
++
+    if (chain->dxgi)
+       chain->dxgi->Release();
+ 
+@@ -657,16 +862,25 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
        }
     }
  
@@ -2467,3 +2723,36 @@ index df41fd9..63ff50b 100644
  
     *image_index = index;
     chain->images[index].state = WSI_IMAGE_DRAWING;
+@@ -734,6 +948,14 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+    if (chain->dxgi)
+       return wsi_win32_queue_present_dxgi(chain, image, damage);
+ 
++   if (chain->status != VK_SUCCESS) {
++      image->state = WSI_IMAGE_IDLE;
++      return chain->status;
++   }
++
++   if (chain->d3d11.sc)
++      return wsi_win32_queue_present_d3d11(chain, image);
++
+    char *ptr = (char *)image->base.cpu_map;
+    char *dptr = (char *)image->sw.ppvBits;
+ 
+@@ -901,6 +1123,9 @@ wsi_win32_surface_create_swapchain(
+       chain->base.image_count++;
+    }
+ 
++   if (!chain->dxgi && wsi->sw_dxgi)
++      wsi_win32_swapchain_init_d3d11(chain, create_info, chain->wnd);
++
+    *swapchain_out = &chain->base;
+ 
+    return VK_SUCCESS;
+@@ -987,6 +1212,7 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
+    wsi->physical_device = physical_device;
+    wsi->alloc = alloc;
+    wsi->wsi = wsi_device;
++   wsi->sw_dxgi = wsi_win32_sw_dxgi_enabled();
+ 
+    if (!wsi_device->sw) {
+       wsi->dxgi.factory = dxgi_get_factory(WSI_DEBUG & WSI_DEBUG_DXGI);
