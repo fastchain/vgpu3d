@@ -13,6 +13,10 @@ $T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/vkprop
   $R/out/vulkan-mingw/libvulkan-1.dll.a
 $T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/vgpuvram.exe $R/src/umd/vgpuvram/vgpuvram.c \
   $R/out/vulkan-mingw/libvulkan-1.dll.a
+$T-gcc-posix -O2 -Wall -I$R/upstream/khronos/Vulkan-Headers/include -o $O/tearcheckvk.exe $R/src/umd/tearcheck/tearcheckvk.c \
+  $R/out/vulkan-mingw/libvulkan-1.dll.a -lgdi32
+$T-g++-posix -O2 -Wall -o $O/tearcheck12.exe $R/src/umd/tearcheck/tearcheck12.cpp -static -ld3d12 -ldxgi -lgdi32 -luuid
+$T-gcc-posix -O2 -Wall -o $O/tearcheck.exe $R/src/umd/tearcheck/tearcheck.c -static -ld3d11 -ldxgi -lgdi32 -luuid
 $T-gcc-posix -O2 -Wall -o $O/readbacktest.exe $R/src/umd/readbacktest/readbacktest.c -static -ld3d11 -ldxgi -luuid
 for T2 in x86_64 i686; do
   $T2-w64-mingw32-gcc-posix -O2 -Wall -mwindows -o $O/blttest_$T2.exe $R/src/umd/blttest/blttest.c -static -ld3d11 -ldxgi -luuid
