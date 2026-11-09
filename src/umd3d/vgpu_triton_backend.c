@@ -921,6 +921,7 @@ vgpu_fb_worker(void *arg)
       esc.FbPresent.Format = vgpu_fb.format;
       esc.FbPresent.DstX = (ULONG)job.x0;
       esc.FbPresent.DstY = (ULONG)job.y0;
+      esc.FbPresent.FrameId = (ULONG)job.value; /* frame END: its GPU work (and the readback) finished */
       HRESULT hr = tritonKmEscape(&vgpu_fb.km, &esc);
       if (FAILED(hr) || esc.FbPresent.NeedFull)
          InterlockedExchange(&vgpu_fb.worker_need_full, 1);
@@ -1084,6 +1085,23 @@ vgpu_fb_async_present(PTRITON_DEVICE pD, PTRITON_RESOURCE src, LONG x0, LONG y0,
    return true;
 }
 
+/* Called by the present path before it submits the frame's GPU work (the compositor's frame on
+ * the asynchronous framebuffer path): tells the KMD that this frame's GPU work, which reads window
+ * redirection surfaces, starts now.  Its END is the worker's FB_PRESENT with the same FrameId; in
+ * between the KMD holds blt-present copies into redirection surfaces (they would tear). */
+void
+vgpuFbFrameBegin(PTRITON_DEVICE pD)
+{
+   if (!vgpu_fb.async || vgpu_fb.dev != pD || vgpu_blob_scanout())
+      return;
+   VIOGPU_ESCAPE esc;
+   memset(&esc, 0, sizeof(esc));
+   esc.Type = VIOGPU_FB_PRESENT;
+   esc.DataLength = sizeof(esc.FbPresent);
+   esc.FbPresent.FrameId = (ULONG)(vgpu_fb.fence_value + 1); /* the id vgpu_fb_async_present will use */
+   tritonKmEscape(&pD->Km, &esc);
+}
+
 /* Copies the changed part of the frame (the bounding box of the DXGI dirty rects, or the whole
  * frame) into the KMD framebuffer: only that box is read back, copied and uploaded to the host. */
 void
@@ -1206,14 +1224,17 @@ vgpuBltSourceRelease(PTRITON_DEVICE pD, PTRITON_RESOURCE r)
    r->vgpuPrevValid = FALSE;
    r->vgpuFastRun = 0;
    r->vgpuLastBltQpc = 0;
-   if (r->hVgpuCoherent && pD && pD->KTCallbacks.pfnDeallocateCb) {
-      D3DDDICB_DEALLOCATE da;
-      memset(&da, 0, sizeof(da));
-      da.NumAllocations = 1;
-      da.HandleList = &r->hVgpuCoherent;
-      pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
+   for (UINT i = 0; i < VGPU_BLT_SOURCE_RING; i++) {
+      if (r->hVgpuCoherent[i] && pD && pD->KTCallbacks.pfnDeallocateCb) {
+         D3DDDICB_DEALLOCATE da;
+         memset(&da, 0, sizeof(da));
+         da.NumAllocations = 1;
+         da.HandleList = &r->hVgpuCoherent[i];
+         pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
+      }
+      r->hVgpuCoherent[i] = 0;
    }
-   r->hVgpuCoherent = 0;
+   r->vgpuCoherentNext = 0;
    r->vgpuCoherentW = r->vgpuCoherentH = 0;
 }
 
@@ -1364,6 +1385,77 @@ vgpu_blt_pipeline(void)
    return enabled;
 }
 
+/* One coherent virgl 3D allocation for blt sources (see vgpuBltSource); 0 on failure. */
+static D3DKMT_HANDLE
+vgpu_blt_coherent_alloc(PTRITON_DEVICE pD, UINT width, UINT height)
+{
+   /* The trailing lookup cookie makes the KMD's DxgkDdiOpenAllocation
+    * resolve THIS allocation; without one it falls back to the KMT handle
+    * map, where a stale entry with the same handle value (another
+    * process's allocation) wins and the blt reads the wrong surface.
+    * Bit 31 keeps these apart from Venus' per-process cookie counter. */
+   static volatile LONG cookie_counter;
+   VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX axe;
+   memset(&axe, 0, sizeof(axe));
+   axe.LookupCookie = ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000u |
+                      (UINT)(InterlockedIncrement(&cookie_counter) & 0x7fffffff);
+   VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax = &axe.Base;
+   ax->Type = VIOGPU_RESOURCE_TYPE_3D;
+   ax->Options3D.target = 2; /* PIPE_TEXTURE_2D */
+   /* identical to the KMD's own coherent standard allocations (staging /
+    * shadow surfaces), which the host accepts for transfers and copies */
+   ax->Options3D.format = VIRGL_FORMAT_B8G8R8X8_UNORM;
+   ax->Options3D.bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW |
+                       VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SCANOUT;
+   ax->Options3D.width = width;
+   ax->Options3D.height = height;
+   ax->Options3D.depth = 1;
+   ax->Options3D.array_size = 1;
+   ax->Options3D.flags = VIRGL_RESOURCE_FLAG_MAP_COHERENT;
+   ax->Size = (ULONGLONG)width * height * 4;
+
+   D3DDDI_ALLOCATIONINFO2 ai;
+   memset(&ai, 0, sizeof(ai));
+   ai.pPrivateDriverData = &axe;
+   ai.PrivateDriverDataSize = sizeof(axe);
+   D3DDDICB_ALLOCATE cb;
+   memset(&cb, 0, sizeof(cb));
+   cb.NumAllocations = 1;
+   cb.pAllocationInfo2 = &ai;
+   HRESULT hr = pD->KTCallbacks.pfnAllocateCb(pD->hRTDevice.handle, &cb);
+   if (FAILED(hr) || !ai.hAllocation) {
+      static LONG n;
+      if (InterlockedIncrement(&n) <= 3)
+         TR_LOG("vgpu: blt source: coherent %ux%u allocation failed 0x%08lx", width, height, hr);
+      return 0;
+   }
+   tritonKmRequestResidency(&pD->Km, ai.hAllocation);
+   /* GpuMmu: the KMD attaches a TYPE_3D allocation's guest pages to the
+    * host resource only from UPDATE_PAGE_TABLE, i.e. once it has a GPU VA.
+    * Without one the host resource has no backing and every TRANSFER of
+    * the blt present fails ("Illegal resource"). */
+   if (pD->KTCallbacks.pfnMapGpuVirtualAddressCb && pD->Km.hPagingQueue) {
+      D3DDDI_MAPGPUVIRTUALADDRESS mv;
+      memset(&mv, 0, sizeof(mv));
+      mv.hPagingQueue = pD->Km.hPagingQueue;
+      mv.hAllocation = ai.hAllocation;
+      mv.SizeInPages = (ax->Size + 4095) / 4096;
+      mv.Protection.Write = 1;
+      HRESULT mhr = pD->KTCallbacks.pfnMapGpuVirtualAddressCb(pD->hRTDevice.handle, &mv);
+      if (mhr == E_PENDING && pD->Km.PagingFenceVa) {
+         const ULONGLONG deadline = GetTickCount64() + 5000;
+         while (*pD->Km.PagingFenceVa < mv.PagingFenceValue && GetTickCount64() < deadline)
+            Sleep(0);
+      }
+      TR_LOG("vgpu: blt source: alloc=0x%x %ux%u map hr=0x%08lx va=0x%llx",
+             ai.hAllocation, width, height, mhr, (unsigned long long)mv.VirtualAddress);
+   } else {
+      TR_LOG("vgpu: blt source: no GPU VA map (cb=%p queue=0x%x)",
+             pD->KTCallbacks.pfnMapGpuVirtualAddressCb, pD->Km.hPagingQueue);
+   }
+   return ai.hAllocation;
+}
+
 D3DKMT_HANDLE
 vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
 {
@@ -1384,74 +1476,16 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
       return 0;
    }
 
-   if (src->vgpuCoherentW != d.Width || src->vgpuCoherentH != d.Height || !src->hVgpuCoherent) {
+   if (src->vgpuCoherentW != d.Width || src->vgpuCoherentH != d.Height || !src->hVgpuCoherent[0]) {
       vgpuBltSourceRelease(pD, src);
 
-      /* The trailing lookup cookie makes the KMD's DxgkDdiOpenAllocation
-       * resolve THIS allocation; without one it falls back to the KMT handle
-       * map, where a stale entry with the same handle value (another
-       * process's allocation) wins and the blt reads the wrong surface.
-       * Bit 31 keeps these apart from Venus' per-process cookie counter. */
-      static volatile LONG cookie_counter;
-      VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX axe;
-      memset(&axe, 0, sizeof(axe));
-      axe.LookupCookie = ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000u |
-                         (UINT)(InterlockedIncrement(&cookie_counter) & 0x7fffffff);
-      VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax = &axe.Base;
-      ax->Type = VIOGPU_RESOURCE_TYPE_3D;
-      ax->Options3D.target = 2; /* PIPE_TEXTURE_2D */
-      /* identical to the KMD's own coherent standard allocations (staging /
-       * shadow surfaces), which the host accepts for transfers and copies */
-      ax->Options3D.format = VIRGL_FORMAT_B8G8R8X8_UNORM;
-      ax->Options3D.bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW |
-                          VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SCANOUT;
-      ax->Options3D.width = d.Width;
-      ax->Options3D.height = d.Height;
-      ax->Options3D.depth = 1;
-      ax->Options3D.array_size = 1;
-      ax->Options3D.flags = VIRGL_RESOURCE_FLAG_MAP_COHERENT;
-      ax->Size = (ULONGLONG)d.Width * d.Height * 4;
-
-      D3DDDI_ALLOCATIONINFO2 ai;
-      memset(&ai, 0, sizeof(ai));
-      ai.pPrivateDriverData = &axe;
-      ai.PrivateDriverDataSize = sizeof(axe);
-      D3DDDICB_ALLOCATE cb;
-      memset(&cb, 0, sizeof(cb));
-      cb.NumAllocations = 1;
-      cb.pAllocationInfo2 = &ai;
-      HRESULT hr = pD->KTCallbacks.pfnAllocateCb(pD->hRTDevice.handle, &cb);
-      if (FAILED(hr) || !ai.hAllocation) {
-         static LONG n;
-         if (InterlockedIncrement(&n) <= 3)
-            TR_LOG("vgpu: blt source: coherent %ux%u allocation failed 0x%08lx", d.Width, d.Height, hr);
-         return 0;
-      }
-      tritonKmRequestResidency(&pD->Km, ai.hAllocation);
-      /* GpuMmu: the KMD attaches a TYPE_3D allocation's guest pages to the
-       * host resource only from UPDATE_PAGE_TABLE, i.e. once it has a GPU VA.
-       * Without one the host resource has no backing and every TRANSFER of
-       * the blt present fails ("Illegal resource"). */
-      if (pD->KTCallbacks.pfnMapGpuVirtualAddressCb && pD->Km.hPagingQueue) {
-         D3DDDI_MAPGPUVIRTUALADDRESS mv;
-         memset(&mv, 0, sizeof(mv));
-         mv.hPagingQueue = pD->Km.hPagingQueue;
-         mv.hAllocation = ai.hAllocation;
-         mv.SizeInPages = (ax->Size + 4095) / 4096;
-         mv.Protection.Write = 1;
-         HRESULT mhr = pD->KTCallbacks.pfnMapGpuVirtualAddressCb(pD->hRTDevice.handle, &mv);
-         if (mhr == E_PENDING && pD->Km.PagingFenceVa) {
-            const ULONGLONG deadline = GetTickCount64() + 5000;
-            while (*pD->Km.PagingFenceVa < mv.PagingFenceValue && GetTickCount64() < deadline)
-               Sleep(0);
+      for (UINT k = 0; k < VGPU_BLT_SOURCE_RING; k++) {
+         src->hVgpuCoherent[k] = vgpu_blt_coherent_alloc(pD, d.Width, d.Height);
+         if (!src->hVgpuCoherent[k]) {
+            vgpuBltSourceRelease(pD, src);
+            return 0;
          }
-         TR_LOG("vgpu: blt source: alloc=0x%x %ux%u map hr=0x%08lx va=0x%llx",
-                ai.hAllocation, d.Width, d.Height, mhr, (unsigned long long)mv.VirtualAddress);
-      } else {
-         TR_LOG("vgpu: blt source: no GPU VA map (cb=%p queue=0x%x)",
-                pD->KTCallbacks.pfnMapGpuVirtualAddressCb, pD->Km.hPagingQueue);
       }
-
       D3D11_TEXTURE2D_DESC sd = d;
       sd.MipLevels = 1;
       sd.ArraySize = 1;
@@ -1461,18 +1495,9 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
       sd.MiscFlags = 0;
       if (FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuStaging)) ||
           FAILED(ID3D11Device1_CreateTexture2D(pD->pDev1, &sd, NULL, &src->pVgpuStagingPrev))) {
-         if (src->pVgpuStaging)
-            ID3D11Texture2D_Release(src->pVgpuStaging);
-         src->pVgpuStaging = NULL;
-         src->pVgpuStagingPrev = NULL;
-         D3DDDICB_DEALLOCATE da;
-         memset(&da, 0, sizeof(da));
-         da.NumAllocations = 1;
-         da.HandleList = &ai.hAllocation;
-         pD->KTCallbacks.pfnDeallocateCb(pD->hRTDevice.handle, &da);
+         vgpuBltSourceRelease(pD, src);
          return 0;
       }
-      src->hVgpuCoherent = ai.hAllocation;
       src->vgpuCoherentW = d.Width;
       src->vgpuCoherentH = d.Height;
    }
@@ -1504,9 +1529,13 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
       return 0;
    QueryPerformanceCounter(&bt[1]);
 
+   /* next ring slot: the previous presents' slots may still be waiting in the KMD for DWM's
+    * next frame boundary */
+   const D3DKMT_HANDLE coherent = src->hVgpuCoherent[src->vgpuCoherentNext];
+   src->vgpuCoherentNext = (src->vgpuCoherentNext + 1) % VGPU_BLT_SOURCE_RING;
    D3DDDICB_LOCK lock;
    memset(&lock, 0, sizeof(lock));
-   lock.hAllocation = src->hVgpuCoherent;
+   lock.hAllocation = coherent;
    lock.Flags.WriteOnly = 1;
    HRESULT hr = pD->KTCallbacks.pfnLockCb(pD->hRTDevice.handle, &lock);
    QueryPerformanceCounter(&bt[2]);
@@ -1515,7 +1544,7 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
    if (FAILED(hr) || !lock.pData) {
       static LONG n;
       if (InterlockedIncrement(&n) <= 5)
-         TR_LOG("vgpu: blt source: Lock(0x%x) failed 0x%08lx", src->hVgpuCoherent, hr);
+         TR_LOG("vgpu: blt source: Lock(0x%x) failed 0x%08lx", coherent, hr);
    }
    if (SUCCEEDED(hr) && lock.pData) {
       if (vgpu_tearcheck_enabled())
@@ -1542,16 +1571,16 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
                                                    (SIZE_T)(d.Height / 2) * m.RowPitch) + d.Width / 2;
             const uint32_t *c0 = (const uint32_t *)m.pData;
             TR_LOG("vgpu: blt source %ux%u fmt=%u center=0x%08x corner=0x%08x alloc=0x%x",
-                   d.Width, d.Height, (UINT)d.Format, *c, *c0, src->hVgpuCoherent);
+                   d.Width, d.Height, (UINT)d.Format, *c, *c0, coherent);
          }
       }
       QueryPerformanceCounter(&bt[3]);
       D3DDDICB_UNLOCK unlock;
       memset(&unlock, 0, sizeof(unlock));
       unlock.NumAllocations = 1;
-      unlock.phAllocations = &src->hVgpuCoherent;
+      unlock.phAllocations = &coherent;
       pD->KTCallbacks.pfnUnlockCb(pD->hRTDevice.handle, &unlock);
-      ret = src->hVgpuCoherent;
+      ret = coherent;
    } else {
       static LONG n;
       if (InterlockedIncrement(&n) <= 3)

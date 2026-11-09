@@ -431,6 +431,16 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     RtlZeroMemory(&m_PointerShape, sizeof(m_PointerShape));
     m_pCursorBuf = NULL;
     ExInitializeFastMutex(&m_CursorLock);
+    KeInitializeSpinLock(&m_BltLock);
+    InitializeListHead(&m_BltPending);
+    KeInitializeEvent(&m_BltEvent, SynchronizationEvent, FALSE);
+    m_pBltThread = NULL;
+    m_bStopBltThread = FALSE;
+    m_DwmFrameBegun = 0;
+    m_DwmFrameDone = 0;
+    m_DwmEndSeq = 0;
+    m_DwmEndTime = 0;
+    m_VsyncTime = 0;
     m_CursorShown = FALSE;
     m_CursorHotX = m_CursorHotY = m_CursorX = m_CursorY = 0;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
@@ -1551,7 +1561,17 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 {
                     return STATUS_INVALID_BUFFER_SIZE;
                 }
+                if (pVioGpuEscape->FbPresent.Width == 0 && pVioGpuEscape->FbPresent.Height == 0)
+                {
+                    FbFrameBegin(pVioGpuEscape->FbPresent.FrameId);
+                    status = STATUS_SUCCESS;
+                    break;
+                }
                 status = vidpn.PresentToFrameBuffer(&pVioGpuEscape->FbPresent);
+                if (NT_SUCCESS(status))
+                {
+                    FbFrameEnd(pVioGpuEscape->FbPresent.FrameId);
+                }
                 break;
             }
         case VIOGPU_RES_INFO:
@@ -3235,6 +3255,8 @@ void VioGpuAdapter::VioGpuAdapterClose()
         m_CursorQueue.Close();
         virtio_device_shutdown(&m_VioDev);
         vidpn.Powerdown();
+        // Waiting blt copies: complete their packets (the copy is moot now).
+        BltFlush(FALSE, TRUE);
         // The reset destroyed the host cursor resource; the next
         // SetPointerShape (dxgkrnl re-sends it after D0) creates a new one.
         DropCursor();
@@ -3463,6 +3485,21 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList)
         return status;
     }
 
+    // Deferred blt-present copies; without the thread blt presents copy at once.
+    m_bStopBltThread = FALSE;
+    if (NT_SUCCESS(PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuAdapter::BltThread,
+                                        this)))
+    {
+        if (!NT_SUCCESS(ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS, NULL, KernelMode,
+                                                  (PVOID *)&m_pBltThread, NULL)))
+        {
+            m_pBltThread = NULL;
+            m_bStopBltThread = TRUE;
+            KeSetEvent(&m_BltEvent, IO_NO_INCREMENT, FALSE);
+        }
+        ZwClose(threadHandle);
+    }
+
     // FIXME: bar 0 is not required to be present
     PHYSICAL_ADDRESS fb_pa = m_PciResources.GetPciBar(0)->GetPA();
     // The framebuffer segment is described with 32-bit sizes; clamp instead of
@@ -3556,6 +3593,15 @@ NTSTATUS VioGpuAdapter::HWClose(void)
         m_pWorkThread = NULL;
     }
 
+    if (m_pBltThread != NULL)
+    {
+        m_bStopBltThread = TRUE;
+        KeSetEvent(&m_BltEvent, IO_NO_INCREMENT, FALSE);
+        KeWaitForSingleObject(m_pBltThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(m_pBltThread);
+        m_pBltThread = NULL;
+    }
+    BltFlush(FALSE, TRUE);
     frameSegment.Close();
     DropCursor();
     m_CursorSegment.Close();
@@ -3823,6 +3869,146 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     }
     ExReleaseFastMutex(&m_CursorLock);
     return STATUS_SUCCESS;
+}
+
+
+// ---------------------------------------------------------------------------
+// Deferred blt-present copies (see m_BltPending)
+// ---------------------------------------------------------------------------
+
+BOOLEAN VioGpuAdapter::BltDefer(VioGpuAllocation *src, VioGpuAllocation *dst, const VIOGPU_BLT_CPU_COPY_CMD *body,
+                                void (*cb)(void *, void *, void *), void *ctx)
+{
+    PAGED_CODE();
+    // Not composing: copy now.  Waiting longer than the composition would cap the
+    // app at DWM's frame rate -- dxgkrnl lets a window's next blt present through
+    // only once the previous one completed.
+    if (m_pBltThread == NULL || m_bStopBltThread || !DwmComposing(KeQueryInterruptTime()))
+    {
+        return FALSE;
+    }
+    BLT_DEFER *d = new (NonPagedPoolNx) BLT_DEFER;
+    if (d == NULL)
+    {
+        return FALSE;
+    }
+    d->Src = src;
+    d->Dst = dst;
+    d->Body = *body;
+    d->Cb = cb;
+    d->Ctx = ctx;
+    d->Seq = InterlockedCompareExchange(&m_DwmEndSeq, 0, 0);
+    d->Queued = KeQueryInterruptTime();
+    KIRQL irql;
+    KeAcquireSpinLock(&m_BltLock, &irql);
+    InsertTailList(&m_BltPending, &d->Entry);
+    KeReleaseSpinLock(&m_BltLock, irql);
+    KeSetEvent(&m_BltEvent, IO_NO_INCREMENT, FALSE);
+    return TRUE;
+}
+
+// DWM's composition may be reading redirection surfaces: a frame BEGUN and not yet ENDed, or a
+// vsync (DWM composes on it; its BEGIN mark only arrives at its present, after much of the
+// frame's GPU work was submitted) since the last END, for at most the compose window.
+BOOLEAN VioGpuAdapter::DwmComposing(ULONGLONG now)
+{
+    const LONG begun = InterlockedCompareExchange(&m_DwmFrameBegun, 0, 0);
+    if ((LONG)(begun - InterlockedCompareExchange(&m_DwmFrameDone, 0, 0)) > 0)
+    {
+        return TRUE;
+    }
+    const ULONGLONG vsync = (ULONGLONG)InterlockedCompareExchange64(&m_VsyncTime, 0, 0);
+    const ULONGLONG end = (ULONGLONG)InterlockedCompareExchange64(&m_DwmEndTime, 0, 0);
+    return vsync > end && now - vsync < VIOGPU_DWM_COMPOSE_WINDOW_100NS;
+}
+
+void VioGpuAdapter::FbFrameBegin(ULONG frameId)
+{
+    if (frameId != 0)
+    {
+        InterlockedExchange(&m_DwmFrameBegun, (LONG)frameId);
+    }
+}
+
+void VioGpuAdapter::FbFrameEnd(ULONG frameId)
+{
+    if (frameId == 0)
+    {
+        return;
+    }
+    // Monotonic: a dropped frame's END never comes, a later END covers it.
+    LONG cur = InterlockedCompareExchange(&m_DwmFrameDone, 0, 0);
+    while ((LONG)(frameId - (ULONG)cur) > 0)
+    {
+        const LONG seen = InterlockedCompareExchange(&m_DwmFrameDone, (LONG)frameId, cur);
+        if (seen == cur)
+        {
+            break;
+        }
+        cur = seen;
+    }
+    InterlockedExchange64(&m_DwmEndTime, (LONG64)KeQueryInterruptTime());
+    InterlockedIncrement(&m_DwmEndSeq);
+    KeSetEvent(&m_BltEvent, IO_NO_INCREMENT, FALSE);
+}
+
+void VioGpuAdapter::BltFlush(BOOLEAN copy, BOOLEAN all)
+{
+    PAGED_CODE();
+    LIST_ENTRY due;
+    InitializeListHead(&due);
+    const LONG endSeq = InterlockedCompareExchange(&m_DwmEndSeq, 0, 0);
+    const ULONGLONG now = KeQueryInterruptTime();
+    const BOOLEAN composing = DwmComposing(now);
+    KIRQL irql;
+    KeAcquireSpinLock(&m_BltLock, &irql);
+    for (LIST_ENTRY *e = m_BltPending.Flink; e != &m_BltPending;)
+    {
+        BLT_DEFER *p = CONTAINING_RECORD(e, BLT_DEFER, Entry);
+        e = e->Flink;
+        if (all || endSeq != p->Seq || !composing || now - p->Queued > VIOGPU_BLT_MAX_HOLD_100NS)
+        {
+            RemoveEntryList(&p->Entry);
+            InsertTailList(&due, &p->Entry);
+        }
+    }
+    KeReleaseSpinLock(&m_BltLock, irql);
+
+    while (!IsListEmpty(&due))
+    {
+        BLT_DEFER *p = CONTAINING_RECORD(RemoveHeadList(&due), BLT_DEFER, Entry);
+        if (copy && !p->Src->CpuBltTo(p->Dst, p->Body.rects, p->Body.count, p->Body.dx, p->Body.dy))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("%s deferred blt copy failed\n", __FUNCTION__));
+        }
+        p->Cb(p->Ctx, NULL, NULL);
+        delete p;
+    }
+}
+
+void VioGpuAdapter::BltThread(PVOID ctx)
+{
+    ((VioGpuAdapter *)ctx)->BltThreadRoutine();
+}
+
+void VioGpuAdapter::BltThreadRoutine(void)
+{
+    KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
+    while (!m_bStopBltThread)
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&m_BltLock, &irql);
+        const BOOLEAN pending = !IsListEmpty(&m_BltPending);
+        KeReleaseSpinLock(&m_BltLock, irql);
+        LARGE_INTEGER tick;
+        tick.QuadPart = -20000; // 2 ms while copies wait (the max-hold check)
+        KeWaitForSingleObject(&m_BltEvent, Executive, KernelMode, FALSE, pending ? &tick : NULL);
+        if (!m_bStopBltThread)
+        {
+            BltFlush(TRUE, FALSE);
+        }
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 PAGED_CODE_SEG_END

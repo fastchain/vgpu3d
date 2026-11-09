@@ -773,23 +773,32 @@ PVOID VioGpuAllocation::CpuMapLocked()
     return va;
 }
 
+BOOLEAN VioGpuAllocation::CanCpuBltTo(VioGpuAllocation *dst)
+{
+    PAGED_CODE();
+
+    if (dst == NULL || dst == this || m_IsBlob || dst->m_IsBlob || !IsLinear32BppVirtioFormat(m_3dOptions.format) ||
+        !IsLinear32BppVirtioFormat(dst->m_3dOptions.format))
+    {
+        return FALSE;
+    }
+    const LONG sw = (LONG)m_3dOptions.width, sh = (LONG)m_3dOptions.height;
+    const LONG dw = (LONG)dst->m_3dOptions.width, dh = (LONG)dst->m_3dOptions.height;
+    return sw > 0 && sh > 0 && dw > 0 && dh > 0 && (ULONGLONG)sw * 4 * sh <= m_Size &&
+           (ULONGLONG)dw * 4 * dh <= dst->m_Size;
+}
+
 BOOLEAN VioGpuAllocation::CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UINT count, INT dx, INT dy)
 {
     PAGED_CODE();
 
-    if (dst == NULL || dst == this || m_IsBlob || dst->m_IsBlob || rects == NULL ||
-        !IsLinear32BppVirtioFormat(m_3dOptions.format) || !IsLinear32BppVirtioFormat(dst->m_3dOptions.format))
+    if (rects == NULL || !CanCpuBltTo(dst))
     {
         return FALSE;
     }
     const LONG sw = (LONG)m_3dOptions.width, sh = (LONG)m_3dOptions.height;
     const LONG dw = (LONG)dst->m_3dOptions.width, dh = (LONG)dst->m_3dOptions.height;
     const SIZE_T sstride = (SIZE_T)sw * 4, dstride = (SIZE_T)dw * 4;
-    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || (ULONGLONG)sstride * sh > m_Size ||
-        (ULONGLONG)dstride * dh > dst->m_Size)
-    {
-        return FALSE;
-    }
 
     // Lock both in address order so two opposite blts cannot deadlock.
     VioGpuAllocation *first = (this < dst) ? this : dst;

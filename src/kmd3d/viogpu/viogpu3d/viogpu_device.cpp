@@ -133,11 +133,49 @@ NTSTATUS VioGpuDevice::GenerateBltPresent(DXGKARG_PRESENT *pPresent, VioGpuDevic
     // scanned out from its host texture (DWM's redirection surface, which DWM
     // reads from guest memory): copy on the CPU instead of TRANSFER_TO_HOST,
     // a host copy and TRANSFER_FROM_HOST -- at 4K that round trip moved ~56 MB
-    // per frame.  The packet stays empty and completes like a flip.
+    // per frame.
+    //
+    // The copy runs when the packet executes (VIOGPU_CMD_BLT_CPU_COPY), where
+    // the adapter can hold it until DWM's next frame boundary: DWM reads the
+    // redirection surface on the host GPU while composing, outside the GPU
+    // scheduler, and copying into it at any other time tore windows that
+    // presented faster than DWM composed (VioGpuAdapter::BltDefer).  Without
+    // room in the DMA buffer it copies now, as before.
     if (src->IsCoherent() && dst->IsCoherent() && !src->IsBlob() && !dst->IsBlob() && !dst->IsPrimary() &&
-        src->CpuBltTo(dst, pPresent->pDstSubRects, pPresent->SubRectCnt, dx, dy))
+        src->CanCpuBltTo(dst))
     {
-        return STATUS_SUCCESS;
+        VIOGPU_BLT_CPU_COPY_CMD body;
+        RtlZeroMemory(&body, sizeof(body));
+        body.dx = dx;
+        body.dy = dy;
+        if (pPresent->SubRectCnt <= VIOGPU_BLT_CPU_COPY_MAX_RECTS)
+        {
+            body.count = pPresent->SubRectCnt;
+            RtlCopyMemory(body.rects, pPresent->pDstSubRects, sizeof(RECT) * body.count);
+        }
+        else
+        {
+            body.count = 1;
+            body.rects[0] = coverRect;
+        }
+        const SIZE_T bodySize = FIELD_OFFSET(VIOGPU_BLT_CPU_COPY_CMD, rects) + sizeof(RECT) * body.count;
+        if (pPresent->DmaSize >= sizeof(VIOGPU_COMMAND_HDR) + bodySize)
+        {
+            VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)dmaBuf;
+            cmd_hdr->type = VIOGPU_CMD_BLT_CPU_COPY;
+            cmd_hdr->size = (UINT)bodySize;
+            cmd_hdr->flags = 0;
+            cmd_hdr->ring_idx = 0;
+            dmaBuf += sizeof(VIOGPU_COMMAND_HDR);
+            RtlCopyMemory(dmaBuf, &body, bodySize);
+            dmaBuf += bodySize;
+            pPresent->pDmaBuffer = dmaBuf;
+            return STATUS_SUCCESS;
+        }
+        if (src->CpuBltTo(dst, pPresent->pDstSubRects, pPresent->SubRectCnt, dx, dy))
+        {
+            return STATUS_SUCCESS;
+        }
     }
 
     // If source requires coherency (staging or shadow surface) then emit transfer
@@ -579,6 +617,8 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
         {
             char *bodyStart = (char *)pPresent->pDmaBuffer;
             GenerateBltPresent(pPresent, src, dst);
+            // Built here, never by the UMD: the body may carry BLT_CPU_COPY.
+            cmd->SetKmdAuthored();
             // Carry the just-built body to SubmitCommandVirtual by
             // value (the submit DDI only sees a GPU VA in the virtual model).
             cmd->MirrorBody(pPresent->pDmaBufferPrivateData,
