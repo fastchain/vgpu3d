@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.26313.13703 (2026-11-09)
+
+Installer: `vgpu3d-setup-1.0.26313.13703.exe`. Ideas adopted from the Yttrium project (re-implemented, no code
+copied; see README credits).
+
+### Fixed
+- **Driver updates and adapter restarts no longer crash apps or the desktop.** Installing a driver update,
+  disabling/enabling the adapter or a GPU-timeout recovery used to crash DWM, Explorer, the Start menu and every
+  running D3D11/D3D12/Vulkan app. Apps now get the regular "device removed / device lost" error (and can
+  recreate their device or exit), DWM keeps running, and new apps start normally right away.
+- **Tearing in Vulkan and OpenGL windows** (e.g. GravityMark-Vulkan, FurMark, Zink apps): they ended with a GDI
+  blit into the window, which DWM could show half-written (1–5 % of frames). They now present through a
+  flip-model DXGI swap chain: 0 mixed frames in tests, about 4 % lower GravityMark score. IMMEDIATE and MAILBOX
+  present modes are now offered. `VGPU_WSI_DXGI=0` (environment) or `HKLM\SOFTWARE\vgpu` `WsiDxgi`=0 (DWORD)
+  restores the old path.
+- Smaller fixes: a deadlock when opening a shared resource failed, an undersized WSI blit buffer when the host
+  rounds memory requirements up, async present keeping pointers to the app's damage rectangles.
+
+### Docs
+- Turn off Fast Startup / hibernation in the guest (stale GPU state after a "shutdown" that is really a
+  hibernate). README lists every bundled library and source with its authors and licence.
+
+### Known limitations
+- Older windowed D3D apps with blt-model swap chains running uncapped: 1–4 % mixed frames remain, more under
+  heavy host load (unchanged since 1.0.26313.7767; clean with vsync). 3DMark's SystemInfo still shows the GPU as "not available".
+
 ## 1.0.26313.7767 (2026-11-09)
 
 Installer: `vgpu3d-setup-1.0.26313.7767.exe`. From this release on, releases are named by the full driver version.

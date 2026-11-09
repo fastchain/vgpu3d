@@ -816,3 +816,19 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   4534 vs 4438, FurMark VK 6256 vs 5411 (same session). Device loss: unchanged (apps get device-lost, DWM ok).
 - Phase 2 (separate paging node) skipped: disable/enable with GPU apps running completes in ~10 s on Win11 with
   no hang (Yttrium added it for a Win10 `VidSchFlushAdapter` hang).
+
+### Yttrium adoption phases 5-7: evaluated, not ported (2026-11-09)
+- Phase 5, native GPU clock calibration (Yttrium f47dd27e): skipped. In our stack D3D12 `GetClockCalibration`
+  and D3D11/Vulkan timestamp queries come from vkd3d-proton/DXVK/Venus through VK_EXT_calibrated_timestamps in
+  user mode; only ETW/GPUView/PresentMon read `DxgkDdiCalibrateGpuClock`, and our DMA packets complete
+  CPU-side, so QPC is the consistent clock for what dxgkrnl sees.
+- Phase 6, Venus timelines through the WDDM scheduler (36688d99): deferred. Their packet orders completion
+  reporting, not execution, and the DWM producer is their private D3D12 UMD. Real ordering of blt copies
+  against DWM's reads needs DWM's composition submits routed through scheduler packets with a host fence the
+  copy waits on; our ring-fenced submits are deliberately fire-and-forget (holding the slot deadlocked, see
+  viogpu_command.cpp). It is a submit-protocol redesign whose only target is the residual blt-model tearing
+  (old windowed uncapped D3D apps); option B stays.
+- Phase 7, per-process blob views revoked at process exit (f382105b): deferred. It closes a narrow,
+  never-observed race (a process starting to exit between our liveness check and the foreign unmap in
+  `~VioGpuAllocation`). It needs a global process-exit notify routine in the KMD that must be unregistered on
+  every unload (driver updates), or the next process exit bugchecks the guest.
