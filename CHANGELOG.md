@@ -27,9 +27,7 @@ copied; see README credits).
 
 ### Known limitations
 - Older windowed D3D apps with blt-model swap chains running uncapped: 1–4 % mixed frames remain, more under
-  heavy host load (unchanged since 1.0.26313.7767; clean with vsync).
-- After an adapter restart Windows may bring the display back in a different mode (seen once in about 20
-  restarts: 3840x2160 instead of 1920x1080); set the resolution again in Display settings. 3DMark's SystemInfo still shows the GPU as "not available".
+  heavy host load (unchanged since 1.0.26313.7767; clean with vsync). 3DMark's SystemInfo still shows the GPU as "not available".
 
 ## 1.0.26313.7767 (2026-11-09)
 

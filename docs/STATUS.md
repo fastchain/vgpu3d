@@ -834,9 +834,9 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   every unload (driver updates), or the next process exit bugchecks the guest.
 
 ### Adapter restarts, part 2: dead views stay reserved; no DWM heap corruption (2026-11-09)
-- Found after the user saw a broken desktop (taskbar gone, wallpaper only in a 1024x768 corner at a new
-  3840x2160 mode): DWM crashed with heap corruption (0xc0000374) on every adapter restart, and 3DMark's UI
-  (javaw) faulted in Venus. Explorer itself survived but never relaid out for the new mode.
+- Found after the user saw a broken desktop (taskbar gone, wallpaper only in a corner after a manual
+  resolution change): DWM crashed with heap corruption (0xc0000374) on every adapter restart, and 3DMark's UI
+  (javaw) faulted in Venus.
 - Cause 1, address reuse: the KMD unmapped live processes' views at teardown, and later allocations in the same
   process (heap, recreated device) could land there before the UMD noticed. Fix (KMD, `~VioGpuAllocation`):
   when the destroy runs on a System thread (dxgkrnl teardown; normal destroys run on the app's or DWM's own
