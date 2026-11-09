@@ -752,6 +752,114 @@ vgpu_fb_async_stats(UINT64 area, UINT64 full, const LARGE_INTEGER *queued, const
    }
 }
 
+/* HKLM\SOFTWARE\vgpu TearCheck (REG_DWORD) = 1: classify every frame handed to the KMD
+ * (the exact pixels that go to the host) for the src/umd/tearcheck test programs, which alternate
+ * solid red and blue frames: a frame showing both colours mixed two app frames.  Counts are logged
+ * every 300 frames with the presenting process.  Read once per process; off by default. */
+static DWORD
+vgpu_reg_dword(const char *name, DWORD def)
+{
+   DWORD v = def, n = sizeof(v);
+   if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\vgpu", name, RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, NULL, &v,
+                    &n) != ERROR_SUCCESS)
+      v = def;
+   return v;
+}
+
+static bool
+vgpu_tearcheck_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = vgpu_reg_dword("TearCheck", 0) != 0;
+   return enabled;
+}
+
+/* TearCheckDump (REG_DWORD, polled every 60 frames): when it changes to a new non-zero N, the next
+ * N handed-over frames are written as C:\\vgpu\\hand\\<process>-<frame>.bmp, for inspecting exactly
+ * what went to the host.  Set it while the scene of interest runs. */
+static void
+vgpu_tearcheck_dump(const uint8_t *px, UINT pitch, LONG w, LONG h, DXGI_FORMAT fmt, LONG frame)
+{
+   static DWORD seen, left;
+   if (frame % 60 == 0) {
+      const DWORD v = vgpu_reg_dword("TearCheckDump", 0);
+      if (v && v != seen) {
+         left = v;
+         CreateDirectoryA("C:\\vgpu\\hand", NULL);
+      }
+      seen = v;
+   }
+   if (!left)
+      return;
+   left--;
+   char exe[MAX_PATH] = "?", name[MAX_PATH];
+   GetModuleFileNameA(NULL, exe, sizeof(exe));
+   const char *base = strrchr(exe, '\\');
+   snprintf(name, sizeof(name), "C:\\vgpu\\hand\\%s-%05ld.bmp", base ? base + 1 : exe, frame);
+   HANDLE f = CreateFileA(name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+   if (f == INVALID_HANDLE_VALUE)
+      return;
+   BITMAPFILEHEADER fh = { 0x4d42, 0, 0, 0, sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) };
+   BITMAPINFOHEADER ih = { sizeof(ih), w, -h, 1, 32, BI_RGB };
+   fh.bfSize = fh.bfOffBits + (DWORD)(w * h * 4);
+   DWORD wr;
+   WriteFile(f, &fh, sizeof(fh), &wr, NULL);
+   WriteFile(f, &ih, sizeof(ih), &wr, NULL);
+   const bool bgra = fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8X8_UNORM ||
+                     fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+   uint8_t *row = (uint8_t *)malloc((size_t)w * 4);
+   for (LONG y = 0; y < h && row; y++) {
+      const uint8_t *src = px + (SIZE_T)y * pitch;
+      memcpy(row, src, (size_t)w * 4);
+      if (!bgra)
+         for (LONG x = 0; x < w; x++) {
+            uint8_t t = row[x * 4];
+            row[x * 4] = row[x * 4 + 2];
+            row[x * 4 + 2] = t;
+         }
+      WriteFile(f, row, (DWORD)(w * 4), &wr, NULL);
+   }
+   free(row);
+   CloseHandle(f);
+}
+
+static void
+vgpu_tearcheck(const uint8_t *px, UINT pitch, LONG w, LONG h, DXGI_FORMAT fmt)
+{
+   static LONG frames, red_frames, blue_frames, mixed, other;
+   const bool bgra = fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8X8_UNORM ||
+                     fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+   UINT red = 0, blue = 0, n = 0;
+   for (LONG y = h / 64; y < h; y += max(h / 32, 1L))
+      for (LONG x = w / 128; x < w; x += max(w / 64, 1L)) {
+         const uint8_t *p = px + (SIZE_T)y * pitch + (SIZE_T)x * 4;
+         const uint8_t r = bgra ? p[2] : p[0], g = p[1], b = bgra ? p[0] : p[2];
+         if (r > 180 && g < 80 && b < 80)
+            red++;
+         else if (b > 180 && g < 80 && r < 80)
+            blue++;
+         n++;
+      }
+   frames++;
+   vgpu_tearcheck_dump(px, pitch, w, h, fmt, frames);
+   if (red > n / 50 && blue > n / 50)
+      mixed++;
+   else if (red > n / 50)
+      red_frames++;
+   else if (blue > n / 50)
+      blue_frames++;
+   else
+      other++;
+   if (frames % 300 == 0) {
+      char exe[MAX_PATH] = "?";
+      GetModuleFileNameA(NULL, exe, sizeof(exe));
+      const char *base = strrchr(exe, '\\');
+      TR_LOG("vgpu: tearcheck %s frames=%ld red=%ld blue=%ld MIXED=%ld other=%ld (box %ldx%ld)", base ? base + 1 : exe,
+             frames, red_frames, blue_frames, mixed, other, w, h);
+   }
+}
+
 static DWORD WINAPI
 vgpu_fb_worker(void *arg)
 {
@@ -796,6 +904,10 @@ vgpu_fb_worker(void *arg)
             TR_LOG("vgpu: fb async frame %ld fence %llu centre=0x%08x", nf, (unsigned long long)job.value, *c);
          }
       }
+
+      if (vgpu_tearcheck_enabled())
+         vgpu_tearcheck(vgpu_fb.ptr[job.slot] + (SIZE_T)job.y0 * vgpu_fb.pitch[job.slot] + (SIZE_T)job.x0 * 4,
+                        vgpu_fb.pitch[job.slot], job.x1 - job.x0, job.y1 - job.y0, vgpu_fb.format);
 
       VIOGPU_ESCAPE esc;
       memset(&esc, 0, sizeof(esc));
@@ -1044,6 +1156,9 @@ vgpuFbPresent(PTRITON_DEVICE pD, PTRITON_RESOURCE src, const RECT *rects, UINT n
    }
 
    QueryPerformanceCounter(&t[1]);
+   if (vgpu_tearcheck_enabled())
+      vgpu_tearcheck((const uint8_t *)m.pData + (SIZE_T)y0 * m.RowPitch + (SIZE_T)x0 * 4, m.RowPitch, x1 - x0,
+                     y1 - y0, d.Format);
 
    VIOGPU_ESCAPE esc;
    memset(&esc, 0, sizeof(esc));

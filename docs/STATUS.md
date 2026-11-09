@@ -737,3 +737,22 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   Average wait 0-0.5 ms per present.
 - Not fixable in the guest: SPICE lossy video streaming in busy regions (blocky areas); SETUP.md 9 lists the
   host-side `<streaming mode='off'/>` option.
+
+### Remaining tearing: guest output verified clean; blt-model race found (2026-11-09)
+- User report after 1.0.26312.28657: Steel Nomad still shows patches of another frame near the centre, also
+  at a 1920x1080 desktop and with SPICE `streaming-video=off,image-compression=off` (verified on the QEMU
+  command line; no change, rolled back).
+- Test programs src/umd/tearcheck (D3D11 flip/blt, D3D12, Vulkan WSI; window, borderless, exclusive fullscreen)
+  alternate solid red/blue frames. Screen captures of DWM's output plus the UMD's TearCheck hand-off check
+  (HKLM\SOFTWARE\vgpu TearCheck=1: classifies the exact pixels given to the KMD; TearCheckDump=N writes the
+  next N handed-over frames to C:\vgpu\hand) found 0 mixed frames for D3D11/D3D12 flip model in every mode.
+  D3D12 "exclusive" fullscreen is still composed by DWM; D3D11 exclusive hands over directly.
+- Steel Nomad presents through DWM (composed path). 240 consecutive handed-over frames (two dumps, the
+  high-motion scenes) show no rectangular patches in frames or difference maps, so the patches the user sees
+  arise after the guest (QEMU egl-headless readback, SPICE rectangle updates, viewer).
+- Real guest bug, not fixed yet: D3D11 blt-model windows with sync interval 0 show 15-18% mixed frames (0 with
+  vsync), Vulkan WSI windows (GDI StretchBlt into the redirected window) 1-5%. GenerateBltPresent copies the
+  frame with the CPU into DWM's redirection surface at DxgkDdiPresent time (CpuBltTo), while DWM reads that
+  surface asynchronously on the host; nothing orders the two. A fix needs a "DWM finished reading" signal or a
+  present throttle (changes blt-model benchmark rates). A WSI fence wait before the CPU copy did not help
+  (the frames were already complete) and cost ~10 % fps; reverted.

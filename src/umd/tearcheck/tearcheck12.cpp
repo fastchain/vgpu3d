@@ -4,7 +4,9 @@
  * with a deliberately heavy pixel shader, while a capture thread BitBlts the window's client area from
  * the screen every ~10 ms and counts captures that contain both colours (two frames mixed).  The first
  * mixed captures are saved as tearcheck12-N.bmp.
- * Usage: tearcheck12 [seconds [shader_loops [sync_interval [buffers]]]]   (default 20 400 0 3)
+ * Usage: tearcheck12 [seconds [shader_loops [sync_interval [buffers [fs]]]]]   (default 20 400 0 3 0)
+ * fs: 0 window, 1 borderless fullscreen window, 2 exclusive fullscreen (screen captures then show only
+ * DWM's desktop; the driver's TearCheck counters see the frames).
  * Build: build/build_tests.sh.
  * SPDX-License-Identifier: MIT
  */
@@ -119,6 +121,7 @@ main(int argc, char **argv)
     UINT buffers = argc > 4 ? (UINT)atoi(argv[4]) : 3;
     if (buffers < 2 || buffers > MAX_BUFFERS)
         buffers = 3;
+    int fs = argc > 5 ? atoi(argv[5]) : 0;
     SetProcessDPIAware();
 
     WNDCLASSA wc = {};
@@ -127,8 +130,13 @@ main(int argc, char **argv)
     wc.lpszClassName = "tearcheck12";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
-    g_hwnd = CreateWindowA("tearcheck12", "tearcheck12 (flip-model D3D12)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100,
-                           1600, 900, NULL, NULL, wc.hInstance, NULL);
+    if (fs)
+        g_hwnd = CreateWindowA("tearcheck12", "tearcheck12 (flip-model D3D12)", WS_POPUP | WS_VISIBLE, 0, 0,
+                               GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, wc.hInstance,
+                               NULL);
+    else
+        g_hwnd = CreateWindowA("tearcheck12", "tearcheck12 (flip-model D3D12)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100,
+                               100, 1600, 900, NULL, NULL, wc.hInstance, NULL);
     SetForegroundWindow(g_hwnd);
 
     ID3D12Device *dev;
@@ -154,6 +162,18 @@ main(int argc, char **argv)
     }
     IDXGISwapChain3 *sc;
     sc1->QueryInterface(IID_PPV_ARGS(&sc));
+    if (fs == 2) {
+        HRESULT hr = E_FAIL;
+        for (int tries = 0; tries < 50; tries++) {
+            SetForegroundWindow(g_hwnd);
+            hr = sc->SetFullscreenState(TRUE, NULL);
+            if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+                break;
+            Sleep(200);
+        }
+        printf("SetFullscreenState hr=0x%08lx\n", hr);
+        sc->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, buffers };
     ID3D12DescriptorHeap *heap;
@@ -266,11 +286,13 @@ main(int argc, char **argv)
     queue->Signal(fence, ++fv);
     fence->SetEventOnCompletion(fv, ev);
     WaitForSingleObject(ev, 5000);
+    if (fs == 2)
+        sc->SetFullscreenState(FALSE, NULL);
     InterlockedExchange(&g_stop, 1);
     WaitForSingleObject(cap, INFINITE);
     double secs = (GetTickCount64() - start) / 1000.0;
-    printf("frames %u (%.1f fps, %u shader loops, interval %u, %u buffers)\n", frame, frame / secs, loops, interval,
-           buffers);
+    printf("frames %u (%.1f fps, %u shader loops, interval %u, %u buffers, fs %d)\n", frame, frame / secs, loops,
+           interval, buffers, fs);
     printf("captures %ld: red %ld, blue %ld, mixed %ld, mostly-other %ld\n", g_captures, g_red, g_blue, g_mixed,
            g_other);
     printf("[%s] mixed-frame captures: %ld of %ld\n", g_mixed ? "FAIL" : "PASS", g_mixed, g_captures);

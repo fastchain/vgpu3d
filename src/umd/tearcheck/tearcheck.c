@@ -7,6 +7,7 @@
  * started overwriting with the next frame.  The first mixed captures are saved as tearcheck-N.bmp.
  * Usage: tearcheck [seconds [shader_loops [sync_interval [buffers [blt]]]]]   (default 20 400 0 3 0)
  * blt=1: legacy blt-model swap chain (DXGI_SWAP_EFFECT_DISCARD, 1 buffer) instead of flip-discard.
+ * A 6th argument fs: 0 window, 1 borderless fullscreen window, 2 exclusive fullscreen.
  * Build: build/build_tests.sh.
  * SPDX-License-Identifier: MIT
  */
@@ -121,6 +122,7 @@ main(int argc, char **argv)
     UINT interval = argc > 3 ? (UINT)atoi(argv[3]) : 0;
     UINT buffers = argc > 4 ? (UINT)atoi(argv[4]) : 3;
     int blt = argc > 5 ? atoi(argv[5]) : 0;
+    int fs = argc > 6 ? atoi(argv[6]) : 0;
     SetProcessDPIAware();
 
     WNDCLASSA wc = { 0 };
@@ -129,8 +131,12 @@ main(int argc, char **argv)
     wc.lpszClassName = "tearcheck";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
-    g_hwnd = CreateWindowA("tearcheck", "tearcheck (flip-model D3D11)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100,
-                           1600, 900, NULL, NULL, wc.hInstance, NULL);
+    if (fs)
+        g_hwnd = CreateWindowA("tearcheck", "tearcheck (D3D11)", WS_POPUP | WS_VISIBLE, 0, 0, GetSystemMetrics(SM_CXSCREEN),
+                               GetSystemMetrics(SM_CYSCREEN), NULL, NULL, wc.hInstance, NULL);
+    else
+        g_hwnd = CreateWindowA("tearcheck", "tearcheck (D3D11)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 1600, 900,
+                               NULL, NULL, wc.hInstance, NULL);
     SetForegroundWindow(g_hwnd);
 
     ID3D11Device *dev;
@@ -156,6 +162,19 @@ main(int argc, char **argv)
     if (FAILED(IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)dev, g_hwnd, &sd, NULL, NULL, &sc))) {
         printf("[FAIL] CreateSwapChainForHwnd\n");
         return 1;
+    }
+
+    if (fs == 2) {
+        HRESULT hr = E_FAIL;
+        for (int tries = 0; tries < 50; tries++) {
+            SetForegroundWindow(g_hwnd);
+            hr = IDXGISwapChain1_SetFullscreenState(sc, TRUE, NULL);
+            if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE)
+                break;
+            Sleep(200);
+        }
+        printf("SetFullscreenState hr=0x%08lx\n", hr);
+        IDXGISwapChain1_ResizeBuffers(sc, 0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
     }
 
     HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
@@ -206,11 +225,14 @@ main(int argc, char **argv)
         IDXGISwapChain1_Present(sc, interval, 0);
         frame++;
     }
+    if (fs == 2)
+        IDXGISwapChain1_SetFullscreenState(sc, FALSE, NULL);
     InterlockedExchange(&g_stop, 1);
     WaitForSingleObject(cap, INFINITE);
     double secs = (GetTickCount64() - start) / 1000.0;
     printf("frames %u (%.1f fps, %u shader loops, interval %u, %u buffers, %s)\n", frame, frame / secs, loops, interval,
            buffers, blt ? "blt model" : "flip model");
+    printf("fs %d\n", fs);
     printf("captures %ld: red %ld, blue %ld, mixed %ld, mostly-other %ld\n", g_captures, g_red, g_blue, g_mixed,
            g_other);
     printf("[%s] mixed-frame captures: %ld of %ld\n", g_mixed ? "FAIL" : "PASS", g_mixed, g_captures);
