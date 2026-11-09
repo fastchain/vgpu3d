@@ -1518,6 +1518,8 @@ vgpuBltSource(PTRITON_DEVICE pD, PTRITON_RESOURCE src, BOOL *pAsync)
          TR_LOG("vgpu: blt source: Lock(0x%x) failed 0x%08lx", src->hVgpuCoherent, hr);
    }
    if (SUCCEEDED(hr) && lock.pData) {
+      if (vgpu_tearcheck_enabled())
+         vgpu_tearcheck((const uint8_t *)m.pData, m.RowPitch, (LONG)d.Width, (LONG)d.Height, d.Format);
       const UINT row = d.Width * 4;
       for (UINT y = 0; y < d.Height; y++) {
          const uint8_t *s = (const uint8_t *)m.pData + (SIZE_T)y * m.RowPitch;

@@ -756,3 +756,14 @@ Benchmark scripts: tools/fusion-bench/bench.sh load|check|orbit (MCP tunnelled o
   surface asynchronously on the host; nothing orders the two. A fix needs a "DWM finished reading" signal or a
   present throttle (changes blt-model benchmark rates). A WSI fence wait before the CPU copy did not help
   (the frames were already complete) and cost ~10 % fps; reverted.
+- Blt-model tearing, localized (TearCheck in vgpuBltSource): the frames read back from the app are clean
+  (1800 of 1800 alternate correctly); DWM's composed frames are 18 % mixed. So the copy into the redirection
+  surface races DWM's read of it. Root cause: on hardware, the app's blt packet and DWM's composition are both
+  scheduler packets on the one engine and cannot overlap; here DWM composes through Venus rings that bypass the
+  scheduler, so nothing orders them, and the KMD cannot see when DWM starts reading. Tried and reverted (no
+  effect): running the CPU copy as a KMD command at packet execution (VIOGPU_CMD_BLT_CPU_COPY) and gating it
+  on DWM's present token. DWM never arms one: with in-process DXVK its present fences are DXVK's own
+  (dwmtoken stayed 0). Fix options need a design decision: (A) DWM's UMD brackets each composition with a
+  KMD-visible "composing" flag (needs a hook in DXVK's submit path), (B) park blt copies until DWM finishes a
+  frame with a source-buffer ring, newest-wins and an idle timeout (+1 frame latency), (C) throttle blt-model
+  windows to one present per refresh (caps their frame rate).
