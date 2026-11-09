@@ -78,7 +78,7 @@ Apps use it automatically, with no per-app setup.
 | API | 64-bit | 32-bit | Implementation |
 |---|:---:|:---:|---|
 | **Vulkan 1.4** | ✅ | ✅ | Mesa **Venus** ICD → host Vulkan driver |
-| **Direct3D 12** | ✅ | ✅ | Triton D3D12 DDI + **vkd3d-proton** (in-process) |
+| **Direct3D 12** | ✅ | ✅ | Triton D3D12 DDI + **vkd3d-proton** (in-process); runs 3DMark Steel Nomad, GravityMark, DirectML |
 | **Direct3D 10 / 11** (FL 11_1) | ✅ | ✅ | Triton D3D10/11 DDI + **DXVK** (in-process) |
 | **Direct3D 9** | ✅ | ✅ | Windows' **D3D9On12** on our D3D12 driver |
 | **OpenGL 4.6** | ✅ | ✅ | Mesa **Zink** (OpenGL on Vulkan) |
@@ -103,7 +103,7 @@ Host: NVIDIA **RTX 4090**, Linux, QEMU 11.1. Guest: Windows 11 Pro, 12 vCPUs. Wi
 | | OpenGL | 12684 (~76 fps) |
 | | Direct3D 11 | 11516 (~69 fps) |
 | **GravityMark 1.89**, 3840×2160 exclusive fullscreen | D3D12 / Vulkan / OpenGL / D3D11 | 12587 / 5539 / 5295 / 4767 (75 / 33 / 32 / 29 fps) |
-| **3DMark Steel Nomad** (demo), 4K offscreen | Direct3D 12 | **2295** (22.96 fps) |
+| **3DMark Steel Nomad** (demo), 4K offscreen | Direct3D 12 | **2969** (~29.7 fps) |
 | **Unigine Superposition 1.1**, 1080p | Direct3D 11 / OpenGL | 69.8 / 56.4 fps |
 | **Unigine Heaven 4.0** (5K desktop) | Direct3D 11 / OpenGL | 82–88 / 67.4 fps |
 | **Unigine Heaven 4.0**, exclusive fullscreen | Direct3D 11, 3840×2160 / 1920×1080 | 72.0 / 187.2 fps |
@@ -290,7 +290,8 @@ Progress log and design notes: [docs/STATUS.md](docs/STATUS.md).
 - **OpenCL is 64-bit only** (clvk). Do **not** install Microsoft's *OpenCL, OpenGL and Vulkan Compatibility
   Pack*: its Dozen driver and our D3D12 driver call each other, and every Vulkan app deadlocks.
 - **No CUDA**: it needs NVIDIA's own driver and hardware in the guest.
-- **Driver install/update restarts the adapter.** Apps using the GPU (Explorer, DWM) restart.
+- **Driver install/update restarts the adapter.** Apps using the GPU get a "device removed/lost" error and must
+  recreate their device (many simply exit); DWM and the desktop keep running.
 - Light workloads are CPU-bound, and the desktop costs CPU at very high resolutions.
 - Tested on NVIDIA (RTX 4090) only; AMD and Intel hosts are expected to work but are untested.
 
