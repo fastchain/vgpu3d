@@ -339,7 +339,9 @@ typedef struct _VIOGPU_FB_PRESENT_REQ
     ULONG DstX;           // top-left of the updated box in the framebuffer
     ULONG DstY;
     ULONG NeedFull;       // out: the KMD framebuffer was (re)created; send the whole frame next time
-    ULONG Reserved;
+    ULONG FrameId;        // the compositor's frame number (0: untracked).  Width = Height = 0 marks the
+                          // frame's BEGIN (its GPU work is about to be submitted; no pixels); a copy
+                          // marks its END (that work finished).  Orders blt-present copies (KMD).
 } VIOGPU_FB_PRESENT_REQ;
 #pragma pack()
 
@@ -582,6 +584,20 @@ struct _VIOGPU_BLIT_PRESENT
                                           // KMD for packet-gated flip presents
                                           // (VIOGPU_PRESENT_GATE_HINT); never reaches
                                           // virtio and never authored by the UMD
+#define VIOGPU_CMD_BLT_CPU_COPY       0xC // KMD-authored: CPU copy of a blt present from the packet's
+                                          // source to its destination allocation (body:
+                                          // VIOGPU_BLT_CPU_COPY_CMD); the KMD may hold it until
+                                          // DWM's next frame boundary; never reaches virtio
+
+#define VIOGPU_BLT_CPU_COPY_MAX_RECTS 32
+typedef struct _VIOGPU_BLT_CPU_COPY_CMD
+{
+    INT dx; // source = destination + (dx, dy)
+    INT dy;
+    UINT count;
+    UINT reserved;
+    RECT rects[VIOGPU_BLT_CPU_COPY_MAX_RECTS]; // destination rects; only `count` are sent
+} VIOGPU_BLT_CPU_COPY_CMD;
 
 // Per-submission DMA private data.  The KMD's build-phase DDIs and the D3D12
 // DDI's SubmitCommandCb (virtual contexts) both carry the command `body` by

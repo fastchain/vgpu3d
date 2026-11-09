@@ -180,6 +180,8 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // (nothing copied) when either side is a blob, not 32 bpp linear or not
     // fully resident; the caller then takes the virgl path.
     BOOLEAN CpuBltTo(VioGpuAllocation *dst, const RECT *rects, UINT count, INT dx, INT dy);
+    // The static part of CpuBltTo's checks (formats, sizes, no blobs): whether a copy can be deferred.
+    BOOLEAN CanCpuBltTo(VioGpuAllocation *dst);
 
 
     void FlushToScreen(UINT scan_id);

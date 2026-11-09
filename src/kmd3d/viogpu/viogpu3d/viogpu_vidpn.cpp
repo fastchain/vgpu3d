@@ -2844,6 +2844,7 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
 void VioGpuVidPN::Flip()
 {
     TryPromoteFlip();
+    m_pAdapter->NoteVsync();
 
     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
     interrupt.InterruptType = DXGK_INTERRUPT_CRTC_VSYNC;

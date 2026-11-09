@@ -626,6 +626,48 @@ void VioGpuCommand::Run()
                     return;
                 }
 
+            case VIOGPU_CMD_BLT_CPU_COPY:
+                {
+                    // Blt present copy (see GenerateBltPresent).  The source and
+                    // destination are the packet's own present allocations, which
+                    // dxgkrnl keeps alive while the packet is pending.
+                    VIOGPU_BLT_CPU_COPY_CMD body;
+                    if (!m_KmdAuthored || cmdHdr->size < FIELD_OFFSET(VIOGPU_BLT_CPU_COPY_CMD, rects) ||
+                        cmdHdr->size > sizeof(body))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR, ("%s fence_id=%d invalid BLT_CPU_COPY (kmd=%d size=%u)\n",
+                                                     __FUNCTION__, m_FenceId, m_KmdAuthored, cmdHdr->size));
+                        break;
+                    }
+                    RtlZeroMemory(&body, sizeof(body));
+                    RtlCopyMemory(&body, cmdBody, cmdHdr->size);
+                    body.count = min(body.count, (UINT)((cmdHdr->size - FIELD_OFFSET(VIOGPU_BLT_CPU_COPY_CMD, rects)) /
+                                                        sizeof(RECT)));
+                    VioGpuAllocation *src =
+                        m_allocationsLength > DXGK_PRESENT_SOURCE_INDEX ? m_allocations[DXGK_PRESENT_SOURCE_INDEX] : NULL;
+                    VioGpuAllocation *dst = m_allocationsLength > DXGK_PRESENT_DESTINATION_INDEX
+                                                ? m_allocations[DXGK_PRESENT_DESTINATION_INDEX]
+                                                : NULL;
+                    if (src == NULL || dst == NULL)
+                    {
+                        break;
+                    }
+                    // Park the packet until the adapter has made the copy at DWM's next
+                    // frame boundary (or dropped it for a newer one); its completion is
+                    // what tells DWM the window changed.
+                    AddPending();
+                    if (m_pAdapter->BltDefer(src, dst, &body, VioGpuCommand::QueueRunningCb, this))
+                    {
+                        return;
+                    }
+                    DropPending();
+                    if (!src->CpuBltTo(dst, body.rects, body.count, body.dx, body.dy))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR, ("%s fence_id=%d BLT_CPU_COPY failed\n", __FUNCTION__, m_FenceId));
+                    }
+                    break;
+                }
+
             case VIOGPU_CMD_NOP:
             default:
                 {

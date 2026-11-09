@@ -138,6 +138,41 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // Hardware cursor (virtio-gpu cursor queue): a POINTER_SIZE^2 B8G8R8A8 host
     // resource the viewer draws itself, so the pointer does not wait for DWM
     // frames.  m_CursorLock serialises the pointer DDIs and the D3 teardown.
+    // Deferred blt-present copies (against blt-model tearing).  DWM reads window
+    // redirection surfaces on the host GPU while composing, outside the GPU scheduler,
+    // so a blt present's CPU copy into one waits while a DWM frame is in flight:
+    // between its BEGIN (VIOGPU_FB_PRESENT without pixels, sent before DWM submits the
+    // frame) and its END (the frame's VIOGPU_FB_PRESENT copy).  m_BltThread copies at
+    // the END, or after VIOGPU_BLT_MAX_HOLD_100NS.
+    struct BLT_DEFER
+    {
+        LIST_ENTRY Entry;
+        VioGpuAllocation *Src;
+        VioGpuAllocation *Dst;
+        VIOGPU_BLT_CPU_COPY_CMD Body;
+        void (*Cb)(void *, void *, void *); // VioGpuCommand::QueueRunningCb
+        void *Ctx;
+        LONG Seq;          // m_DwmEndSeq when queued: due at the next END
+        ULONGLONG Queued;  // KeQueryInterruptTime when queued
+    };
+    static const ULONGLONG VIOGPU_BLT_MAX_HOLD_100NS = 120000ULL; // copy anyway after 12 ms
+    KSPIN_LOCK m_BltLock;
+    LIST_ENTRY m_BltPending; // guarded by m_BltLock
+    KEVENT m_BltEvent;
+    PETHREAD m_pBltThread;
+    volatile BOOLEAN m_bStopBltThread;
+    volatile LONG m_DwmFrameBegun; // FrameId of the latest BEGIN
+    volatile LONG m_DwmFrameDone;  // FrameId of the latest END
+    volatile LONG m_DwmEndSeq;     // number of ENDs
+    volatile LONG64 m_DwmEndTime;  // KeQueryInterruptTime of the latest END
+    volatile LONG64 m_VsyncTime;   // ... of the latest vsync (DWM starts composing on it)
+    static const ULONGLONG VIOGPU_DWM_COMPOSE_WINDOW_100NS = 80000ULL; // 8 ms after a vsync
+    BOOLEAN DwmComposing(ULONGLONG now);
+    static void BltThread(PVOID ctx);
+    void BltThreadRoutine(void);
+    // Run (copy == TRUE) or drop the waiting copies that are due; all of them with `all`.
+    void BltFlush(BOOLEAN copy, BOOLEAN all);
+
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
     FAST_MUTEX m_CursorLock;
@@ -236,6 +271,18 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
+    // Queue a blt-present copy until DWM's next frame boundary (see m_BltPending).
+    // FALSE: copy now (DWM idle, or no deferral thread); the callback is not used.
+    BOOLEAN BltDefer(VioGpuAllocation *src, VioGpuAllocation *dst, const VIOGPU_BLT_CPU_COPY_CMD *body,
+                     void (*cb)(void *, void *, void *), void *ctx);
+    // A DWM frame's GPU work starts / finished (VIOGPU_FB_PRESENT FrameId).
+    void FbFrameBegin(ULONG frameId);
+    void FbFrameEnd(ULONG frameId);
+    // A vsync was reported to dxgkrnl (VioGpuVidPN::Flip).
+    void NoteVsync(void)
+    {
+        InterlockedExchange64(&m_VsyncTime, (LONG64)KeQueryInterruptTime());
+    }
     NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
     NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition);
     PDXGKRNL_INTERFACE GetDxgkInterface(void)
