@@ -38,7 +38,7 @@ No GPU passthrough, no second card, no vGPU licenses. The host keeps its desktop
 - [Limitations](#-limitations)
 - [Tearing and picture artifacts](#-tearing-and-picture-artifacts)
 - [Building from source](#-building-from-source)
-- [Licensing](#-licensing)
+- [Credits and licences](#-credits-and-licences)
 - [Changelog](CHANGELOG.md)
 
 ---
@@ -341,8 +341,40 @@ LLVM/clspv cross-build, ~10 min on 32 cores) and `build_opencl_loader.sh [32]` (
 
 ---
 
-## 📜 Licensing
+## 📜 Credits and licences
 
-The kernel driver derives from virtio-win (BSD-3-Clause). Mesa (Venus, Zink) is MIT. DXVK is zlib.
-vkd3d-proton is LGPL-2.1. clvk is Apache-2.0 (with LLVM/clspv inside, Apache-2.0 with LLVM exceptions). Triton's DDI layer has its own license, in `upstream/triton`. Check each
-component's license before redistributing binaries.
+vgpu3d stands on the work of many projects. Thank you to their authors and contributors. The driver package
+contains code from the projects in the first table; check each licence before redistributing binaries.
+
+**Shipped in the driver package**
+
+| Component | Used for | Authors | Licence |
+|---|---|---|---|
+| [virtio-win / kvm-guest-drivers-windows](https://github.com/virtio-win/kvm-guest-drivers-windows) | Base of the WDDM kernel driver (`viogpu3d.sys`) and its virtio layer | Red Hat, Inc. and contributors | BSD-3-Clause |
+| [Triton / Neptune](https://github.com/osy/virtio-win-mesa) ([KMD fork](https://github.com/osy/kvm-guest-drivers-windows)) | D3D10/11/12 DDI layer, Venus transport for Windows, resolution service (`vgpusrv.exe`, `viogpuap.exe`), WDDM 3D groundwork | osy / Turing Software LLC and contributors | MIT (Mesa side), BSD-3-Clause (kernel side) |
+| [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | **Venus** Vulkan driver, **Zink** OpenGL, Gallium WGL | The Mesa contributors (Venus: Google and others; Zink: Collabora and others) | MIT (some files other permissive licences, see `mesa/licenses`) |
+| [DXVK](https://github.com/doitsujin/dxvk) (with [dxbc-spirv](https://github.com/doitsujin/dxbc-spirv), [libdisplay-info](https://gitlab.freedesktop.org/emersion/libdisplay-info)) | Direct3D 10/11 on Vulkan, in-process | Philip Rebohle, Joshua Ashton, Robin Kertels, Jeffrey Ellison and contributors | zlib (dxbc-spirv, libdisplay-info: MIT) |
+| [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) (with [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv)) | Direct3D 12 on Vulkan | Hans-Kristian Arntzen, Philip Rebohle, Joshua Ashton (Valve) and contributors; based on Wine's vkd3d (Józef Kucia and others) | LGPL-2.1-or-later (dxil-spirv: MIT) |
+| [clvk](https://github.com/kpet/clvk) | OpenCL 3.0 on Vulkan | Kévin Petit and contributors | Apache-2.0 |
+| [clspv](https://github.com/google/clspv), [LLVM](https://llvm.org) | OpenCL C → SPIR-V compiler inside clvk | Google and contributors; the LLVM project | Apache-2.0; Apache-2.0 WITH LLVM-exception |
+| [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools), [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers), [SPIRV-LLVM-Translator](https://github.com/KhronosGroup/SPIRV-LLVM-Translator) | SPIR-V handling inside clvk/clspv | The Khronos Group and contributors | Apache-2.0; MIT-style (Khronos); LLVM Release License (NCSA) |
+| [OpenCL ICD Loader](https://github.com/KhronosGroup/OpenCL-ICD-Loader), [OpenCL-Headers](https://github.com/KhronosGroup/OpenCL-Headers) | `OpenCL.dll` the installer puts in System32 | The Khronos Group | Apache-2.0 |
+| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | Vulkan API headers | The Khronos Group | Apache-2.0 OR MIT |
+| MinGW-w64 runtime, GCC runtime libraries | Statically linked C/C++ runtime of the user-mode DLLs and tools | The MinGW-w64 project; the GCC project | ZPL-2.1 / MIT / public domain (MinGW-w64); GPL-3.0 with the GCC Runtime Library Exception |
+| `Inf2Cat.exe` and its helper DLLs (Windows Driver Kit) | Building the driver catalog inside the guest during installation | Microsoft | Microsoft WDK licence terms |
+
+**Used to build, test or run it (not in the package)**
+
+| Component | Used for | Authors | Licence |
+|---|---|---|---|
+| [QEMU](https://www.qemu.org), [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) | Host side: virtio-gpu device, Venus and virgl renderers | The QEMU and virglrenderer contributors | GPL-2.0 (QEMU), MIT (virglrenderer) |
+| Windows SDK and WDK headers/libraries | Compiling the kernel and user-mode drivers | Microsoft | Microsoft SDK/WDK licence terms |
+| LLVM/clang (clang-cl, lld), MinGW-w64 GCC, Meson, Ninja, Python | Cross-compilers and build tools | Their respective projects | Apache-2.0 WITH LLVM-exception; GPL-3.0; Apache-2.0; Apache-2.0; PSF |
+| [NSIS](https://nsis.sourceforge.io) | The Windows installer | NSIS contributors | zlib/libpng |
+| [RenderDoc](https://renderdoc.org) | Frame-capture debugging | Baldur Karlsson and contributors | MIT |
+| [Yttrium](https://github.com/arehnman/yttrium-virtio-gpu) | Studied for ideas (scheduler-ordered Venus work, paging node, clock calibration, Fast Startup note); no code copied | arehnman and contributors | BSD-3-Clause, MPL-2.0 for its viogpu3d changes |
+| [VirtualBox](https://github.com/VirtualBox/virtualbox) | Reference only (kept in `upstream/vbox`); no code used | Oracle and contributors | GPL-3.0 |
+
+Our own code (the vgpu changes, the installer, tools and tests) follows the licence of the project it modifies;
+new files carry an SPDX header (MIT unless stated otherwise). Our patches to Mesa, Triton, DXVK, vkd3d-proton and
+clvk are in [`patches/`](patches/).
