@@ -20,7 +20,7 @@
 #include "tritonSharedBridge.h"
 #include "npt_env.h"
 #include "virtio-gpu/virgl_hw.h"
-#include "virtio-gpu/wddm_hw.h"
+#include "vgpu_blt.h"
 #include <vulkan/vulkan.h>
 
 static HMODULE g_self;
@@ -1385,6 +1385,14 @@ vgpu_blt_pipeline(void)
    return enabled;
 }
 
+ULONGLONG
+vgpuMintAllocCookie(void)
+{
+   static volatile LONG counter;
+   return ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000u |
+          ((UINT)InterlockedIncrement(&counter) & 0x7fffffffu);
+}
+
 /* One coherent virgl 3D allocation for blt sources (see vgpuBltSource); 0 on failure. */
 static D3DKMT_HANDLE
 vgpu_blt_coherent_alloc(PTRITON_DEVICE pD, UINT width, UINT height)
@@ -1394,25 +1402,11 @@ vgpu_blt_coherent_alloc(PTRITON_DEVICE pD, UINT width, UINT height)
     * map, where a stale entry with the same handle value (another
     * process's allocation) wins and the blt reads the wrong surface.
     * Bit 31 keeps these apart from Venus' per-process cookie counter. */
-   static volatile LONG cookie_counter;
    VIOGPU_CREATE_ALLOCATION_EXCHANGE_EX axe;
    memset(&axe, 0, sizeof(axe));
-   axe.LookupCookie = ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000u |
-                      (UINT)(InterlockedIncrement(&cookie_counter) & 0x7fffffff);
+   axe.LookupCookie = vgpuMintAllocCookie();
    VIOGPU_CREATE_ALLOCATION_EXCHANGE *ax = &axe.Base;
-   ax->Type = VIOGPU_RESOURCE_TYPE_3D;
-   ax->Options3D.target = 2; /* PIPE_TEXTURE_2D */
-   /* identical to the KMD's own coherent standard allocations (staging /
-    * shadow surfaces), which the host accepts for transfers and copies */
-   ax->Options3D.format = VIRGL_FORMAT_B8G8R8X8_UNORM;
-   ax->Options3D.bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW |
-                       VIRGL_BIND_DISPLAY_TARGET | VIRGL_BIND_SCANOUT;
-   ax->Options3D.width = width;
-   ax->Options3D.height = height;
-   ax->Options3D.depth = 1;
-   ax->Options3D.array_size = 1;
-   ax->Options3D.flags = VIRGL_RESOURCE_FLAG_MAP_COHERENT;
-   ax->Size = (ULONGLONG)width * height * 4;
+   vgpuInitBltAllocation(ax, width, height);
 
    D3DDDI_ALLOCATIONINFO2 ai;
    memset(&ai, 0, sizeof(ai));

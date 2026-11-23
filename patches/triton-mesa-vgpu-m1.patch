@@ -44,10 +44,24 @@ index 94a72f4..b718166 100644
  
  /* Views keep the host desc they were created with, so recreating them after
 diff --git a/src/virtio/neptune/triton/triton12.h b/src/virtio/neptune/triton/triton12.h
-index 9eb6257..fecb4eb 100644
+index 9eb6257..62b7696 100644
 --- a/src/virtio/neptune/triton/triton12.h
 +++ b/src/virtio/neptune/triton/triton12.h
-@@ -125,6 +125,7 @@ triton12Device(D3D12DDI_HDEVICE hDevice)
+@@ -105,6 +105,13 @@ typedef struct TRITON12_DEVICE
+     BOOL                         QueueLockInit;
+     struct TRITON12_QUEUE       *Queues[TRITON12_MAX_QUEUES];
+     UINT                         QueueCount;
++#ifdef VGPU_DXVK_INPROC
++    struct {
++        ID3D12Resource *buffer;
++        UINT64 capacity;
++    } idleReadbacks[4];
++    UINT nextReadbackEviction;
++#endif
+ 
+     /* ---- tile-mapping decode edge (see t12UpdateTileMappings) ----
+      *
+@@ -125,6 +132,7 @@ triton12Device(D3D12DDI_HDEVICE hDevice)
  /* Whether textures on CPU-visible heaps are built ROW_MAJOR for CPU access
   * (see TRITON12_ADAPTER). */
  BOOL triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter);
@@ -55,7 +69,27 @@ index 9eb6257..fecb4eb 100644
  
  typedef struct TRITON12_DESCRIPTOR_HEAP
  {
-@@ -327,7 +328,7 @@ typedef struct TRITON12_LIST
+@@ -192,6 +200,9 @@ typedef struct TRITON12_RESOURCE
+      * a present source a companion in its place where the source's shape
+      * allows one. */
+     BOOL                         ResidencyOnlyAlloc;
++#ifdef VGPU_DXVK_INPROC
++    struct vgpu_blt_frame *lastBlt;
++#endif
+ } TRITON12_RESOURCE, *PTRITON12_RESOURCE;
+ 
+ typedef struct TRITON12_QUERYHEAP
+@@ -207,6 +218,9 @@ typedef struct TRITON12_FENCE
+ typedef struct TRITON12_QUEUE
+ {
+     ID3D12CommandQueue          *pQueue;
++#ifdef VGPU_DXVK_INPROC
++    struct vgpu_blt_frame *failedBlts;
++#endif
+     PTRITON12_DEVICE             pDev;
+     /* Per-queue kernel context (pfnCreateContextVirtualCb): the runtime
+      * binds it to hRTCommandQueue and performs its kernel-side fence
+@@ -327,7 +341,7 @@ typedef struct TRITON12_LIST
       * recording entries do not QueryInterface per call.  IfaceTried marks
       * an index as resolved, NULL included.  A list records on one thread
       * at a time, so no lock. */
@@ -64,6 +98,29 @@ index 9eb6257..fecb4eb 100644
      UINT                         IfaceTried;
      PTRITON12_DEVICE             pDev;
      /* Recording-thread stamp, kept only under
+@@ -342,8 +356,22 @@ typedef struct TRITON12_LIST
+      * list). */
+     UINT                         ApiType;
+     BOOL                         AwaitingReset;
++#ifdef VGPU_DXVK_INPROC
++    struct vgpu_blt_frame *blts;
++#endif
+ } TRITON12_LIST, *PTRITON12_LIST;
+ 
++#ifdef VGPU_DXVK_INPROC
++HRESULT vgpuRecordBlt(PTRITON12_LIST list, PTRITON12_RESOURCE src, ULONGLONG cookie, D3DKMT_HANDLE *handle);
++struct vgpu_blt_frame *vgpuAcquireBlts(PTRITON12_LIST list);
++HRESULT vgpuFinishBlts(PTRITON12_DEVICE dev, struct vgpu_blt_frame *frames);
++void vgpuDestroyReadbacks(PTRITON12_DEVICE dev);
++void vgpuHoldFailedBlts(PTRITON12_QUEUE queue, struct vgpu_blt_frame *frames);
++void vgpuReleaseFailedBlts(PTRITON12_QUEUE queue);
++void vgpuDiscardBlts(PTRITON12_LIST list);
++void vgpuReleaseBlt(PTRITON12_DEVICE dev, struct vgpu_blt_frame *frame);
++#endif
++
+ /* Each object family installs its own slots into the tables the runtime
+  * hands to pfnFillDDITable. */
+ void triton12InstallDescriptorFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
 diff --git a/src/virtio/neptune/triton/tritonDDI.c b/src/virtio/neptune/triton/tritonDDI.c
 index f012201..582dd86 100644
 --- a/src/virtio/neptune/triton/tritonDDI.c
@@ -90,10 +147,20 @@ index f012201..582dd86 100644
          ID3D11DeviceContext1_Flush(p->pCtx1);
      /* Tear down the present kernel context before the device goes away, under
 diff --git a/src/virtio/neptune/triton/tritonDDI12.c b/src/virtio/neptune/triton/tritonDDI12.c
-index bae8e4f..92455cc 100644
+index bae8e4f..0cb25b0 100644
 --- a/src/virtio/neptune/triton/tritonDDI12.c
 +++ b/src/virtio/neptune/triton/tritonDDI12.c
-@@ -250,6 +250,30 @@ triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter)
+@@ -123,6 +123,9 @@ triton12DestroyDevice(D3D12DDI_HDEVICE hDevice)
+             p->pScratchAlloc[i] = NULL;
+         }
+     }
++#ifdef VGPU_DXVK_INPROC
++    vgpuDestroyReadbacks(p);
++#endif
+     if (p->pDev) {
+         ID3D12Device_Release(p->pDev);
+         p->pDev = NULL;
+@@ -250,6 +253,30 @@ triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter)
      return pAdapter->CpuVisibleTextures;
  }
  
@@ -124,7 +191,7 @@ index bae8e4f..92455cc 100644
  #define HC12(bit) ((hc->have & TRITON_HC12_##bit) != 0)
  #define CAP12_HOST(name, lv, bit, hv) \
      TRITON_CAP_HOST("d3d12", name, lv, HC12(bit), hv)
-@@ -589,9 +613,14 @@ triton12GetCaps(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_GETCAPS *pArgs)
+@@ -589,9 +616,14 @@ triton12GetCaps(D3D12DDI_HADAPTER hAdapter, const D3D12DDIARG_GETCAPS *pArgs)
          if (OPT12_AT(0054)) {
              D3D12DDI_D3D12_OPTIONS_DATA_0054 *o =
                  (D3D12DDI_D3D12_OPTIONS_DATA_0054 *)pArgs->pData;
@@ -393,7 +460,7 @@ index bc4e182..6be5d28 100644
     InterlockedDecrement(&pD->presentInFlight);
     return hr;
 diff --git a/src/virtio/neptune/triton/tritonKm.c b/src/virtio/neptune/triton/tritonKm.c
-index 4a359d5..8962be5 100644
+index 4a359d5..9453f48 100644
 --- a/src/virtio/neptune/triton/tritonKm.c
 +++ b/src/virtio/neptune/triton/tritonKm.c
 @@ -78,7 +78,7 @@ tritonKmEnsureRuntimeCtx(TRITON_KM *km)
@@ -405,8 +472,103 @@ index 4a359d5..8962be5 100644
        esc.CtxInit.NumRings = 1;
        HRESULT hr = tritonKmEscape(km, &esc);
        if (SUCCEEDED(hr))
+@@ -110,6 +110,22 @@ tritonKmLoadFence(volatile const UINT64 *va)
+ #endif
+ }
+ 
++HRESULT
++tritonKmWaitPaging(TRITON_KM *km, HRESULT hr, UINT64 value)
++{
++   if (hr != E_PENDING)
++      return hr;
++   if (!km->PagingFenceVa)
++      return E_FAIL;
++   const ULONGLONG deadline = GetTickCount64() + 5000;
++   while (tritonKmLoadFence(km->PagingFenceVa) < value) {
++      if (GetTickCount64() >= deadline)
++         return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
++      Sleep(0);
++   }
++   return S_OK;
++}
++
+ /* WDDM2 explicit residency.  GpuMmu allocations are not resident at create,
+  * and VidMm refuses any DMA buffer that references an allocation holding no
+  * residency request ("Failed to reference DMA buffer: Allocation is not
+@@ -120,14 +136,14 @@ tritonKmLoadFence(volatile const UINT64 *va)
+  * allocations it owns resident, never the ones pfnAllocateCb hands back to
+  * the driver.  Requests are never revoked; the reference dies with the
+  * allocation. */
+-void
++HRESULT
+ tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
+ {
+    if (!hAllocation || !km->pCallbacks)
+-      return;
++      return E_FAIL;
+    if (!km->PagingQueueTried) {
+       if (!km->pLock)
+-         return;
++         return E_FAIL;
+       EnterCriticalSection(km->pLock);
+       if (!km->PagingQueueTried) {
+          if (km->pCallbacks->pfnCreatePagingQueueCb &&
+@@ -150,7 +166,7 @@ tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
+       LeaveCriticalSection(km->pLock);
+    }
+    if (!km->hPagingQueue)
+-      return;
++      return E_FAIL;
+ 
+    D3DDDI_MAKERESIDENT mr;
+    memset(&mr, 0, sizeof(mr));
+@@ -158,26 +174,10 @@ tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation)
+    mr.NumAllocations = 1;
+    mr.AllocationList = &hAllocation;
+    HRESULT hr = km->pCallbacks->pfnMakeResidentCb(km->hRTDevice, &mr);
+-   if (hr == E_PENDING && km->PagingFenceVa) {
+-      /* Queued: a present built against the allocation before the paging
+-       * fence reaches mr.PagingFenceValue still dies as above.  Creation-time
+-       * waits are rare and short, so poll the plain monotonic fence value
+-       * with a yield and a loud timeout. */
+-      const ULONGLONG deadline = GetTickCount64() + 5000;
+-      while (tritonKmLoadFence(km->PagingFenceVa) < mr.PagingFenceValue) {
+-         if (GetTickCount64() > deadline) {
+-            TR_LOG("km: paging fence wait TIMED OUT (alloc=0x%x fence=%llu < %llu)",
+-                   hAllocation, (unsigned long long)tritonKmLoadFence(km->PagingFenceVa),
+-                   (unsigned long long)mr.PagingFenceValue);
+-            return;
+-         }
+-         Sleep(0);
+-      }
+-   } else if (FAILED(hr)) {
+-      TR_LOG("km: MakeResident(alloc=0x%x) FAILED 0x%08lx -- a blt-model "
+-             "present referencing it will remove the device",
+-             hAllocation, (unsigned long)hr);
+-   }
++   hr = tritonKmWaitPaging(km, hr, mr.PagingFenceValue);
++   if (FAILED(hr))
++      TR_LOG("km: MakeResident(alloc=0x%x) failed 0x%08lx", hAllocation, (unsigned long)hr);
++   return hr;
+ }
+ 
+ BOOL
+diff --git a/src/virtio/neptune/triton/tritonKm.h b/src/virtio/neptune/triton/tritonKm.h
+index 879f031..5d14afb 100644
+--- a/src/virtio/neptune/triton/tritonKm.h
++++ b/src/virtio/neptune/triton/tritonKm.h
+@@ -53,7 +53,8 @@ void    tritonKmDestroy(TRITON_KM *km);
+ 
+ HRESULT tritonKmEscape(const TRITON_KM *km, VIOGPU_ESCAPE *esc);
+ void    tritonKmEnsureRuntimeCtx(TRITON_KM *km);
+-void    tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation);
++HRESULT tritonKmWaitPaging(TRITON_KM *km, HRESULT hr, UINT64 value);
++HRESULT tritonKmRequestResidency(TRITON_KM *km, D3DKMT_HANDLE hAllocation);
+ 
+ /* The D3D11 description of a texture being exported as a shared blob. */
+ typedef struct TRITON_KM_SHARED_DESC {
 diff --git a/src/virtio/neptune/triton/tritonList12.c b/src/virtio/neptune/triton/tritonList12.c
-index 117e4b2..5b90233 100644
+index 117e4b2..5ecbff6 100644
 --- a/src/virtio/neptune/triton/tritonList12.c
 +++ b/src/virtio/neptune/triton/tritonList12.c
 @@ -36,7 +36,7 @@ t12ListApiType(D3D12DDI_COMMAND_LIST_TYPE Type,
@@ -426,7 +588,39 @@ index 117e4b2..5b90233 100644
      };
      if (!l || !l->pList)
          return NULL;
-@@ -1581,20 +1582,334 @@ static VOID APIENTRY
+@@ -374,6 +375,10 @@ t12ResetCommandList0040(D3D12DDI_HCOMMANDLIST hList,
+     TR_LOG_HOT("12.ResetCommandList(0040) -> 0x%08lx", (unsigned long)hr);
+     if (FAILED(hr))
+         t12ListError(l, "ResetCommandList(0040)", hr);
++#ifdef VGPU_DXVK_INPROC
++    else
++        vgpuDiscardBlts(l);
++#endif
+ }
+ 
+ static VOID APIENTRY
+@@ -389,6 +394,9 @@ t12DestroyCommandList(D3D12DDI_HDEVICE hDevice, D3D12DDI_HCOMMANDLIST hList)
+         l->pIface[i] = NULL;
+     }
+     l->IfaceTried = 0;
++#ifdef VGPU_DXVK_INPROC
++    vgpuDiscardBlts(l);
++#endif
+     if (l->pList) {
+         ID3D12GraphicsCommandList_Release(l->pList);
+         l->pList = NULL;
+@@ -434,6 +442,10 @@ t12ResetCommandList(D3D12DDI_HCOMMANDLIST hList,
+     TR_LOG_HOT("12.ResetCommandList -> 0x%08lx", (unsigned long)hr);
+     if (FAILED(hr))
+         t12ListError(l, "ResetCommandList", hr);
++#ifdef VGPU_DXVK_INPROC
++    else
++        vgpuDiscardBlts(l);
++#endif
+ }
+ 
+ static VOID APIENTRY
+@@ -1581,20 +1593,334 @@ static VOID APIENTRY
  t12DestroySchedulingGroup(D3D12DDI_HDEVICE hDevice, D3D12DDI_HSCHEDULINGGROUP_0050 h)
  { (void)hDevice; (void)h; }
  
@@ -764,7 +958,7 @@ index 117e4b2..5b90233 100644
  
  static void APIENTRY
  t12GetRaytracingAccelerationStructurePrebuildInfo(
-@@ -1602,9 +1917,19 @@ t12GetRaytracingAccelerationStructurePrebuildInfo(
+@@ -1602,9 +1928,19 @@ t12GetRaytracingAccelerationStructurePrebuildInfo(
      const D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054 *pInputs,
      D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054 *pInfo)
  {
@@ -787,7 +981,7 @@ index 117e4b2..5b90233 100644
  }
  
  static D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS APIENTRY
-@@ -1618,19 +1943,32 @@ t12CheckDriverMatchingIdentifier(D3D12DDI_HDEVICE hDevice,
+@@ -1618,19 +1954,32 @@ t12CheckDriverMatchingIdentifier(D3D12DDI_HDEVICE hDevice,
  
  static void *APIENTRY
  t12GetShaderIdentifier(D3D12DDI_HSTATEOBJECT_0054 h, LPCWSTR pName)
@@ -824,7 +1018,7 @@ index 117e4b2..5b90233 100644
  
  static void APIENTRY
  t12SetBackgroundProcessingMode(D3D12DDI_HDEVICE hDevice,
-@@ -1648,28 +1986,63 @@ t12ExecuteMetaCommand(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HMETACOMMAND_0052 h,
+@@ -1648,28 +1997,63 @@ t12ExecuteMetaCommand(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HMETACOMMAND_0052 h,
                        const void *p, SIZE_T cb)
  { (void)hList; (void)h; (void)p; (void)cb; }
  
@@ -893,7 +1087,7 @@ index 117e4b2..5b90233 100644
  
  static VOID APIENTRY
  t12RSSetShadingRate(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_SHADING_RATE_0062 Rate,
-@@ -1683,13 +2056,22 @@ t12RSSetShadingRateImage(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HRESOURCE h)
+@@ -1683,13 +2067,22 @@ t12RSSetShadingRateImage(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HRESOURCE h)
  static SIZE_T APIENTRY
  t12CalcPrivateAddToStateObjectSize(D3D12DDI_HDEVICE hDevice,
                                     const D3D12DDIARG_ADD_TO_STATE_OBJECT_0072 *pArgs)
@@ -919,10 +1113,25 @@ index 117e4b2..5b90233 100644
  static void APIENTRY
  t12SetBackgroundProcessingMode0063(D3D12DDI_HDEVICE hDevice,
 diff --git a/src/virtio/neptune/triton/tritonPresent12.c b/src/virtio/neptune/triton/tritonPresent12.c
-index 033c07f..48a4262 100644
+index 033c07f..0438b37 100644
 --- a/src/virtio/neptune/triton/tritonPresent12.c
 +++ b/src/virtio/neptune/triton/tritonPresent12.c
-@@ -480,7 +480,7 @@ t12Present(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HCOMMANDQUEUE hQueue,
+@@ -114,9 +114,14 @@ triton12RegisterSharedBlob(PTRITON12_DEVICE p, PTRITON12_RESOURCE r,
+ static ULONGLONG
+ t12MintAllocCookie(void)
+ {
++#ifdef VGPU_DXVK_INPROC
++    extern ULONGLONG vgpuMintAllocCookie(void);
++    return vgpuMintAllocCookie();
++#else
+     static volatile LONG counter;
+     return ((ULONGLONG)GetCurrentProcessId() << 32) | 0x80000000ull |
+            ((ULONG)InterlockedIncrement(&counter) & 0x7fffffffu);
++#endif
+ }
+ 
+ D3DKMT_HANDLE
+@@ -480,7 +485,7 @@ t12Present(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HCOMMANDQUEUE hQueue,
      if (src && src->pResource && !src->pCompanion && !src->CompanionFailed &&
          q->pDev && (src->ResidencyOnlyAlloc || !src->hKMAllocation)) {
          D3D12_RESOURCE_DESC desc;
@@ -931,11 +1140,63 @@ index 033c07f..48a4262 100644
          HRESULT hr = E_INVALIDARG;
          BOOL resolvable = desc.SampleDesc.Count <= 1;
          if (!resolvable) {
+@@ -536,6 +541,22 @@ t12Present(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HCOMMANDQUEUE hQueue,
+      * carries the frame's writes (a D3D11On12 swapchain records its clear,
+      * update and draw there) would show the previous frame. */
+     const BOOL blt = pArgs->Flags.Blt ? TRUE : FALSE;
++#ifdef VGPU_DXVK_INPROC
++    if (blt && !pOut->hDstAllocation && l && l->pList && !l->AwaitingReset && src &&
++        src->pCompanion && src->pResource && pArgs->SurfacesToPresent == 1 &&
++        src->Desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM && src->Desc.SampleDesc.Count == 1 &&
++        src->Desc.ResourceType == D3D12DDI_RT_TEXTURE2D &&
++        src->Desc.DepthOrArraySize == 1 && src->Desc.MipLevels <= 1) {
++        pOut->hSrcAllocation = 0;
++        HRESULT hr = vgpuRecordBlt(l, src, t12MintAllocCookie(), &pOut->hSrcAllocation);
++        if (FAILED(hr)) {
++            TR_LOG("12.Blt: record failed hr=0x%08lx", (unsigned long)hr);
++            q->pDev->pUMCallbacks->pfnSetErrorCb(q->pDev->hRTDevice, hr);
++            return;
++        }
++        pOut->AddedGpuWork = TRUE;
++    } else
++#endif
+     if (src && src->pCompanion && src->pResource) {
+         if (blt && l && l->pList && !l->AwaitingReset) {
+             t12RecordCompanionFill(l->pList, src);
+@@ -677,10 +698,15 @@ t12Present(D3D12DDI_HCOMMANDLIST hList, D3D12DDI_HCOMMANDQUEUE hQueue,
+ 
+     if (n <= 8 || (n & 255) == 0)
+         TR_LOG("12.Present #%ld: src=0x%x dst=0x%x ctx=%p surfaces=%u "
+-               "flipInterval=%d", (long)n,
+-               src ? src->hKMAllocation : 0, dst ? dst->hKMAllocation : 0,
++               "flipInterval=%d blt=%u hostList=%u awaitingReset=%u addedWork=%u "
++               "size=%llux%u fmt=%u samples=%u companion=%u", (long)n,
++               pOut->hSrcAllocation, pOut->hDstAllocation,
+                q->hKMContext, pArgs->SurfacesToPresent,
+-               (int)pArgs->FlipInterval);
++               (int)pArgs->FlipInterval, (unsigned)blt, !!(l && l->pList),
++               !!(l && l->AwaitingReset), (unsigned)pOut->AddedGpuWork,
++               src ? (unsigned long long)src->Desc.Width : 0ull,
++               src ? src->Desc.Height : 0, src ? (unsigned)src->Desc.Format : 0,
++               src ? src->Desc.SampleDesc.Count : 0, !!(src && src->pCompanion));
+ }
+ 
+ /* _0028 appends SyncIntervalOverride{Valid,}: left clear, the runtime's
 diff --git a/src/virtio/neptune/triton/tritonQueue12.c b/src/virtio/neptune/triton/tritonQueue12.c
-index c658197..a2dd84b 100644
+index c658197..34004c4 100644
 --- a/src/virtio/neptune/triton/tritonQueue12.c
 +++ b/src/virtio/neptune/triton/tritonQueue12.c
-@@ -288,6 +288,31 @@ triton12QueueGate(PTRITON12_QUEUE q)
+@@ -239,6 +239,9 @@ t12DestroyCommandQueue(D3D12DDI_HDEVICE hDevice, D3D12DDI_HCOMMANDQUEUE hQueue)
+         ID3D12CommandQueue_Release(q->pQueue);
+         q->pQueue = NULL;
+     }
++#ifdef VGPU_DXVK_INPROC
++    vgpuReleaseFailedBlts(q);
++#endif
+     if (q->hPresentArmEvent) {
+         CloseHandle(q->hPresentArmEvent);
+         q->hPresentArmEvent = NULL;
+@@ -288,6 +291,31 @@ triton12QueueGate(PTRITON12_QUEUE q)
          return FALSE;
      }
  
@@ -948,12 +1209,12 @@ index c658197..a2dd84b 100644
 +     * KMD deadline, GravityMark D3D12 133 -> 17 fps.) */
 +    {
 +        HANDLE evt = CreateEventW(NULL, FALSE, FALSE, NULL);
-+        BOOL done = FALSE;
 +        if (evt && SUCCEEDED(ID3D12Fence_SetEventOnCompletion(q->pDrainFence, v, evt)))
-+            done = WaitForSingleObject(evt, 5000) == WAIT_OBJECT_0;
++            WaitForSingleObject(evt, 5000);
 +        if (evt)
 +            CloseHandle(evt);
-+        if (!done && ID3D12Fence_GetCompletedValue(q->pDrainFence) < v) {
++        UINT64 completed = ID3D12Fence_GetCompletedValue(q->pDrainFence);
++        if (completed == UINT64_MAX || completed < v) {
 +            static LONG late;
 +            if (InterlockedIncrement(&late) <= 4)
 +                TR_LOG("12.QueueGate: drain v=%llu not reached after 5 s",
@@ -967,6 +1228,63 @@ index c658197..a2dd84b 100644
      UINT64 kmdToken = 0;
      if (!npt_d3d12_ecl_gate_arm(q->pDrainFence, v, &kmdToken)) {
          static LONG armFail;
+@@ -448,19 +476,54 @@ t12ExecuteCommandLists(D3D12DDI_HCOMMANDQUEUE hQueue, UINT Count,
+      * would drop the whole batch. */
+     ID3D12CommandList *lists[64];
+     UINT n = 0, total = 0;
++#ifdef VGPU_DXVK_INPROC
++    struct vgpu_blt_frame *frames[ARRAYSIZE(lists)];
++    BOOL hasBlts = FALSE;
++    HRESULT error = S_OK;
++#endif
++    BOOL gated = FALSE;
+     for (UINT i = 0; i < Count; i++) {
+         PTRITON12_LIST l = (PTRITON12_LIST)pCommandLists[i].pDrvPrivate;
+-        if (l && l->pList)
++        if (l && l->pList) {
++#ifdef VGPU_DXVK_INPROC
++            frames[n] = vgpuAcquireBlts(l);
++            hasBlts |= frames[n] != NULL;
++#endif
+             lists[n++] = (ID3D12CommandList *)l->pList;
++        }
+         if (n == ARRAYSIZE(lists) || (i + 1 == Count && n)) {
+             ID3D12CommandQueue_ExecuteCommandLists(q->pQueue, n, lists);
++            gated = FALSE;
++#ifdef VGPU_DXVK_INPROC
++            if (hasBlts) {
++                BOOL done = triton12QueueGate(q);
++                gated = TRUE;
++                for (UINT j = 0; j < n; ++j) {
++                    if (!frames[j])
++                        continue;
++                    if (!done)
++                        vgpuHoldFailedBlts(q, frames[j]);
++                    HRESULT hr = done ? vgpuFinishBlts(q->pDev, frames[j]) : DXGI_ERROR_DEVICE_HUNG;
++                    if (FAILED(hr))
++                        error = hr;
++                    vgpuReleaseBlt(q->pDev, frames[j]);
++                }
++                hasBlts = FALSE;
++            }
++#endif
+             total += n;
+             n = 0;
+         }
+     }
+     TR_LOG_HOT("12.ExecuteCommandLists: %u list(s)", total);
+-    if (total)
++    if (total && !gated)
+         triton12QueueGate(q);
++#ifdef VGPU_DXVK_INPROC
++    if (FAILED(error)) {
++        TR_LOG("12.Blt: completion failed hr=0x%08lx", (unsigned long)error);
++        q->pDev->pUMCallbacks->pfnSetErrorCb(q->pDev->hRTDevice, error);
++    }
++#endif
+ }
+ 
+ static void APIENTRY
 diff --git a/src/virtio/neptune/triton/tritonResource.c b/src/virtio/neptune/triton/tritonResource.c
 index e47217f..5c52f90 100644
 --- a/src/virtio/neptune/triton/tritonResource.c
@@ -1068,7 +1386,7 @@ index e47217f..5c52f90 100644
          ID3D11Resource_Release(r->pPresentCompanion);
          r->pPresentCompanion = NULL;
 diff --git a/src/virtio/neptune/triton/tritonResource12.c b/src/virtio/neptune/triton/tritonResource12.c
-index 2a23e5b..9f19d22 100644
+index 2a23e5b..157be98 100644
 --- a/src/virtio/neptune/triton/tritonResource12.c
 +++ b/src/virtio/neptune/triton/tritonResource12.c
 @@ -99,6 +99,9 @@ t12ResourceDesc(const D3D12DDIARG_CREATERESOURCE_0003 *pR,
@@ -1081,6 +1399,17 @@ index 2a23e5b..9f19d22 100644
      pDesc->Flags = f;
  }
  
+@@ -660,6 +663,10 @@ t12DestroyHeapAndResource(D3D12DDI_HDEVICE hDevice, D3D12DDI_HHEAP hHeap,
+     PTRITON12_DEVICE p = triton12Device(hDevice);
+     PTRITON12_HEAP h = (PTRITON12_HEAP)hHeap.pDrvPrivate;
+     PTRITON12_RESOURCE r = (PTRITON12_RESOURCE)hResource.pDrvPrivate;
++#ifdef VGPU_DXVK_INPROC
++    if (r)
++        vgpuReleaseBlt(p, r->lastBlt);
++#endif
+     if (r && r->pCompanion) {
+         ID3D12Resource_Release(r->pCompanion);
+         r->pCompanion = NULL;
 diff --git a/src/virtio/virtio-gpu/wddm_hw.h b/src/virtio/virtio-gpu/wddm_hw.h
 index e2da5c4..9198566 100644
 --- a/src/virtio/virtio-gpu/wddm_hw.h
@@ -2038,7 +2367,7 @@ index dbee43f..f69d4ea 100644
  vn_renderer_destroy(struct vn_renderer *renderer,
                      const VkAllocationCallbacks *alloc)
 diff --git a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
-index 0acb349..83c78e2 100644
+index 0acb349..d1c6f33 100644
 --- a/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 +++ b/src/virtio/vulkan/vn_renderer_virtgpu_win32.c
 @@ -2,6 +2,7 @@
@@ -2049,7 +2378,7 @@ index 0acb349..83c78e2 100644
  #include <d3dkmthk.h>
  #include <d3dukmdt.h>
  #include <dxgiddi.h>
-@@ -15,15 +16,34 @@
+@@ -15,15 +16,35 @@
  #include "virtio/virtio-gpu/venus_hw.h"
  #include "virtio/virtio-gpu/wddm_hw.h"
  
@@ -2081,20 +2410,22 @@ index 0acb349..83c78e2 100644
     D3DKMT_HANDLE alloc;
 +   /* vgpu: mmap_ptr is the WDDM2 KMD's RES_INFO UserVa (no D3DKMTLock/MAP_BLOB) */
 +   bool kmd_mapped;
++   uint64_t cookie;
     union {
        D3DKMT_HANDLE kmt;
        HANDLE h;
-@@ -42,6 +62,9 @@ struct virtgpu_bo {
+@@ -42,6 +63,10 @@ struct virtgpu_bo {
        HANDLE h;
     } /* resource */;
     uint32_t blob_flags;
 +   /* vgpu: WDDM2 KMD's RES_INFO UserVa, used instead of D3DKMTLock */
 +   void *kmd_va;
++   uint64_t cookie;
 +   struct virtgpu_va_range guard;
  };
  
  struct virtgpu_sync {
-@@ -93,6 +116,13 @@ struct virtgpu {
+@@ -93,6 +118,13 @@ struct virtgpu {
           PFND3DKMT_DESTROYDEVICE destroyDevice;
           PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
           PFND3DKMT_CLOSEADAPTER closeAdapter;
@@ -2108,7 +2439,7 @@ index 0acb349..83c78e2 100644
        } cb;
     } d3dkmt;
  
-@@ -112,6 +142,15 @@ struct virtgpu {
+@@ -112,6 +144,15 @@ struct virtgpu {
  
        D3DDDI_PATCHLOCATIONLIST *patch_list;
        size_t patch_size;
@@ -2124,7 +2455,7 @@ index 0acb349..83c78e2 100644
     } ctx;
  
     struct {
-@@ -157,6 +196,9 @@ hr_to_nt(struct virtgpu *gpu, HRESULT hr)
+@@ -157,6 +198,9 @@ hr_to_nt(struct virtgpu *gpu, HRESULT hr)
        return STATUS_NO_MEMORY;
     case E_INVALIDARG:
        return STATUS_INVALID_PARAMETER;
@@ -2134,7 +2465,7 @@ index 0acb349..83c78e2 100644
     default:
        vn_log(gpu->instance, "Unknown HRESULT: %lx", hr);
        return STATUS_INVALID_PARAMETER;
-@@ -550,6 +592,101 @@ sim_submit_signal_syncs(struct virtgpu *gpu,
+@@ -550,6 +594,101 @@ sim_submit_signal_syncs(struct virtgpu *gpu,
     return VK_SUCCESS;
  }
  
@@ -2236,7 +2567,7 @@ index 0acb349..83c78e2 100644
  static NTSTATUS
  virtgpu_ioctl_create_context(struct virtgpu *gpu)
  {
-@@ -577,6 +714,9 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu)
+@@ -577,6 +716,9 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu)
  
        return STATUS_SUCCESS;
     } else {
@@ -2246,7 +2577,7 @@ index 0acb349..83c78e2 100644
        D3DKMT_CREATECONTEXT context = {
           .hDevice = gpu->d3dkmt.device,
           .ClientHint = D3DKMT_CLIENTHINT_VULKAN,
-@@ -663,6 +803,33 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
+@@ -663,6 +805,33 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
  static NTSTATUS
  virtgpu_ioctl_signal(struct virtgpu *gpu, HANDLE fence)
  {
@@ -2280,7 +2611,7 @@ index 0acb349..83c78e2 100644
     if (gpu->ddicb != NULL) {
        D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signal = {
             .hContext = gpu->ctx.h,
-@@ -702,6 +869,20 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+@@ -702,6 +871,20 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
        const struct vn_renderer_submit_batch *batch = &submit->batches[i];
        mtx_lock(&gpu->ctx.lock);
  
@@ -2301,15 +2632,38 @@ index 0acb349..83c78e2 100644
        for (uint32_t i = 0; i < submit->bo_count; i++) {
           struct virtgpu_bo *bo = (struct virtgpu_bo *)submit->bos[i];
           assert(bo->alloc != 0);
-@@ -726,6 +907,7 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
+@@ -726,18 +909,23 @@ sim_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
           break;
        }
  
 +signal_syncs:
        if (batch->sync_count > 0) {
           HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
-          // vn_log(gpu->instance, "created handle %p", fence);
-@@ -774,7 +956,7 @@ virtgpu_ioctl_getparam(struct virtgpu *gpu,
+-         // vn_log(gpu->instance, "created handle %p", fence);
+-         NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
+-         if (!NT_SUCCESS(status)) {
+-            vn_log(gpu->instance, "failed to execbuffer: 0x%lx", status);
++         if (!fence) {
++            ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+             break;
+          }
+ 
+-         ret = sim_submit_signal_syncs(gpu, fence, batch->syncs,
+-                                       batch->sync_values, batch->sync_count,
+-                                       batch->ring_idx == 0);
++         NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
++         if (NT_SUCCESS(status)) {
++            ret = sim_submit_signal_syncs(gpu, fence, batch->syncs,
++                                          batch->sync_values, batch->sync_count,
++                                          batch->ring_idx == 0);
++         } else {
++            vn_log(gpu->instance, "failed to execbuffer: 0x%lx", status);
++            ret = VK_ERROR_DEVICE_LOST;
++         }
+          CloseHandle(fence);
+          if (ret != VK_SUCCESS)
+             break;
+@@ -774,7 +962,7 @@ virtgpu_ioctl_getparam(struct virtgpu *gpu,
  }
  
  static NTSTATUS
@@ -2318,7 +2672,7 @@ index 0acb349..83c78e2 100644
  {
     if (gpu->ddicb != NULL) {
        D3DDDICB_ESCAPE escape = {
-@@ -797,6 +979,179 @@ virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
+@@ -797,6 +985,179 @@ virtgpu_ioctl_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *priv)
     }
  }
  
@@ -2498,17 +2852,32 @@ index 0acb349..83c78e2 100644
  static NTSTATUS
  virtgpu_ioctl_get_caps(struct virtgpu *gpu,
                         uint32_t id,
-@@ -818,9 +1173,23 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
-    return virtgpu_ioctl_escape(gpu, &caps);
+@@ -819,8 +1180,38 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
  }
  
-+static NTSTATUS virtgpu_ioctl_wait(struct virtgpu *gpu);
-+
  static NTSTATUS
 -virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
++virtgpu_ioctl_wait(struct virtgpu *gpu)
+ {
++   HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
++   if (!fence)
++      return STATUS_NO_MEMORY;
++
++   NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
++   if (!NT_SUCCESS(status)) {
++      vn_log(gpu->instance, "vgpu: sync signal failed: 0x%lx", status);
++   } else if (WaitForSingleObject(fence, INFINITE) != WAIT_OBJECT_0) {
++      status = STATUS_UNSUCCESSFUL;
++   }
++
++   CloseHandle(fence);
++   return status;
++}
++
++static NTSTATUS
 +virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle,
 +                       uint32_t res_id)
- {
++{
 +   if (gpu->ctx.virt) {
 +      const ULONG payload = res_id;
 +      mtx_lock(&gpu->ctx.lock);
@@ -2523,7 +2892,24 @@ index 0acb349..83c78e2 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -859,8 +1228,20 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
+@@ -843,24 +1234,24 @@ virtgpu_ioctl_init_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
+       return status;
+    }
+ 
+-   HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
+-   // vn_log(gpu->instance, "created handle %p", fence);
+-   status = virtgpu_ioctl_signal(gpu, fence);
+-   if (!NT_SUCCESS(status)) {
+-      return status;
+-   }
+-
+-   // vn_log(gpu->instance, "waiting for handle %p", fence);
+-   if (WaitForSingleObject(fence, INFINITE) != WAIT_OBJECT_0) {
+-      return STATUS_ABANDONED_WAIT_0;
+-   }
+-
+-   return STATUS_SUCCESS;
++   return virtgpu_ioctl_wait(gpu);
  }
  
  static NTSTATUS
@@ -2545,15 +2931,46 @@ index 0acb349..83c78e2 100644
     mtx_lock(&gpu->ctx.lock);
  
     gpu->ctx.alloc_list[0].hAllocation = handle;
-@@ -906,6 +1287,7 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
-    // vn_log(gpu->instance, "created handle %p", fence);
-    NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
-    if (!NT_SUCCESS(status)) {
-+      vn_log(gpu->instance, "vgpu: sync signal failed: 0x%lx", status);
+@@ -883,37 +1274,7 @@ virtgpu_ioctl_destroy_map(struct virtgpu *gpu, D3DKMT_HANDLE handle)
        return status;
     }
-    // vn_log(gpu->instance, "waiting for handle %p", fence);
-@@ -924,6 +1306,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
+ 
+-   HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
+-   // vn_log(gpu->instance, "created handle %p", fence);
+-   status = virtgpu_ioctl_signal(gpu, fence);
+-   if (!NT_SUCCESS(status)) {
+-      return status;
+-   }
+-
+-   // vn_log(gpu->instance, "waiting for handle %p", fence);
+-   if (WaitForSingleObject(fence, INFINITE) != WAIT_OBJECT_0) {
+-      return STATUS_ABANDONED_WAIT_0;
+-   }
+-
+-   return STATUS_SUCCESS;
+-   // return virtgpu_ioctl_unlock(gpu, handle);
+-}
+-
+-static NTSTATUS
+-virtgpu_ioctl_wait(struct virtgpu *gpu)
+-{
+-   HANDLE fence = CreateEventA(NULL, TRUE, FALSE, NULL);
+-   // vn_log(gpu->instance, "created handle %p", fence);
+-   NTSTATUS status = virtgpu_ioctl_signal(gpu, fence);
+-   if (!NT_SUCCESS(status)) {
+-      return status;
+-   }
+-   // vn_log(gpu->instance, "waiting for handle %p", fence);
+-   if (WaitForSingleObject(fence, INFINITE) != WAIT_OBJECT_0) {
+-      return STATUS_ABANDONED_WAIT_0;
+-   }
+-
+-   return STATUS_SUCCESS;
++   return virtgpu_ioctl_wait(gpu);
+ }
+ 
+ #define VIRTGPU_SYNC_OR_RETURN_NTSTATUS(gpu) \
+@@ -924,6 +1285,18 @@ virtgpu_ioctl_wait(struct virtgpu *gpu)
        } \
     } while (0)
  
@@ -2572,7 +2989,7 @@ index 0acb349..83c78e2 100644
  static NTSTATUS
  virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     uint32_t blob_mem,
-@@ -934,19 +1328,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -934,19 +1307,29 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
                                     D3DKMT_HANDLE *alloc_handle,
                                     D3DKMT_HANDLE *res_kmt_local,
                                     D3DKMT_HANDLE *res_kmt_global,
@@ -2611,7 +3028,7 @@ index 0acb349..83c78e2 100644
  
     VIOGPU_CREATE_RESOURCE_EXCHANGE res_priv = { 0 };
  
-@@ -991,6 +1395,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -991,6 +1374,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        };
        NTSTATUS status = gpu->d3dkmt.cb.createAllocation(&alloc);
        if (!NT_SUCCESS(status)) {
@@ -2619,7 +3036,7 @@ index 0acb349..83c78e2 100644
           return status;
        }
        *res_kmt_local = alloc.hResource;
-@@ -1008,22 +1413,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
+@@ -1008,22 +1392,47 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
        .DataLength = sizeof(res_info.ResourceInfo),
        .ResourceInfo = {
           .ResHandle = *alloc_handle,
@@ -2676,7 +3093,7 @@ index 0acb349..83c78e2 100644
  }
  
  static NTSTATUS
-@@ -1379,6 +1809,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
+@@ -1379,6 +1788,18 @@ virtgpu_open(struct virtgpu *gpu, void *info)
           (void *)GetProcAddress(gdi32lib, "D3DKMTOpenAdapterFromHdc");
        gpu->d3dkmt.cb.closeAdapter =
           (void *)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
@@ -2695,7 +3112,7 @@ index 0acb349..83c78e2 100644
  
        NTSTATUS status = virtgpu_find_adapter(gpu);
        if (!NT_SUCCESS(status)) {
-@@ -1496,11 +1938,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
+@@ -1496,11 +1917,20 @@ virtgpu_ioctl_open_resource(struct virtgpu *gpu,
        *alloc = alloc_list[0].hAllocation;
        *res_kmt_local = open.hResource;
  
@@ -2716,7 +3133,7 @@ index 0acb349..83c78e2 100644
           },
        };
  
-@@ -1546,11 +1997,21 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
+@@ -1546,11 +1976,21 @@ virtgpu_bo_create_from_handle(struct vn_renderer *renderer,
        virtgpu_ioctl_open_resource(gpu, kmt_global, &alloc, &kmt_local, &res_info, d3d_open);
     if (!NT_SUCCESS(status)) {
        vn_log(gpu->instance, "failed to open resource: 0x%lx", status);
@@ -2738,7 +3155,7 @@ index 0acb349..83c78e2 100644
     bo = util_sparse_array_get(&gpu->bo_array, alloc);
  
     /* Upon import, blob_flags is not passed to the kernel and is only for
-@@ -1668,9 +2129,11 @@ virtgpu_bo_create_from_device_memory(
+@@ -1668,9 +2108,11 @@ virtgpu_bo_create_from_device_memory(
     }
  
     D3DKMT_HANDLE alloc, kmt_local, kmt_global;
@@ -2751,7 +3168,7 @@ index 0acb349..83c78e2 100644
     if (!NT_SUCCESS(status)) {
        vn_log(gpu->instance,
               "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
-@@ -1692,6 +2155,7 @@ virtgpu_bo_create_from_device_memory(
+@@ -1692,6 +2134,7 @@ virtgpu_bo_create_from_device_memory(
           .DataLength = sizeof(res_info.ResourceInfo),
           .ResourceInfo = {
              .ResHandle = alloc,
@@ -2759,17 +3176,18 @@ index 0acb349..83c78e2 100644
           },
        };
  
-@@ -1725,7 +2189,9 @@ virtgpu_bo_create_from_device_memory(
+@@ -1725,7 +2168,10 @@ virtgpu_bo_create_from_device_memory(
        },
        .alloc = alloc,
        .blob_flags = blob_flags,
 +      .kmd_va = kmd_va,
++      .cookie = cookie,
     };
 +   virtgpu_va_guard_add(gpu, &bo->guard, kmd_va, size);
  
     if (gpu->ddicb != NULL) {
        bo->h = h;
-@@ -1770,7 +2236,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
+@@ -1770,7 +2216,9 @@ virtgpu_bo_map(struct vn_renderer *renderer,
     const bool mappable = bo->blob_flags & VIOGPU_BLOB_FLAG_USE_MAPPABLE;
  
     /* not thread-safe but is fine */
@@ -2780,13 +3198,42 @@ index 0acb349..83c78e2 100644
        NTSTATUS status =
           virtgpu_ioctl_lock(gpu, bo->alloc, &bo->base.mmap_ptr);
        if (!NT_SUCCESS(status)) {
-@@ -1817,9 +2285,11 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+@@ -1801,6 +2249,27 @@ virtgpu_bo_export_handle(struct vn_renderer *renderer,
+       return NULL /* TODO */;
+ }
+ 
++/* Private blobs have no importers to retain this view. Retire it while
++ * still in the mapping process: a later VidMm destruction on a System
++ * worker must conservatively reserve any surviving user view for device
++ * loss recovery. A failed escape leaves cleanup to that destructor. */
++static void
++virtgpu_release_private_window(struct virtgpu *gpu, D3DKMT_HANDLE alloc,
++                               uint64_t cookie)
++{
++   VIOGPU_ESCAPE esc = {
++      .Type = VIOGPU_RES_RELEASE_WINDOW,
++      .DataLength = sizeof(esc.ResRelease),
++      .ResRelease = {
++         .ResHandle = alloc,
++         .LookupCookie = cookie,
++      },
++   };
++   NTSTATUS status = virtgpu_ioctl_escape(gpu, &esc);
++   if (!NT_SUCCESS(status))
++      vn_log(gpu->instance, "release private window failed: 0x%lx", status);
++}
++
+ static bool
+ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+ {
+@@ -1817,9 +2286,12 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
        return false;
     }
  
 -   if (bo->base.mmap_ptr) {
-+   /* a KMD-owned mapping is torn down by the KMD at allocation destroy */
 +   virtgpu_va_guard_remove(&bo->guard);
++   if (bo->kmd_va && bo->cookie && !(bo->blob_flags & VIOGPU_BLOB_FLAG_USE_SHAREABLE))
++      virtgpu_release_private_window(gpu, bo->alloc, bo->cookie);
 +   if (bo->base.mmap_ptr && !bo->kmd_va) {
        virtgpu_ioctl_unlock(gpu, bo->alloc);
 -      virtgpu_ioctl_destroy_map(gpu, bo->alloc);
@@ -2794,30 +3241,33 @@ index 0acb349..83c78e2 100644
     }
  
     /* Set alloc and res to 0 to indicate that the bo is invalid. Must be set
-@@ -1981,8 +2451,11 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
+@@ -1981,8 +2453,13 @@ virtgpu_shmem_destroy_now(struct vn_renderer *renderer,
     struct virtgpu *gpu = (struct virtgpu *)renderer;
     struct virtgpu_shmem *shmem = (struct virtgpu_shmem *)_shmem;
  
 -   virtgpu_ioctl_unlock(gpu, shmem->alloc);
 -   virtgpu_ioctl_destroy_map(gpu, shmem->alloc);
 +   virtgpu_va_guard_remove(&shmem->guard);
-+   if (!shmem->kmd_mapped) {
++   if (shmem->kmd_mapped) {
++      virtgpu_release_private_window(gpu, shmem->alloc, shmem->cookie);
++   } else {
 +      virtgpu_ioctl_unlock(gpu, shmem->alloc);
 +      virtgpu_ioctl_destroy_map(gpu, shmem->alloc, shmem->base.res_id);
 +   }
     virtgpu_ioctl_resource_destroy_blob(gpu, shmem->alloc, shmem->kmt,
                                         shmem->h);
  }
-@@ -2015,14 +2488,18 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2015,14 +2492,19 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
     HANDLE h = NULL; /* This is a device allocation */
     D3DKMT_HANDLE alloc, kmt;
  
 +   void *ptr = NULL;
++   uint64_t cookie;
     NTSTATUS status = virtgpu_ioctl_resource_create_blob(
        gpu, gpu->shmem_blob_mem, VIOGPU_BLOB_FLAG_USE_MAPPABLE, size, 0,
 -      &res_id, &alloc, &kmt, NULL, &h);
 -   if (!NT_SUCCESS(status))
-+      &res_id, &alloc, &kmt, NULL, &h, &ptr, NULL);
++      &res_id, &alloc, &kmt, NULL, &h, &ptr, &cookie);
 +   if (!NT_SUCCESS(status)) {
 +      vn_log(gpu->instance, "vgpu: shmem create_blob(%zu) failed: 0x%lx", size, status);
        return NULL;
@@ -2831,18 +3281,19 @@ index 0acb349..83c78e2 100644
     if (!NT_SUCCESS(status)) {
        virtgpu_ioctl_resource_destroy_blob(gpu, alloc, kmt, h);
        vn_log(gpu->instance, "failed to map blob resource: 0x%lx", status);
-@@ -2039,7 +2516,10 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+@@ -2039,7 +2521,11 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
           .mmap_ptr = ptr,
        },
        .alloc = alloc,
 +      .kmd_mapped = kmd_mapped,
++      .cookie = cookie,
     };
 +   if (kmd_mapped)
 +      virtgpu_va_guard_add(gpu, &shmem->guard, ptr, size);
  
     if (gpu->ddicb != NULL) {
        shmem->h = h;
-@@ -2108,6 +2588,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
+@@ -2108,6 +2594,18 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
     assert(capset->supports_multiple_timelines);
     info->max_timeline_count = gpu->max_timeline_count;
  
@@ -2861,7 +3312,7 @@ index 0acb349..83c78e2 100644
     /* Use guest blob allocations from dedicated heap (Host visible memory) */
     //if (gpu->bo_blob_mem == VIOGPU_BLOB_MEM_HOST3D && capset->use_guest_vram)
     //   info->has_guest_vram = true;
-@@ -2167,9 +2659,16 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2167,9 +2665,16 @@ virtgpu_destroy(struct vn_renderer *renderer,
     struct virtgpu *gpu = (struct virtgpu *)renderer;
  
     vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
@@ -2878,7 +3329,7 @@ index 0acb349..83c78e2 100644
     if (gpu->d3dkmt.device)
        virtgpu_ioctl_destroy_device(gpu);
     if (gpu->d3dkmt.adapter)
-@@ -2179,6 +2678,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
+@@ -2179,6 +2684,7 @@ virtgpu_destroy(struct vn_renderer *renderer,
  
     mtx_destroy(&gpu->win32_handle_import_mutex);
     mtx_destroy(&gpu->ctx.lock);
@@ -2886,7 +3337,7 @@ index 0acb349..83c78e2 100644
  
     util_sparse_array_finish(&gpu->shmem_array);
     util_sparse_array_finish(&gpu->bo_array);
-@@ -2199,6 +2699,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+@@ -2199,6 +2705,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
     mtx_init(&gpu->win32_handle_import_mutex, mtx_plain);
  
     mtx_init(&gpu->ctx.lock, mtx_plain);
@@ -2894,7 +3345,7 @@ index 0acb349..83c78e2 100644
  
     VkResult result = virtgpu_open(gpu, info);
     if (result == VK_SUCCESS)
-@@ -2220,6 +2721,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
+@@ -2220,6 +2727,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
     gpu->base.ops.destroy = virtgpu_destroy;
     gpu->base.ops.submit = virtgpu_submit;
     gpu->base.ops.wait = virtgpu_wait;
@@ -2902,7 +3353,7 @@ index 0acb349..83c78e2 100644
  
     gpu->base.shmem_ops.create = virtgpu_shmem_create;
     gpu->base.shmem_ops.destroy = virtgpu_shmem_destroy;
-@@ -2274,3 +2776,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
+@@ -2274,3 +2782,50 @@ vn_renderer_create_virtgpu_win32(struct vn_instance *instance,
  
     return VK_SUCCESS;
  }
